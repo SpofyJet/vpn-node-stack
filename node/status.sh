@@ -1,0 +1,57 @@
+#!/bin/bash
+# node — status.sh: сверка «ожидаемое (auto-план) vs фактическое» + заметки.
+set -euo pipefail
+
+node_status() {
+    # rebuild plan (dry, no writes)
+    source "$NODE_DIR/lib/sysctl.sh";    node_sysctl_plan_init
+    source "$NODE_DIR/lib/conntrack.sh"; node_conntrack_plan
+    source "$NODE_DIR/lib/tcp.sh";       node_tcp_plan; node_tcp_perf_plan
+    source "$NODE_DIR/lib/datapath.sh";  node_datapath_plan
+    source "$NODE_DIR/lib/kernel.sh"
+    source "$NODE_DIR/lib/udp.sh";       node_udp_plan
+    source "$NODE_DIR/lib/network.sh";   node_network_plan
+    source "$NODE_DIR/lib/limits.sh";    node_limits_plan
+    source "$NODE_DIR/lib/services.sh";  node_harden_ipv6   # ipv6-ключи видны в сверке
+
+    echo "node v$NODE_VERSION status — $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "======================================================================"
+    printf '%-46s %-14s %-14s %s\n' "parameter" "expected" "actual" "ok"
+    echo "----------------------------------------------------------------------"
+    local k v actual st
+    while IFS=$'\t' read -r k v f; do
+        actual="$(sysctl -n "$k" 2>/dev/null || echo '?')"
+        if [ "$actual" = "$v" ]; then st="✓"; else st="✗"; fi
+        printf '%-46s %-14s %-14s %s\n' "$k" "$v" "$actual" "$st"
+    done < "$NODE_PLAN_FILE"
+    echo "----------------------------------------------------------------------"
+
+    # заметки
+    source "$NODE_DIR/lib/cpu.sh"; node_cpu_check
+    if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
+        echo "note: docker active — node не изменяет его конфигурацию (INTEGRATION_DOCKER=$(node_conf_get INTEGRATION_DOCKER 0))"
+    fi
+    if systemctl is-active --quiet irqbalance 2>/dev/null; then
+        echo "note: irqbalance active (node не отключает; конфликтует с ENABLE_RSS_BALANCE=1)"
+    fi
+    if [ "$(node_conf_get ENABLE_MSS_CLAMP 0)" = "1" ]; then
+        if nft list table inet node_mss_clamp >/dev/null 2>&1; then echo "note: MSS clamp: ON (inet node_mss_clamp)"; else echo "note: MSS clamp: enabled in config, table missing"; fi
+    fi
+    local snap
+    snap="$(ls -1t "$NODE_DIAG_DIR"/*.txt 2>/dev/null | head -1)"
+    echo "note: last snapshot: ${snap:-none}"
+    echo "note: contract: $NODE_PROFILE_DIR/stack.conf"
+    echo "note: log: $NODE_LOG"
+
+    # --- kernel/BBR/NIC-opt секция ---
+    echo "----------------------------------------------------------------------"
+    echo "kernel: $(uname -r) $(node_kernel_is_xanmod && echo '[XanMod]' || echo '[stock]')"
+    echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
+    echo "congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 0) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)"
+    echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0) nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0) irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
+    echo "datapath=$(node_conf_get ENABLE_DATAPATH 1) fq_tune=$(node_conf_get ENABLE_FQ_TUNE 1) busy_poll=$(node_conf_get ENABLE_BUSY_POLL 0) netdev_budget=$(node_conf_get NETDEV_BUDGET 600)/$(node_conf_get NETDEV_BUDGET_USECS 8000)"
+    echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash install.sh rollback)"
+    source "$NODE_DIR/lib/xray.sh"
+    echo "xray/remnanode sockets: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
+}
