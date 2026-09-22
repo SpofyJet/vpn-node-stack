@@ -65,7 +65,7 @@ extract_if_needed shieldnode shieldnode.tar.gz
 command -v sha256sum >/dev/null 2>&1 || warn "нет sha256sum — SHA256SUMS не сгенерирую (vpn-node-setup.sh будет ругаться)"
 if command -v sha256sum >/dev/null 2>&1; then
     SUM_FILES=(node.tar.gz shieldnode.tar.gz)
-    [ -f vpn-node-setup.sh ] && SUM_FILES+=(vpn-node-setup.sh) || warn "vpn-node-setup.sh не найден рядом — в репозиторий уйдут только архивы"
+    [ -f vpn-node-setup.sh ] && SUM_FILES+=(vpn-node-setup.sh) || warn "vpn-node-setup.sh не найден рядом с deploy-to-github.sh — в репозиторий (и в SHA256SUMS) попадут только архивы, однострочник работать не будет"
     sha256sum "${SUM_FILES[@]}" > SHA256SUMS
     echo "Сгенерирован SHA256SUMS (${#SUM_FILES[@]} файлов)"
 fi
