@@ -119,6 +119,23 @@ node_load_config >/dev/null 2>&1 || true
 NODE_PROC_MEMINFO=/proc/meminfo node_conntrack_plan >/dev/null 2>&1 || true
 t "conntrack: на реальной RAM clamp не трогает адекватный max" '[ "${NODE_CONNTRACK_MAX:-0}" = 1048576 ]'
 
+# ---------- conntrack тиры старого стека (MB-пороги, fix: заниженный max) ----------
+# ≤1.2GB→262144, ≤2.5GB→786432, ≤8.5GB→1048576, >8.5GB→2097152
+: > /tmp/node-irt-test/node.conf   # снимаем override CONNTRACK_MAX
+node_load_config >/dev/null 2>&1 || true
+printf 'MemTotal:        1048576 kB\n' > /tmp/node-irt-test/meminfo
+NODE_PROC_MEMINFO=/tmp/node-irt-test/meminfo node_conntrack_plan >/dev/null 2>&1 || true
+t "conntrack tier: 1GB -> 262144 (hashsize max/4)" '[ "${NODE_CONNTRACK_MAX:-0}" = 262144 ] && [ "${NODE_CONNTRACK_HASHSIZE:-0}" = 65536 ]'
+printf 'MemTotal:        2097152 kB\n' > /tmp/node-irt-test/meminfo
+NODE_PROC_MEMINFO=/tmp/node-irt-test/meminfo node_conntrack_plan >/dev/null 2>&1 || true
+t "conntrack tier: 2GB -> 786432" '[ "${NODE_CONNTRACK_MAX:-0}" = 786432 ]'
+printf 'MemTotal:        8388608 kB\n' > /tmp/node-irt-test/meminfo
+NODE_PROC_MEMINFO=/tmp/node-irt-test/meminfo node_conntrack_plan >/dev/null 2>&1 || true
+t "conntrack tier: 8GB -> 1048576" '[ "${NODE_CONNTRACK_MAX:-0}" = 1048576 ]'
+printf 'MemTotal:        16777216 kB\n' > /tmp/node-irt-test/meminfo
+NODE_PROC_MEMINFO=/tmp/node-irt-test/meminfo node_conntrack_plan >/dev/null 2>&1 || true
+t "conntrack tier: 16GB -> 2097152" '[ "${NODE_CONNTRACK_MAX:-0}" = 2097152 ]'
+
 # ---------- IRQ mask guard >64 CPU ----------
 t "irq: guard 64 бита присутствует (RPS и XPS)" 'grep -q "eff=\$cpus; \[ \"\$eff\" -gt 64 \]" "$NODE_DIR/lib/irq.sh" && [ "$(grep -c "eff=\$cpus" "$NODE_DIR/lib/irq.sh")" -ge 2 ]'
 

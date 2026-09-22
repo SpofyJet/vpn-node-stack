@@ -10,8 +10,14 @@
 #     фикса: минимальные значения не ниже, чем дефолт ядра;
 #   rmem_default/wmem_default tier-aware: high-watermark autotuning'а для
 #     сокетов без SO_RCVBUF (Xray/QUIC); анти-RcvbufErrors (v5.1.0);
-#   vm.dirty_*=5/10: дефолт 20/10% RAM на 16-32GB ноде = 3-6GB dirty pages
-#     → writeback-всплески;
+#   vm.dirty_*_bytes=64M/256M (все тиры): дефолт ratio 20%/10% RAM на
+#     16-32GB ноде = 3-6GB dirty pages → writeback-всплески, стопорящие
+#     fsync (crowdsec sqlite, journald); bytes-лимиты не зависят от роста
+#     RAM и в ядре перекрывают ratio (старый стек v5.12.0);
+#   vm.swappiness/min_free_kbytes/vfs_cache_pressure tier-aware (прод-значения
+#     старого стека), watermark_boost_factor=0 (меньше latency-спайков
+#     reclaim), page-cluster=0 (swap readahead off — диски VPS не шпиндлы);
+#   fs.file-max=2M + inotify headroom (v6.0.0: systemd/dockerd/crowdsec);
 #   vm.overcommit_memory=1 на T1/T2 (<=4GB): anti-OOM;
 #   tcp_plb_enabled=1 (probed, kernel >=6.3): protective load balancing
 #     внутри loss recovery — сглаживает повторные RTO;
@@ -57,9 +63,35 @@ node_datapath_plan() {
     node_sysctl_add "$NODE_SYSCTL_BASE" net.core.rmem_default "$rd"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.core.wmem_default "$wd"
 
-    # vm: writeback + anti-OOM (маленькие ноды)
-    node_sysctl_add "$NODE_SYSCTL_MEM" vm.dirty_background_ratio "$(node_conf_get VM_DIRTY_BG_RATIO 5)"
-    node_sysctl_add "$NODE_SYSCTL_MEM" vm.dirty_ratio "$(node_conf_get VM_DIRTY_RATIO 10)"
+    # --- vm/fs-блок (порт прод-значений старого стека, v5.12.0/v6.0.0) ---
+    # dirty_* в BYTES, не в ratio: проценты от RAM на больших нодах — это
+    # гигабайты dirty-буферов и редкие, но огромные writeback-всплески.
+    # bytes-лимиты (фоновый flush с 64MB, hard-stall на 256MB) не зависят
+    # от объёма RAM; в ядре запись dirty_bytes обнуляет dirty_ratio —
+    # ratio-ключи из плана убраны (stale-cleanup снесёт старые файлы).
+    # Runtime-запись — через node_sysctl_apply (sysctl -p), как весь план.
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.dirty_background_bytes 67108864   # 64MB
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.dirty_bytes 268435456             # 256MB
+    # watermark_boost_factor=0 (старый ~3914): отключает watermark-boost →
+    # меньше latency-спайков преждевременного reclaim при фрагментации.
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.watermark_boost_factor 0
+    # page-cluster=0: swap readahead off — на VPS/VM диски не шпиндлы,
+    # чтение страниц пачками только тратит I/O.
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.page-cluster 0
+    # swappiness/min_free_kbytes/vfs_cache_pressure — tier-значения старого
+    # стека (~3630/3661/3693/3723): T1 активнее свопится (RAM мало),
+    # vfs_cache_pressure=150 только на T1 (dentry/inode cache поджать),
+    # на T3/T4 НЕ пишем — ядерный дефолт 100 норм.
+    local swap="" mfk="" vcp=""
+    case "$tier" in
+        1) swap=20; mfk=32768;  vcp=150 ;;
+        2) swap=10; mfk=65536;  vcp=100 ;;
+        3) swap=10; mfk=131072 ;;
+        *) swap=10; mfk=262144 ;;
+    esac
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.swappiness "$swap"
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.min_free_kbytes "$mfk"
+    [ -z "$vcp" ] || node_sysctl_add "$NODE_SYSCTL_MEM" vm.vfs_cache_pressure "$vcp"
     if [ "$tier" -le 2 ]; then
         node_sysctl_add "$NODE_SYSCTL_MEM" vm.overcommit_memory "$(node_conf_get VM_OVERCOMMIT 1)"
     fi
@@ -67,6 +99,14 @@ node_datapath_plan() {
     # дефолтных 65530 map'ов нагруженной ноде мало (ломается не сразу,
     # а под пиковой нагрузкой — mmap: cannot allocate memory).
     node_sysctl_add "$NODE_SYSCTL_MEM" vm.max_map_count "$(node_conf_get VM_MAX_MAP_COUNT 1048576)"
+    # fs: потолок открытых файлов + inotify headroom (обоснование старого
+    # v6.0.0): systemd/dockerd/crowdsec держат много watches — дефолтные
+    # лимиты (128 instances / ~16k queued events) исчерпываются под
+    # нагрузкой, inotify начинает отвечать ENOSPC на живой системе.
+    node_sysctl_add "$NODE_SYSCTL_MEM" fs.file-max 2097152
+    node_sysctl_add "$NODE_SYSCTL_MEM" fs.inotify.max_user_watches 524288
+    node_sysctl_add "$NODE_SYSCTL_MEM" fs.inotify.max_user_instances 8192
+    node_sysctl_add "$NODE_SYSCTL_MEM" fs.inotify.max_queued_events 65536
 
     # PLB (kernel >=6.3): сглаживание повторных RTO в loss recovery
     node_sysctl_add_probed "$f" net.ipv4.tcp_plb_enabled 1

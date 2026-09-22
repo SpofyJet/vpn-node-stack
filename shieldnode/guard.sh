@@ -9,17 +9,15 @@ set -euo pipefail
 SHIELD_GUARD_SNAPSHOT="${SHIELD_GUARD_SNAPSHOT:-$SHIELD_STATE_DIR/guard-snapshot.tsv}"
 
 # --- счётчики: <name> <packets> <bytes> ---
+# (парсинг многострочных блоков реального `nft list counters` — в common.sh)
 guard_counters() {
-    nft list counters inet shieldnode 2>/dev/null | \
-        sed -E 's/^counter ([a-z0-9_]+) \{ packets ([0-9]+), bytes ([0-9]+) \}.*/\1 \2 \3/' | \
-        awk 'NF==3' || true
+    nft_counters
 }
 
 # --- наборы: <name> <elements> (0 при недоступности) ---
 guard_set_elems() {
-    local s="$1" out
-    out="$(nft -n list set inet shieldnode "$s" 2>/dev/null | sed -n 's/.*elements = { \(.*\) }/\1/p' || true)"
-    if [ -z "$out" ]; then echo 0; else echo "$out" | tr ',' '\n' | awk 'NF' | wc -l; fi
+    local s="$1"
+    nft_set_elem_count "$s"
 }
 
 shield_guard() {
@@ -81,6 +79,7 @@ shield_guard() {
     local s elems
     for s in whitelist_v4 whitelist_v6 ssh_abusers ssh_abusers_v6 tcp_abusers tcp_abusers_v6 \
              udp_abusers udp_abusers_v6 temporary_blocklist temporary_blocklist_v6 \
+             ssh_connlimit ssh_connlimit_v6 tcp_connlimit tcp_connlimit_v6 \
              scanner_blocklist_v4 scanner_blocklist_v6 threat_blocklist_v4 threat_blocklist_v6 \
              tor_exit_blocklist_v4 tor_exit_blocklist_v6 custom_blocklist_v4 custom_blocklist_v6 \
              crowdsec_blocklist_v4 crowdsec_blocklist_v6 spamhaus_blocklist_v4 spamhaus_blocklist_v6 \

@@ -24,3 +24,12 @@ node_persist_stream() {
     node_manifest_record "$dst"
     ok "persist" "$dst"
 }
+
+# Fallback-делегат: в боевом apply-пути node_persist определяет apply.sh
+# (тот же делегат). Здесь — для контекстов, где apply.sh не засурсен
+# (тесты, rt-reapply до source apply.sh и т.п.): иначе «command not found».
+if ! declare -F node_persist >/dev/null 2>&1; then
+    node_persist() {
+        node_persist_stream "$1"
+    }
+fi

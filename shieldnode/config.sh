@@ -15,15 +15,22 @@ shield_conf_get() {
     if [ -n "${CONFIG_CACHE:-}" ] && [ -f "$CONFIG_CACHE" ]; then
         val="$(awk -F= -v k="$key" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$CONFIG_CACHE")"
     fi
-    val="${val#\"}"; val="${val%\"}"
-    val="${val#\'}"; val="${val%\'}"
-    val="${val%%[[:space:]]#*}"
-    val="${val%"${val##*[![:space:]]}"}"
+    # Порядок важен: сначала кавычки — если значение в кавычках, " #" внутри
+    # НЕ комментарий (PASSWORD="ab #cd" не должен портиться). Обрезка
+    # inline-комментария — только для некавыченных значений.
+    case "$val" in
+        \"*)  val="${val#\"}"; val="${val%%\"*}" ;;
+        "'"*) val="${val#\'}"; val="${val%%\'*}" ;;
+        *)    val="${val%%[[:space:]]#*}"
+              val="${val%"${val##*[![:space:]]}"}" ;;
+    esac
     if [ -z "$val" ]; then echo "$def"; else echo "$val"; fi
 }
 
 shield_load_config() {
     CONFIG_CACHE="$(mktemp)"
+    # mktemp-файл не должен оставаться после выхода (root-сессии, /tmp)
+    trap 'rm -f "$CONFIG_CACHE" 2>/dev/null || true' EXIT
     if [ -f "$SHIELD_CONFIG" ]; then
         # tr -d '\r': конфиг, отредактированный на Windows (CRLF), иначе тихо игнорируется
         { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$SHIELD_CONFIG" 2>/dev/null || true; } | tr -d '\r' > "$CONFIG_CACHE"
@@ -41,5 +48,6 @@ shield_load_config() {
 }
 
 shield_cpu_count() {
-    nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo
+    # grep -c возвращает rc=1 при 0 совпадений — под set -e это fatal без || true
+    nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || true
 }

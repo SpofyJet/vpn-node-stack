@@ -37,18 +37,18 @@ shield_status() {
         nft list chains inet shieldnode 2>/dev/null | sed 's/^/  /'
         echo
         echo "sets (elements):"
-        local s elems
+        local s
         for s in whitelist_v4 whitelist_v6 ssh_abusers ssh_abusers_v6 tcp_abusers tcp_abusers_v6 \
                  udp_abusers udp_abusers_v6 temporary_blocklist temporary_blocklist_v6 \
+                 ssh_connlimit ssh_connlimit_v6 tcp_connlimit tcp_connlimit_v6 \
                  scanner_blocklist_v4 scanner_blocklist_v6 threat_blocklist_v4 threat_blocklist_v6 \
                  tor_exit_blocklist_v4 tor_exit_blocklist_v6 custom_blocklist_v4 custom_blocklist_v6 \
                  crowdsec_blocklist_v4 crowdsec_blocklist_v6 \
                  spamhaus_blocklist_v4 spamhaus_blocklist_v6 cins_blocklist_v4 \
                  protected_tcp protected_udp; do
-            if elems="$(nft -n list set inet shieldnode "$s" 2>/dev/null | sed -n 's/.*elements = { \(.*\) }/\1/p')"; then
-                [ -n "$elems" ] || elems=""
-                local n; n="$(echo "$elems" | tr ',' '\n' | awk 'NF' | wc -l)"
-                printf '  %-22s elements=%s\n' "$s" "$n"
+            # elements = { ... } nft печатает многострочно — счёт через common.sh
+            if nft -n list set inet shieldnode "$s" >/dev/null 2>&1; then
+                printf '  %-22s elements=%s\n' "$s" "$(nft_set_elem_count "$s")"
             fi
         done
     else
@@ -63,7 +63,7 @@ shield_status() {
             [ -n "$cnt" ] || continue
             found=1
             printf '  %s\n' "$cnt"
-        done < <(nft list counters inet shieldnode 2>/dev/null | sed -E 's/^counter ([a-z0-9_]+) \{ packets ([0-9]+), bytes ([0-9]+) \}.*/\1: packets=\2 bytes=\3/' | grep '^c_drops_')
+        done < <(nft_counters | awk '$1 ~ /^c_drops_/ { printf "%s: packets=%s bytes=%s\n", $1, $2, $3 }')
         [ "$found" -eq 0 ] && echo "  (counters отсутствуют — apply не выполнялся после обновления?)"
     else
         echo "  (table отсутствует)"
@@ -71,7 +71,8 @@ shield_status() {
     echo
 
     echo "--- crowdsec ---"
-    if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
+    # main.sh в ветке status НЕ source'ит limits.sh (SH_F_* unset) — читаем конфиг напрямую
+    if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 0)" = "1" ]; then
         echo "mode: $(shield_crowdsec_resolve_mode)"
         echo "agent: $(shield_crowdsec_agent_status)"
     else
@@ -88,7 +89,7 @@ shield_status() {
 
     echo "--- persist / ownership ---"
     echo "manifest files: $([ -f "$SHIELD_STATE_DIR/applied-files.txt" ] && wc -l < "$SHIELD_STATE_DIR/applied-files.txt" || echo 0)"
-    echo "owner-keys: $([ -f "$SHIELD_STATE_DIR/owner-keys.txt" ] && wc -l < "$SHIELD_STATE_DIR/owner-keys.txt" || echo 0) ключей (net.netfilter.* там: $(grep -c 'netfilter' "$SHIELD_STATE_DIR/owner-keys.txt" 2>/dev/null || echo 0) — должно быть 0, §15)"
+    echo "owner-keys: $([ -f "$SHIELD_STATE_DIR/owner-keys.txt" ] && wc -l < "$SHIELD_STATE_DIR/owner-keys.txt" || echo 0) ключей (net.netfilter.* там: $(cat "$SHIELD_STATE_DIR/owner-keys.txt" 2>/dev/null | grep -c 'netfilter' || true) — должно быть 0, §15)"
     echo "abuse journal: $([ -f "$SHIELD_STATE_DIR/abuse.journal" ] && wc -l < "$SHIELD_STATE_DIR/abuse.journal" || echo 0) строк"
     echo "nft boot file: $([ -f /etc/nftables.d/shieldnode.conf ] && echo present || echo absent)"
     echo "security sysctl: $([ -f /etc/sysctl.d/99-z5-shieldnode-security.conf ] && echo present || echo absent)"

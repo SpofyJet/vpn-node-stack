@@ -36,12 +36,14 @@ case "$*" in
         exit 0 ;;
     "list set inet shieldnode "*|"-n list set inet shieldnode "*)
         s="${*: -1}"
+        # реальный nft печатает многострочные блоки (сет-заголовок + elements,
+        # длинные списки переносятся на несколько строк)
         case "$s" in
-            whitelist_v4) echo 'elements = { 203.0.113.10 }' ;;
-            scanner_blocklist_v4) echo 'elements = { 91.240.118.0/24, 185.220.101.4/32, 8.8.4.4/32 }' ;;
-            ssh_abusers) echo 'elements = { 45.148.10.0/28 }' ;;
-            threat_blocklist_v4) echo 'elements = { }' ;;
-            *) echo "elements = { }" ;;
+            whitelist_v4) printf '\telements = { 203.0.113.10 }\n' ;;
+            scanner_blocklist_v4) printf '\telements = { 91.240.118.0/24, 185.220.101.4/32,\n\t\t\t8.8.4.4/32 }\n' ;;
+            ssh_abusers) printf '\telements = { 45.148.10.0/28 }\n' ;;
+            threat_blocklist_v4) printf '\telements = { }\n' ;;
+            *) printf '\telements = { }\n' ;;
         esac; exit 0 ;;
     *) exit 1 ;;
 esac
@@ -49,11 +51,22 @@ EOF
 chmod +x "$OUT/bin/nft"
 : > "$OUT/nftdb/table"
 printf 'loopback scanner' > "$OUT/nftdb/flags"
+# реальный формат `nft list counters`: блоки "counter X {\n packets N bytes M\n}"
 cat > "$OUT/nftdb/counters" <<'EOF'
-counter c_drops_syn_v4 { packets 123456, bytes 9876543 }
-counter c_drops_scanner_v4 { packets 42, bytes 1764 }
-counter c_drops_invalid { packets 7, bytes 294 }
-counter c_drops_global_udp { packets 0, bytes 0 }
+table inet shieldnode {
+	counter c_drops_syn_v4 {
+		packets 123456 bytes 9876543
+	}
+	counter c_drops_scanner_v4 {
+		packets 42 bytes 1764
+	}
+	counter c_drops_invalid {
+		packets 7 bytes 294
+	}
+	counter c_drops_global_udp {
+		packets 0 bytes 0
+	}
+}
 EOF
 
 # systemctl-заглушка
@@ -102,17 +115,20 @@ t "снапшот: первая строка unixts" bash -c "head -1 '$SHIELD_G
 # --- второй запуск: дельты ---
 sleep 1
 cat > "$OUT/nftdb/counters" <<'EOF'
-counter c_drops_syn_v4 { packets 123556, packets 0, bytes 9884543 }
-counter c_drops_scanner_v4 { packets 42, bytes 1764 }
-counter c_drops_invalid { packets 17, bytes 714 }
-counter c_drops_global_udp { packets 0, bytes 0 }
-EOF
-# (в строке выше намеренный дефект парсинга — сработает NF==3-фильтр; чиним)
-cat > "$OUT/nftdb/counters" <<'EOF'
-counter c_drops_syn_v4 { packets 123556, bytes 9884543 }
-counter c_drops_scanner_v4 { packets 42, bytes 1764 }
-counter c_drops_invalid { packets 17, bytes 714 }
-counter c_drops_global_udp { packets 0, bytes 0 }
+table inet shieldnode {
+	counter c_drops_syn_v4 {
+		packets 123556 bytes 9884543
+	}
+	counter c_drops_scanner_v4 {
+		packets 42 bytes 1764
+	}
+	counter c_drops_invalid {
+		packets 17 bytes 714
+	}
+	counter c_drops_global_udp {
+		packets 0 bytes 0
+	}
+}
 EOF
 shield_guard > "$OUT/guard2.txt" 2>&1
 t "delta: у syn_v4 появилась дельта +N/s" bash -c "grep 'c_drops_syn_v4' '$OUT/guard2.txt' | grep -qE '\+[0-9]+/s'"

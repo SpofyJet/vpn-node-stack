@@ -70,16 +70,23 @@ source "$NODE_DIR/lib/common.sh"
 
 if [ "$(id -u)" -eq 0 ]; then
     require_root
-    acquire_lock
+    # flock — только пишущим режимам: status/detect read-only и не должны
+    # падать/ждать, пока apply держит lock
+    case "$MODE" in
+        apply|rollback|uninstall|rt-reapply) acquire_lock ;;
+    esac
     mkdir -p "$NODE_STATE_DIR" "$NODE_DIAG_DIR" "$NODE_PROFILE_DIR" "$(dirname "$NODE_LOCK")" 2>/dev/null || true
 else
     case "$MODE" in
         detect|status) : ;;  # только чтение — root не обязателен
-        *) die "run as root: sudo bash install.sh (mode=$MODE требует root)" ;;
+        *)
+            # --dry-run ничего не пишет/не применяет — разрешаем без root
+            [ "$DRY_RUN" = "1" ] || die "run as root: sudo bash install.sh (mode=$MODE требует root)"
+            ;;
     esac
-    if [ "$MODE" = "detect" ]; then
-        # снапшот нужно куда-то писать — уводим во временный каталог
-        export NODE_STATE_DIR="$(mktemp -d /tmp/node-detect.XXXXXX)"
+    if [ "$MODE" = "detect" ] || { [ "$DRY_RUN" = "1" ] && [ "$MODE" != "status" ]; }; then
+        # state/снапшоты писать некуда (нет прав на /var/lib/node) — в /tmp
+        export NODE_STATE_DIR="$(mktemp -d /tmp/node-${MODE}.XXXXXX)"
         export NODE_DIAG_DIR="$NODE_STATE_DIR/diagnostics"
         mkdir -p "$NODE_DIAG_DIR"
     fi

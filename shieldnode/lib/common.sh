@@ -45,6 +45,8 @@ backup() {
     local path="$1" keep ts bdir
     [ -e "$path" ] || return 0
     keep="$(shield_conf_get BACKUP_KEEP 5)"
+    # валидация: BACKUP_KEEP=abc -> $((keep+1))=1 -> снесло бы ВСЕ бэкапы
+    case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
     ts="$(date '+%Y%m%d-%H%M%S')"
     cp -a "$path" "${path}.pre-shieldnode-${ts}" || die "backup failed: $path"
     bdir="$(dirname "$path")"
@@ -64,6 +66,47 @@ atomic_write() {
     chmod "$mode" "$tmp"
     mv "$tmp" "$dst"
     log debug "persist" "wrote $dst (mode $mode)"
+}
+
+# nft_counters — вывод "<name> <packets> <bytes>" по всем counter'ам таблицы.
+# Реальный `nft list counters` печатает многострочные блоки (НЕ однострочники
+# с запятой):  counter c_drops_x {
+#                  packets 123 bytes 456
+#              }
+nft_counters() {
+    nft list counters inet shieldnode 2>/dev/null | awk '
+        /^[[:space:]]*counter [a-zA-Z0-9_]+[[:space:]]*\{/ { name = $2; next }
+        /^[[:space:]]*packets [0-9]+ bytes [0-9]+/ {
+            if (name != "") { print name, $2, $4; name = "" }
+        }' || true
+}
+
+# nft_set_elem_count <set> — число элементов сета. nft переносит длинные
+# списки elements = { ... } на несколько строк — считаем awk'ом с накоплением
+# между "elements = {" и "}". Отсутствующий сет -> 0 (rc 0).
+nft_set_elem_count() {
+    nft -n list set inet shieldnode "$1" 2>/dev/null | awk '
+        /elements = \{/ {
+            ine = 1
+            rest = $0; sub(/.*elements = \{[[:space:]]*/, "", rest)
+            if (rest ~ /\}/) { sub(/[[:space:]]*\}.*/, "", rest); ine = 0 }
+            n = split(rest, a, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[i])
+                if (a[i] != "") cnt++
+            }
+            next
+        }
+        ine {
+            rest = $0
+            if (rest ~ /\}/) { sub(/[[:space:]]*\}.*/, "", rest); ine = 0 }
+            n = split(rest, a, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[i])
+                if (a[i] != "") cnt++
+            }
+        }
+        END { print cnt + 0 }' || true
 }
 
 # foreign_owner_keys — ключи sysctl, принадлежащие node (реестр владения ТЗ §15/§21).

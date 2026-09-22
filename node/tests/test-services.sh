@@ -157,7 +157,11 @@ EOF
 t "rt-откат терпит sysfs/mount (непишемые пути в sandbox)" node_rt_rollback
 
 # --- сценарий 10: fstab-трансформация (fixture, DRY_RUN) ---
+source "$NODE_DIR/persist.sh"   # node_persist fallback (sysctl.sh его больше не несёт)
 source "$NODE_DIR/lib/storage.sh"
+# mock findmnt: --verify принимает (фейковые UUID фикстуры иначе отвергаются),
+# остальные вызовы -> rc=1 (код имеет fallback на '?')
+findmnt() { case "${1:-}" in --verify) return 0 ;; *) return 1 ;; esac; }
 FAKE_FSTAB="$(mktemp)"
 cat > "$FAKE_FSTAB" <<'EOF'
 # /etc/fstab fixture
@@ -165,13 +169,41 @@ UUID=aaaa / ext4 rw,relatime,discard,errors=remount-ro 0 1
 UUID=bbbb /boot/efi vfat rw,relatime,fmask=0022,discard 0 1
 UUID=cccc none swap sw 0 0
 UUID=dddd /data xfs rw,noatime 0 0
+UUID=eeee /var ext4 defaults 0 2
 EOF
 NODE_FSTAB="$FAKE_FSTAB" node_noatime_apply   # persist реально пишет fixture (в /tmp)
 t "fstab: relatime+discard -> noatime, discard снят" bash -c "grep -qE '/ ext4 rw,noatime,errors=remount-ro' '$FAKE_FSTAB'"
 t "fstab: efi discard снят, noatime встал" bash -c "grep -qE '/boot/efi vfat rw,noatime,fmask=0022' '$FAKE_FSTAB'"
 t "fstab: swap не тронут" bash -c "grep -qE 'none swap sw 0 0' '$FAKE_FSTAB'"
 t "fstab: уже-noatime строка не изменилась" bash -c "grep -qE '/data xfs rw,noatime 0 0' '$FAKE_FSTAB'"
-rm -f "$FAKE_FSTAB"
+t "fstab: defaults получил noatime (раньше был молчаливый no-op)" bash -c "grep -qE '/var ext4 defaults,noatime' '$FAKE_FSTAB'"
+
+# --- сценарий 10b: полностью готовый fstab — файл не трогаем (нет backup/no-op) ---
+FAKE_FSTAB2="$(mktemp)"
+printf 'UUID=aaaa / ext4 rw,noatime,errors=remount-ro 0 1\nUUID=cccc none swap sw 0 0\n' > "$FAKE_FSTAB2"
+NODE_FSTAB="$FAKE_FSTAB2" node_noatime_apply
+t "fstab: готовый fstab — без backup (файл не перезаписан)" bash -c "! ls '$FAKE_FSTAB2'.pre-node-* >/dev/null 2>&1"
+
+# --- сценарий 10c: findmnt --verify отверг новый fstab -> die, оригинал не тронут ---
+findmnt() { case "${1:-}" in --verify) return 1 ;; *) return 1 ;; esac; }
+FAKE_FSTAB3="$(mktemp)"
+printf 'UUID=aaaa / ext4 rw,relatime 0 1\n' > "$FAKE_FSTAB3"
+# die() делает exit 1 — обязательно в subshell, иначе убьёт тест-раннер
+if ( NODE_FSTAB="$FAKE_FSTAB3" node_noatime_apply ) >/dev/null 2>&1; then
+    echo "FAIL - fstab: findmnt --verify fail должен убивать node_noatime_apply"; fails=$((fails+1))
+else
+    echo "ok   - fstab: findmnt --verify fail -> die (не применяем)"
+fi
+t "fstab: оригинал не тронут при fail verify" bash -c "grep -qE 'rw,relatime' '$FAKE_FSTAB3' && ! ls '$FAKE_FSTAB3'.pre-node-* >/dev/null 2>&1"
+unset -f findmnt
+rm -f "$FAKE_FSTAB" "$FAKE_FSTAB2" "$FAKE_FSTAB3"
+
+# --- сценарий 11: udev-правила scheduler (порт старого стека) ---
+# раньше было мёртвое KERNEL=="sd*[0-9]" (матчит только разделы без queue/scheduler)
+t "udev: правило vd/xvd без проверки rotational" bash -c "grep -q 'KERNEL==\"vd\[a-z\]|xvd\[a-z\]\"' '$NODE_DIR/lib/storage.sh'"
+t "udev: правило sd/nvme/mmcblk с rotational==0" bash -c "grep -q 'KERNEL==\"sd\[a-z\]|nvme\[0-9\]n\[0-9\]|mmcblk\[0-9\]\"' '$NODE_DIR/lib/storage.sh' && grep -q 'ATTR{queue/rotational}==\"0\"' '$NODE_DIR/lib/storage.sh'"
+t "udev: guard scheduler содержит none" bash -c "grep -q 'ATTR{queue/scheduler}==\"\*none\*\"' '$NODE_DIR/lib/storage.sh'"
+t "udev: мёртвое sd*[0-9] удалено из правил" bash -c "! grep -q 'KERNEL==\"sd\*\[0-9\]\"' '$NODE_DIR/lib/storage.sh'"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: services (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

@@ -41,8 +41,12 @@ shield_detect_admin_ip() {
     fi
     # fallback: первый установленный sshd-сессионный IP (не loopback)
     if command -v ss >/dev/null 2>&1; then
-        ss -tnp state established 2>/dev/null | awk '/sshd/{print $5}' | sed -E 's/:[0-9]+$//' \
-            | grep -vE '^(127\.|::1|0\.0\.0\.0|\*|)$' | head -1
+        # ss печатает IPv6 как [2a01::x]:port — сначала срезаем скобки+порт
+        # (ветка t), иначе для bracket-формы; для IPv4 — просто хвост :port.
+        # || true: grep -vE отдаёт rc=1 при пустом списке сессий (pipefail).
+        ss -tnp state established 2>/dev/null | awk '/sshd/{print $5}' \
+            | sed -E -e 's/^\[([^]]+)\]:[0-9]+$/\1/' -e t -e 's/:[0-9]+$//' \
+            | grep -vE '^(127\.|::1|0\.0\.0\.0|\*|)$' | head -1 || true
     fi
 }
 

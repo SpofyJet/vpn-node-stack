@@ -54,7 +54,7 @@ node_status() {
         if nft list table inet node_mss_clamp >/dev/null 2>&1; then echo "note: MSS clamp: ON (inet node_mss_clamp)"; else echo "note: MSS clamp: enabled in config, table missing"; fi
     fi
     local snap
-    snap="$(ls -1t "$NODE_DIAG_DIR"/*.txt 2>/dev/null | head -1)"
+    snap="$(ls -1t "$NODE_DIAG_DIR"/*.txt 2>/dev/null | head -1 || true)"
     echo "note: last snapshot: ${snap:-none}"
     echo "note: contract: $NODE_PROFILE_DIR/stack.conf"
     echo "note: log: $NODE_LOG"

@@ -36,8 +36,11 @@ node_tcp_perf_plan() {
     node_sysctl_add      "$f" net.ipv4.tcp_tw_reuse 1        # reuse TIME_WAIT (исходящие) — риск CGNAT-клиентов осознан
     node_sysctl_add      "$f" net.ipv4.tcp_fin_timeout 15    # 60 дефолт — медленно закрываемся
     node_sysctl_add      "$f" net.ipv4.tcp_retries2 8        # 15 дефолт медленно; «2» из гуру-скриптов ломает — 8 разумно
-    node_sysctl_add      "$f" net.ipv4.tcp_keepalive_time 600
-    node_sysctl_add      "$f" net.ipv4.tcp_keepalive_intvl 30
+    # keepalive 300/15/5 — прод-значения старого стека (~3497-3500, мобильные
+    # клиенты): carrier-NAT мобильных операторов умирает раньше 600с, поэтому
+    # keepalive обязан успеть до смерти NAT-записи.
+    node_sysctl_add      "$f" net.ipv4.tcp_keepalive_time 300
+    node_sysctl_add      "$f" net.ipv4.tcp_keepalive_intvl 15
     node_sysctl_add      "$f" net.ipv4.tcp_keepalive_probes 5
     node_sysctl_add      "$f" net.ipv4.tcp_mtu_probing 1     # PMTU blackhole обход (особенно с GRO на туннелях)
     node_sysctl_add      "$f" net.ipv4.tcp_fastopen 3        # TFO client+server

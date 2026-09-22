@@ -18,22 +18,43 @@ node_rollback() {
     log info "rollback" "target backup set: ${ts:-<none — только удаление своих файлов>}"
 
     # 1. восстановление/удаление по манифесту
+    local dropdirs=()
     if [ -f "$NODE_MANIFEST" ]; then
         while read -r f; do
             [ -e "$f" ] || continue
-            if [ -n "$ts" ]; then
-                newest="$(ls -1t "${f}".pre-node-* 2>/dev/null | head -1 || true)"
-                if [ -n "$newest" ]; then
-                    cp -a "$newest" "$f"
-                    log info "rollback" "restored $f <- $newest"
-                    continue
+            # запоминаем наши drop-in каталоги (limits) для очистки ниже
+            case "$f" in /etc/systemd/system/*.d/*.conf) dropdirs+=("$(dirname "$f")") ;; esac
+            # Если есть хоть один .pre-node-* бэкап — файл существовал ДО node:
+            # ВОССТАНАНВЛИВАЕМ, а не удаляем (раньше при пустом ts делался rm -f
+            # и стирались чужие pre-existing файлы, напр. /etc/fstab, хотя рядом
+            # лежал бэкап). rm -f — только когда бэкапов нет вообще (файл создан
+            # node с нуля). При заданном ts сначала точный бэкап набора, иначе
+            # fallback на newest + warn (ранее id набора фактически игнорировался).
+            local exact=""
+            [ -n "$ts" ] && [ -f "${f}.pre-node-${ts}" ] && exact="${f}.pre-node-${ts}"
+            newest="$(ls -1t "${f}".pre-node-* 2>/dev/null | head -1 || true)"
+            if [ -n "$exact" ]; then
+                cp -a "$exact" "$f"
+                log info "rollback" "restored $f <- $exact (backup-set $ts)"
+            elif [ -n "$newest" ]; then
+                cp -a "$newest" "$f"
+                if [ -n "$ts" ]; then
+                    warn "rollback" "для $f нет бэкапа набора $ts — восстановлен из newest: $newest"
+                else
+                    log info "rollback" "restored $f <- $newest (файл существовал до node — НЕ удаляем)"
                 fi
+            else
+                rm -f "$f"
+                log info "rollback" "removed own file $f (бэкапов нет — файл создан node с нуля)"
             fi
-            rm -f "$f"
-            log info "rollback" "removed own file $f"
         done < "$NODE_MANIFEST"
-        # очистка пустых drop-in каталогов limits
-        find /etc/systemd/system -maxdepth 2 -type d -name "*.d" -empty -delete 2>/dev/null || true
+        # очистка ТОЛЬКО своих опустевших drop-in каталогов (limits) из манифеста;
+        # rmdir не тронет непустой/чужой каталог (раньше find -empty -delete
+        # сносил ЛЮБЫЕ пустые *.d под /etc/systemd/system)
+        local d
+        for d in ${dropdirs[@]+"${dropdirs[@]}"}; do
+            [ -n "$d" ] && rmdir "$d" 2>/dev/null || true
+        done
         : > "$NODE_MANIFEST"
     fi
 
@@ -45,7 +66,9 @@ node_rollback() {
         while read -r k; do
             [ -z "$k" ] && continue
             # ключ ещё управляется оставшимися файлами node?
-            if grep -rqsE "^${k}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null; then
+            # (точки ключа экранируем: regex-точка в «net.ipv4...» матчила любой символ)
+            local kre="${k//./\\.}"
+            if grep -rqsE "^${kre}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null; then
                 continue
             fi
             v="$(awk -v key="$k" 'found && /^## /{exit} /^## sysctl-managed-baseline/{found=1; next} found && $1==key {print $3; exit}' "$snap")"
@@ -85,7 +108,8 @@ node_rollback() {
     # 4. контракт
     local conf="$NODE_PROFILE_DIR/stack.conf"
     if [ -f "$conf" ]; then
-        local tmp; tmp="$(mktemp)"
+        # mktemp в том же каталоге: mv атомарен только внутри одной ФС
+        local tmp; tmp="$(mktemp "$NODE_PROFILE_DIR/.stack.conf.XXXXXX")"
         awk '/^\[node\]/{skip=1; next} /^\[/{skip=0} !skip' "$conf" > "$tmp" || true
         chmod 0644 "$tmp"; mv "$tmp" "$conf"
     fi

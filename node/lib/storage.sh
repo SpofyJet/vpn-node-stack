@@ -54,9 +54,22 @@ node_storage_apply() {
             fi
         done
         [ "$applied" -gt 0 ] && ok "storage" "scheduler=none на $applied non-rotational дисках"
+        # оба правила портированы из старого продакшен-стека (60-vpn-io-scheduler.rules,
+        # v5.11.0/v5.12.1). Раньше здесь был паттерн на разделы sdN — он матчил
+        # ТОЛЬКО разделы (у разделов нет queue/scheduler) и не покрывал
+        # vd*/xvd*/nvme* — правило было мёртвым.
+        # Правило 1: virtio (vd/xvd) — без проверки rotational (бывает misreport=1).
+        # Правило 2: sd/nvme/mmcblk — только rotational==0 (реальные HDD не трогаем).
+        # Guard ATTR{queue/scheduler}=="*none*": только если none поддерживается.
         {
-            echo "# node: I/O scheduler=none для non-rotational (managed by node)"
-            echo 'ACTION=="add|change", KERNEL=="sd*[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"'
+            echo "# node: I/O scheduler=none для SSD/virtio дисков VPS (managed by node)"
+            echo "# Гипервизор делает scheduling на хосте — гостевая очередь лишняя."
+            echo 'ACTION=="add|change", KERNEL=="vd[a-z]|xvd[a-z]", \'
+            echo '    ATTR{queue/scheduler}=="*none*", \'
+            echo '    ATTR{queue/scheduler}="none"'
+            echo 'ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]n[0-9]|mmcblk[0-9]", \'
+            echo '    ATTR{queue/rotational}=="0", ATTR{queue/scheduler}=="*none*", \'
+            echo '    ATTR{queue/scheduler}="none"'
         } | node_persist /etc/udev/rules.d/99-node-io-scheduler.rules
     fi
 
@@ -72,30 +85,50 @@ node_noatime_apply() {
         log info "storage" "fstab отсутствует — noatime пропущен"
         return 0
     fi
-    # меняем ли что-то? relatime/atime -> noatime, discard -> убрать (swap не трогаем)
-    if ! grep -vE '^[[:space:]]*#' "$fstab" | awk '$3!="swap" {print $4}' | grep -qE '(^|,)(relatime|atime|discard)(,|$)'; then
-        log info "storage" "fstab уже без relatime/atime/discard — noatime не нужен"
-        return 0
-    fi
+    # Трансформация: discard снимаем; noatime добавляем, если среди опций нет
+    # noatime/nodiratime — включая запись 'defaults' (раньше ранний выход
+    # срабатывал только при литеральных relatime/atime/discard, и 'defaults'
+    # давал молчаливый no-op). swap не трогаем.
     local tmp; tmp="$(mktemp)"
     awk '
         /^[[:space:]]*#/ { print; next }
+        NF < 4           { print; next }
         $3 == "swap"     { print; next }
-        $4 ~ /discard/   {
+        {
             o=$4
-            gsub(/,discard/, "", o)   # средний/последний: убираем с ведущей запятой
-            sub(/^discard,/, "", o)   # первым с запятой справа
-            sub(/^discard$/, "", o)   # единственный
+            # discard: убираем с ведущей запятой / первым / единственным
+            gsub(/,discard/, "", o)
+            sub(/^discard,/, "", o)
+            sub(/^discard$/, "", o)
             sub(/^,/, "", o); sub(/,$/, "", o)
             if (o=="") o="defaults"
+            if (o !~ /(^|,)(noatime|nodiratime)(,|$)/) {
+                if (o ~ /(^|,)(relatime|atime)(,|$)/) sub(/(relatime|atime)/, "noatime", o)
+                else o = o ",noatime"
+            }
             $4=o
+            print
         }
-        $4 ~ /(^|,)(relatime|atime)(,|$)/ { sub(/(relatime|atime)/, "noatime", $4) }
-        { print }
     ' "$fstab" > "$tmp"
+    # нечего менять — не трогаем файл вообще (ни backup, ни записи в манифест)
+    if cmp -s "$tmp" "$fstab"; then
+        rm -f "$tmp"
+        log info "storage" "fstab: уже noatime и без discard — изменений не требуется"
+        return 0
+    fi
+    # валидация нового fstab ДО записи (битый fstab = незагружаемая система);
+    # findmnt есть не везде — если команды нет, пропускаем проверку
+    if command -v findmnt >/dev/null 2>&1; then
+        if ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+            log error "storage" "findmnt --verify отверг новый fstab:"
+            findmnt --verify --tab-file "$tmp" 2>&1 | head -10 | while read -r l; do log error "storage" "  $l"; done
+            rm -f "$tmp"
+            die "storage: трансформированный fstab не прошёл findmnt --verify — НЕ применяем (оригинал не тронут)"
+        fi
+    fi
     node_persist "$fstab" < "$tmp"
     rm -f "$tmp"
-    ok "storage" "fstab: noatime вместо relatime/atime, discard снят (backup сохранён)"
+    ok "storage" "fstab: noatime везде (включая defaults), discard снят (backup сохранён)"
 
     # runtime remount / с захватом текущих опций (откат вернёт именно их)
     if [ "${DRY_RUN:-0}" = "1" ]; then

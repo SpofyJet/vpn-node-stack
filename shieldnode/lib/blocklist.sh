@@ -69,6 +69,7 @@ LISTS_DIR="__LISTS_DIR__"
 LOG_FILE="__LOG_FILE__"
 FAIL_THRESHOLD="__FAIL_THRESHOLD__"
 BL_LOCK_FILE="__LOCK_FILE__"
+MAIN_LOCK_FILE="__MAIN_LOCK_FILE__"
 HEADER_EOF
         # baked-конфиг (значения из config.conf на момент apply)
         printf 'BL_ENABLED_scanner="%s"\n' "$SH_F_ENABLE_SCANNER_LIST"
@@ -91,9 +92,9 @@ HEADER_EOF
         printf 'BL_URLS_spamhaus="https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/dropv6.txt https://www.spamhaus.org/drop/edrop.txt"\n'
         # CINS Army: plain IP list (v4 only)
         printf 'BL_URLS_cins="https://cinsscore.com/list/ci-badguys.txt"\n'
-        # креды — отдельно от URL, чтобы они не светились в логах fetch'а
-        printf 'CROWDSEC_USER="%s"\n' "$cs_user"
-        printf 'CROWDSEC_PASSWORD="%s"\n' "$cs_pass"
+        # креды crowdsec НЕ запекаются в updater (скрипт 0750, но читаем
+        # группой) — они живут в /etc/shieldnode/crowdsec.creds (0600 root),
+        # updater source'ит его при каждом тике (см. BODY)
         printf 'BL_MIN_scanner="%s"\n' "$(shield_conf_get MIN_ENTRIES_SCANNER 1000)"
         printf 'BL_MIN_threat="%s"\n' "$(shield_conf_get MIN_ENTRIES_THREAT 500)"
         printf 'BL_MIN_tor="%s"\n' "$(shield_conf_get MIN_ENTRIES_TOR 100)"
@@ -132,6 +133,14 @@ if [ -f "__OVERRIDE__" ]; then
     . "__OVERRIDE__"
 fi
 
+# crowdsec-креды feed-режима — отдельный файл 0600 root:root (создаётся apply
+# из конфига ТОЛЬКО когда crowdsec включён и креды заданы); в updater (0750)
+# они не запекаются
+if [ -f /etc/shieldnode/crowdsec.creds ]; then
+    # shellcheck source=/dev/null
+    . /etc/shieldnode/crowdsec.creds
+fi
+
 bl_log() { # bl_log <level> <msg>
     local lvl="$1"; shift
     logger -t "$TAG" "$lvl: $*" 2>/dev/null || true
@@ -146,6 +155,18 @@ if ! nft list table $TABLE >/dev/null 2>&1; then
 fi
 
 mkdir -p "$STATE_DIR" "$(dirname "$BL_LOCK_FILE")" 2>/dev/null || true
+
+# основной lock shieldnode (apply/rollback): updater не должен менять сеты
+# посреди apply. НЕблокирующе: занят → пропуск тика (следующий применит).
+# Если lock-файл недоступен (нет прав/каталога) — info и работаем без него.
+if [ -n "${MAIN_LOCK_FILE:-}" ]; then
+    mkdir -p "$(dirname "$MAIN_LOCK_FILE")" 2>/dev/null || true
+    if exec 8>"$MAIN_LOCK_FILE" 2>/dev/null; then
+        flock -n 8 2>/dev/null || { bl_log info "main lock занят (apply/rollback) — пропуск тика"; exit 0; }
+    else
+        bl_log info "main lock $MAIN_LOCK_FILE недоступен — тик без основного lock'а"
+    fi
+fi
 
 # flock: серия триггеров схлопывается в последовательные запуски; при занятом
 # lock'е >90с — пропуск тика (следующий применит), а не параллельный апдейт
@@ -182,15 +203,21 @@ PY_EOF
 
 # --- обновление одного списка ---
 update_list() { # update_list <name>
-    local name="$1" enabled urls min_entries max_entries minp4 minp6
-    eval "enabled=\"\$BL_ENABLED_$name\""
+    local name="$1" enabled urls min_entries max_entries minp4 minp6 interval_guard
+    # без eval под root: косвенное раскрытие ${!v} — код из имени не исполняется
+    local _v
+    _v="BL_ENABLED_$name"; enabled="${!_v:-0}"
     [ "$enabled" = "1" ] || return 0
-    eval "urls=\"\$BL_URLS_$name\""
-    eval "min_entries=\"\$BL_MIN_$name\""
-    eval "max_entries=\"\$BL_MAX_$name\""
-    eval "minp4=\"\$BL_MINP4_$name\""
-    eval "minp6=\"\$BL_MINP6_$name\""
-    local set_v4="${name}_blocklist_v4" set_v6="${name}_blocklist_v6"
+    _v="BL_URLS_$name";   urls="${!_v:-}"
+    _v="BL_MIN_$name";    min_entries="${!_v:-0}"
+    _v="BL_MAX_$name";    max_entries="${!_v:-100000}"
+    _v="BL_MINP4_$name";  minp4="${!_v:-8}"
+    _v="BL_MINP6_$name";  minp6="${!_v:-24}"
+    # маппинг имён сетов: name=tor -> nft-сеты tor_exit_blocklist_{v4,v6}
+    # (см. lib/nft.sh), остальные — <name>_blocklist_{v4,v6}
+    local set_prefix="${name}_blocklist"
+    case "$name" in tor) set_prefix="tor_exit_blocklist" ;; esac
+    local set_v4="${set_prefix}_v4" set_v6="${set_prefix}_v6"
     local fail_counter="$STATE_DIR/fails-$name.cnt"
     local tmp remote_ok=0 local_ok=0
     tmp="$(mktemp -d /tmp/shieldnode-bl.XXXXXX)" || return 1
@@ -200,8 +227,7 @@ update_list() { # update_list <name>
     #    не чаще раза в N минут (default 1440 = 24ч, иначе API шлёт 429).
     #    Пропуск = set остаётся как есть (last-known-good), fail-counter не трогаем.
     #    FORCE=1 — ручной обход гарда (отладка/первичная заливка).
-    eval "interval_guard=\"\$BL_INTERVAL_$name\""
-    interval_guard="${interval_guard:-0}"
+    _v="BL_INTERVAL_$name"; interval_guard="${!_v:-0}"
     if [ "${FORCE:-0}" = "1" ]; then interval_guard=0; fi
     if [ "$interval_guard" -gt 0 ] 2>/dev/null; then
         local lastok_f="$STATE_DIR/lastok-$name.ts" now lastok
@@ -253,7 +279,10 @@ update_list() { # update_list <name>
                 *) cat "$f" >> "$tmp/all.raw" ;;
             esac
         else
-            bl_log warn "$name: fetch failed (rc=$curl_rc): $u"
+            # в лог — только имя фида: integration ID и креды crowdsec не светим
+            local ulog="$u"
+            case "$u" in https://admin.api.crowdsec.net/*) ulog="crowdsec-feed (integration-id скрыт)" ;; esac
+            bl_log warn "$name: fetch failed (rc=$curl_rc): $ulog"
         fi
     done
 
@@ -387,9 +416,9 @@ update_list() { # update_list <name>
 
     swap_one() { # swap_one <live_set> <af:4|6> <loadfile> ; 0=ok, 1=fallback-needed
         local set="$1" af="$2" load="$3"
-        local tmp_set="${set}__next" afword="ip" stype="ipv4_addr" sz
+        local tmp_set="${set}__next" afword="ip" stype="ipv4_addr" sz _v
         if [ "$af" = "6" ]; then afword="ip6"; stype="ipv6_addr"; fi
-        eval "sz=\"\$BL_SIZE_${name}\""
+        _v="BL_SIZE_${name}"; sz="${!_v:-262144}"
         # 1) tmp-set с теми же свойствами + заливка (окна для трафика нет)
         {
             echo "add set inet shieldnode $tmp_set { type $stype; flags interval; auto-merge; size ${sz:-262144}; }"
@@ -525,8 +554,18 @@ BODY_EOF
             -e "s|__LOG_FILE__|/var/log/shieldnode.log|g" \
             -e "s|__FAIL_THRESHOLD__|$threshold|g" \
             -e "s|__LOCK_FILE__|/run/shieldnode/blocklist.lock|g" \
+            -e "s|__MAIN_LOCK_FILE__|${SHIELD_LOCK:-/run/shieldnode/shieldnode.lock}|g" \
             -e "s|__OVERRIDE__|$SHIELD_BLOCKLIST_OVERRIDE|g" \
-        | shield_persist_stream "$SHIELD_BLOCKLIST_SCRIPT" 0755
+        | shield_persist_stream "$SHIELD_BLOCKLIST_SCRIPT" 0750
+
+    # --- 1.5) crowdsec-креды feed-режима: отдельный файл 0600 root:root,
+    #     updater читает его source'ом при каждом тике. Создаём/обновляем
+    #     ТОЛЬКО если crowdsec включён и креды заданы (agent-режиму не нужны).
+    if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 0)" = "1" ] && [ -n "$cs_user" ] && [ -n "$cs_pass" ]; then
+        { printf 'CROWDSEC_USER="%s"\n' "$cs_user"
+          printf 'CROWDSEC_PASSWORD="%s"\n' "$cs_pass"
+        } | shield_persist_stream /etc/shieldnode/crowdsec.creds 0600
+    fi
 
     # --- 2) oneshot-служба + timer (OnBootSec=3min, далее раз в BLOCKLIST_UPDATE_INTERVAL мин) ---
     shield_persist_stream /etc/systemd/system/shieldnode-blocklist.service 0644 <<EOF

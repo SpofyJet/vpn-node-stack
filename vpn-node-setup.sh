@@ -37,13 +37,23 @@ say()  { printf '%s\n' "$*"; }
 die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'ВНИМАНИЕ: %s\n' "$*" >&2; }
 
+# sanity WORK_DIR (после die()): не даём rm -rf снести корень или системную
+# папку — WORK_DIR обязан быть путём минимум из двух компонентов (/opt/vpn-node-stack)
+case "$WORK_DIR" in
+    /|"") die "небезопасный WORK_DIR: '$WORK_DIR'" ;;
+    /*/*) : ;;
+    *)    die "небезопасный WORK_DIR: '$WORK_DIR' (нужен абсолютный путь минимум из двух компонентов)" ;;
+esac
+
 # ---------- окружение ----------
 command -v curl >/dev/null 2>&1 || die "нужен curl: apt-get install -y curl"
 command -v tar  >/dev/null 2>&1 || die "нужен tar"
 
-# ---------- команда (первый не-флаг аргумент) ----------
+# ---------- команда (первый не-флаг аргумент) + флаг --dry-run ----------
 CMD="apply"
+dry=0
 for a in "$@"; do
+    [ "$a" = "--dry-run" ] && dry=1
     case "$a" in
         -*) continue ;;
         *)  CMD="$a"; break ;;
@@ -81,16 +91,29 @@ curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$DL/repo.tar.gz" "
     || die "не удалось скачать снапшот $TARBALL_URL (проверь сеть, имя репозитория и его видимость — приватный repo вернёт 404)"
 
 # ---------- безопасность архива (до распаковки) ----------
-if tar -tzf "$DL/repo.tar.gz" | grep -qE '(^\.\./|(^|/)\.\.(/|$)|^/)'; then
+# Две стадии ДО какого-либо удаления:
+#  1) листинг в файл — битый/оборванный архив отлавливается по коду tar,
+#     а не по ложному «нет совпадений» от grep (и нет гонки SIGPIPE grep -q);
+#  2) проверка путей по готовому листингу.
+LIST="$DL/list.txt"
+if ! tar -tzf "$DL/repo.tar.gz" > "$LIST" 2>/dev/null; then
+    die "снапшот $DL/repo.tar.gz повреждён (скачался не полностью?) — $NODE_DIR и $SHIELD_DIR НЕ тронуты"
+fi
+if grep -qE '(^\.\./|(^|/)\.\.(/|$)|^/)' "$LIST"; then
     die "снапшот содержит опасные пути (.. или абсолютные) — распаковка отменена"
 fi
 
-# ---------- чистая замена (без наложения и stale-файлов) ----------
+# ---------- чистая замена (атомарнее: сначала распаковка, потом удаление) ----------
+# Распаковываем во временный подкаталог и проверяем install.sh ДО того,
+# как трогаем старые папки: сбой распаковки оставляет ноду в рабочем виде.
+mkdir -p "$DL/extract"
+tar -xzf "$DL/repo.tar.gz" --strip-components=1 -C "$DL/extract" \
+    || die "распаковка снапшота не удалась — старые $NODE_DIR и $SHIELD_DIR на месте"
+[ -f "$DL/extract/node/install.sh" ]       || die "в снапшоте нет node/install.sh — репозиторий не тот?"
+[ -f "$DL/extract/shieldnode/install.sh" ] || die "в снапшоте нет shieldnode/install.sh — репозиторий не тот?"
 rm -rf "$NODE_DIR" "$SHIELD_DIR"
-tar -xzf "$DL/repo.tar.gz" --strip-components=1 -C "$WORK_DIR" \
-    || die "распаковка снапшота не удалась"
-[ -f "$NODE_DIR/install.sh" ]    || die "в снапшоте нет node/install.sh — репозиторий не тот?"
-[ -f "$SHIELD_DIR/install.sh" ]  || die "в снапшоте нет shieldnode/install.sh — репозиторий не тот?"
+mv "$DL/extract/node"       "$NODE_DIR"
+mv "$DL/extract/shieldnode" "$SHIELD_DIR"
 rm -rf "$DL"; trap - EXIT
 say "==> распаковано в $WORK_DIR"
 
@@ -108,8 +131,10 @@ case "$CMD" in
         ;;
     apply|install|emergency)
         say "==> [1/2] shieldnode (nftables-фаервол)"
-        if ! bash "$SHIELD_DIR/install.sh" "$@"; then
-            rc_shield=$?
+        if bash "$SHIELD_DIR/install.sh" "$@"; then
+            :
+        else
+            rc_shield=$?   # код берём в else: в then-ветке $? был бы 0
             warn "shieldnode завершился с ошибкой $rc_shield — откатываем его правки"
             bash "$SHIELD_DIR/install.sh" rollback || warn "авто-откат shieldnode не полностью (см. /var/log/shieldnode.log)"
             die "установка ОТМЕНЕНА: фаервол не поднят — node (оптимизация) намеренно не запускался"
@@ -129,7 +154,9 @@ esac
 # «Применили, а таблицы нет» — самый неприятный сценарий, ловим жёстко.
 case "$CMD" in
     apply|install|emergency)
-        if command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1; then
+        if [ "$dry" -eq 1 ]; then
+            say "==> dry-run: пост-проверка nft пропущена (фаервол намеренно не применялся)"
+        elif command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1; then
             say "==> фаервол: таблица inet shieldnode активна"
         else
             printf 'ОШИБКА: ФАЕРВОЛ НЕ АКТИВЕН — таблицы inet shieldnode в nft нет.\n' >&2

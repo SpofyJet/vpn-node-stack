@@ -47,9 +47,10 @@ Before=network.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# destroy перед apply: иначе повторный старт службы упадёт на "File exists"
-ExecStart=/bin/sh -c 'nft destroy table inet shieldnode 2>/dev/null || true; nft -c -f /etc/nftables.d/shieldnode.conf && nft -f /etc/nftables.d/shieldnode.conf'
-ExecReload=/bin/sh -c 'nft destroy table inet shieldnode 2>/dev/null || true; nft -c -f /etc/nftables.d/shieldnode.conf && nft -f /etc/nftables.d/shieldnode.conf'
+# delete (не destroy: destroy есть только в nft>=1.0.8, Debian 12 = 1.0.6) перед
+# apply: иначе повторный старт службы упадёт на "File exists"
+ExecStart=/bin/sh -c 'nft delete table inet shieldnode 2>/dev/null || true; nft -c -f /etc/nftables.d/shieldnode.conf && nft -f /etc/nftables.d/shieldnode.conf'
+ExecReload=/bin/sh -c 'nft delete table inet shieldnode 2>/dev/null || true; nft -c -f /etc/nftables.d/shieldnode.conf && nft -f /etc/nftables.d/shieldnode.conf'
 # Принципиально: никаких restart ssh/docker/xray — только загрузка правил.
 
 [Install]
@@ -61,11 +62,13 @@ EOF
     fi
 }
 
-# shield_guard_link — symlink /usr/local/sbin/guard → install.sh: «пульт» одной командой,
-# как в старой ветке. Удаляется в rollback/uninstall вместе с остальными файлами.
+# shield_guard_link — symlink /usr/local/sbin/guard → main.sh: «пульт» одной
+# командой, как в старой ветке. Цель — именно main.sh (не install.sh): после
+# exec $0=main.sh, проверка basename=guard в main.sh не сработала бы и вместо
+# дашборда запустился APPLY. Удаляется в rollback/uninstall вместе с остальными.
 shield_guard_link() {
     local link="${SHIELD_GUARD_LINK:-/usr/local/sbin/guard}"
-    local target="$SHIELD_DIR/install.sh"
+    local target="$SHIELD_DIR/main.sh"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log info "dry-run" "would symlink $link -> $target"
         return 0
@@ -75,7 +78,7 @@ shield_guard_link() {
         return 0
     fi
     ln -sfn "$target" "$link" 2>/dev/null \
-        && { shield_manifest_record "$link"; ok "persist" "$link -> install.sh (команда: guard)"; } \
+        && { shield_manifest_record "$link"; ok "persist" "$link -> main.sh (команда: guard)"; } \
         || log warn "persist" "symlink $link не создан"
 }
 
@@ -103,6 +106,7 @@ shield_persist_security_sysctl() {
         "net.ipv4.conf.default.rp_filter=1|то же для новых интерфейсов"
         "net.ipv4.icmp_echo_ignore_broadcasts=1|smurf-защита: не отвечать на broadcast ping"
         "net.ipv4.icmp_ignore_bogus_error_responses=1|не отвечать на некорректные ICMP errors"
+        "net.ipv4.tcp_rfc1337=1|защита TIME_WAIT от RST-флуда (old fallback v5.0.4)"
         "net.ipv4.conf.all.log_martians=1|логировать martian-пакеты (видимость, ТЗ §27)"
         "net.ipv4.conf.default.log_martians=1|то же для новых интерфейсов"
         "net.ipv4.conf.all.accept_redirects=0|не принимать ICMP redirects (MITM-вектор)"

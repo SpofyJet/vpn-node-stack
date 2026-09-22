@@ -61,16 +61,20 @@ shield_rollback() {
         systemctl disable shieldnode.service >/dev/null 2>&1 || true
         systemctl daemon-reload 2>/dev/null || true
         # откат = удаление нашего firewall (возврат к состоянию «shieldnode не было»)
-        nft destroy table inet shieldnode 2>/dev/null || true
+        # delete, а не destroy: destroy появился только в nft 1.0.8 (Debian 12 = 1.0.6)
+        nft delete table inet shieldnode 2>/dev/null || true
         rm -f /run/shieldnode/emergency
         # guard-symlink (в manifest, удалится и вместе с файлами; тут — явно)
-        [ -L /usr/local/sbin/guard ] && [ "$(readlink /usr/local/sbin/guard 2>/dev/null || true)" = "$SHIELD_DIR/install.sh" ] && rm -f /usr/local/sbin/guard || true
+        # symlink guard указывает на main.sh (вызов через него = read-only дашборд)
+        [ -L /usr/local/sbin/guard ] && [ "$(readlink /usr/local/sbin/guard 2>/dev/null || true)" = "$SHIELD_DIR/main.sh" ] && rm -f /usr/local/sbin/guard || true
     else
-        log info "dry-run" "would: disable timers/service, destroy table inet shieldnode, rm emergency marker"
+        log info "dry-run" "would: disable timers/service, delete table inet shieldnode, rm emergency marker"
     fi
 
     # 4. контракт: убрать [shieldnode] из stack.conf
-    local conf="$NODE_PROFILE_DIR/stack.conf"
+    # Путь — ЛИТЕРАЛ (/etc/node-profile.d — общий каталог контракта; NODE_PROFILE_DIR
+    # существует только в процессе node и здесь даёт unbound variable)
+    local conf="/etc/node-profile.d/stack.conf"
     if [ -f "$conf" ] && [ "${DRY_RUN:-0}" != "1" ]; then
         local tmp; tmp="$(mktemp)"
         awk '/^\[shieldnode\]/{skip=1; next} /^\[/{skip=0} !skip' "$conf" > "$tmp" || true

@@ -12,7 +12,7 @@ node_detect() {
         echo "# node diagnostics — $ts"
         echo "## system"
         uname -a
-        cat /etc/os-release 2>/dev/null | head -4
+        cat /etc/os-release 2>/dev/null | head -4 || true
         echo "virt: $(systemd-detect-virt 2>/dev/null || echo unknown)"
         echo "cpus: $(node_cpu_count)"
         awk '/MemTotal|MemAvailable/{print}' /proc/meminfo
@@ -50,7 +50,7 @@ node_detect() {
                  net.ipv6.conf.lo.disable_ipv6 net.ipv4.tcp_congestion_control \
                  net.core.default_qdisc net.core.somaxconn \
                  net.core.netdev_budget net.ipv4.tcp_max_tw_buckets \
-                 net.core.rmem_default vm.dirty_ratio \
+                 net.core.rmem_default vm.dirty_ratio vm.dirty_bytes \
                  net.netfilter.nf_conntrack_max; do
             printf '%s = %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null || echo '?')"
         done
@@ -60,6 +60,10 @@ node_detect() {
         echo "irqbalance: $(systemctl is-active irqbalance 2>/dev/null || echo inactive)"
         echo "nft: $(command -v nft >/dev/null 2>&1 && echo present || echo MISSING)"
         echo "xray_units:"
+        # NB: в apply-режиме main.sh не source'ит lib/limits.sh до node_detect —
+        # node_limits_detect_units здесь недоступна, секция будет пустой
+        # (2>/dev/null гасит «command not found»). Это осознанно: полный список
+        # юнитов есть в режиме detect (main.sh подключает limits.sh явно).
         node_limits_detect_units 2>/dev/null | sed 's/^/  /' || true
         echo
         echo "## forbidden-cpu-params"
@@ -68,7 +72,9 @@ node_detect() {
             if grep -qw -- "$p" /proc/cmdline 2>/dev/null; then echo "  cmdline: $p"; found=1; fi
             if grep -qE "^[[:space:]]*GRUB_CMDLINE_LINUX.*${p//./\\.}" /etc/default/grub 2>/dev/null; then echo "  grub: $p"; found=1; fi
         done
-        [ "$found" -eq 0 ] && echo "  none"
+        # if, а не `&& echo`: при found=1 `&&`-цепочка вернёт rc=1 и set -e
+        # убьёт apply ровно тогда, когда запрещённые CPU-параметры НАЙДЕНЫ
+        if [ "$found" -eq 0 ]; then echo "  none"; fi
     } > "$snap"
     chmod 0640 "$snap"
 

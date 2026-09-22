@@ -3,7 +3,8 @@
 set -euo pipefail
 
 SHIELD_VERSION="1.0.0"
-SHIELD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
+SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
 export SHIELD_STATE_DIR="${SHIELD_STATE_DIR:-/var/lib/shieldnode}"
 export SHIELD_LOG="${SHIELD_LOG:-/var/log/shieldnode.log}"
@@ -124,7 +125,11 @@ case "$cmd" in
         shield_rollback "$subarg"
         ;;
     emergency)
+        # on/off меняют таблицу — тот же lock, что и у apply (status — read-only, не нужен)
+        [ "$subarg" = "status" ] || acquire_lock
         # off требует полного apply — подключаем весь стек как в apply
+        # (blocklist/crowdsec обязательны: shield_apply зовёт shield_blocklist_install,
+        # без source — command not found и падение посреди apply)
         # shellcheck source=detect.sh
         source "$SHIELD_DIR/detect.sh"
         # shellcheck source=lib/nft.sh
@@ -133,12 +138,16 @@ case "$cmd" in
         source "$SHIELD_DIR/emergency.sh"
         # shellcheck source=firewall.sh
         source "$SHIELD_DIR/firewall.sh"
+        # shellcheck source=lib/crowdsec.sh
+        source "$SHIELD_DIR/lib/crowdsec.sh"
         # shellcheck source=ssh.sh
         source "$SHIELD_DIR/ssh.sh"
         # shellcheck source=limits.sh
         source "$SHIELD_DIR/limits.sh"
         # shellcheck source=persist.sh
         source "$SHIELD_DIR/persist.sh"
+        # shellcheck source=lib/blocklist.sh
+        source "$SHIELD_DIR/lib/blocklist.sh"
         shield_emergency "$subarg"
         ;;
     uninstall)

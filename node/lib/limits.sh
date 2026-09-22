@@ -17,11 +17,13 @@ node_limits_detect_units() {
             units+=("$u")
         fi
     done < <(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
-    # fallback: по имени процесса
+    # fallback: по имени процесса (ps -o unit= уже даёт имя юнита; мёртвый
+    # systemctl show -p Unit поверх него убран — он получал имя юнита как аргумент
+    # и возвращал пусто)
     if [ "${#units[@]}" -eq 0 ]; then
         local pid
         for pid in $(pgrep -f 'xray|remnanode' 2>/dev/null || true); do
-            u="$(systemctl show -p Unit --value "$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ')" 2>/dev/null || true)"
+            u="$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ')"
             [ -n "$u" ] && [ "$u" != "n/a" ] && units+=("$u")
         done
     fi
@@ -44,6 +46,8 @@ node_limits_persist() {
         n=$((n + 1))
     done < <(node_limits_detect_units)
     [ "$n" -eq 0 ] && warn "limits" "systemd-unit'ы xray/remnanode не найдены (docker-only?). Drop-in не создан; примени LimitNOFILE вручную в compose/unit контейнера."
-    systemctl daemon-reload
+    # daemon-reload в chroot/контейнере без systemd падает — это не повод
+    # ронять весь apply (drop-in'ы подхватятся при первом же boot/reload)
+    systemctl daemon-reload 2>/dev/null || warn "limits" "systemctl daemon-reload не удался (chroot/контейнер?) — drop-in'ы применятся при boot"
     ok "limits" "daemon-reload done; drop-ins применятся при следующем рестарте сервисов (сейчас НЕ рестартуем)"
 }

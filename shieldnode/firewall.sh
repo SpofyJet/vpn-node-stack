@@ -21,9 +21,11 @@ shield_table_dump() {
 }
 
 # shield_contract_write — [shieldnode] в /etc/node-profile.d/stack.conf (schema v2, ТЗ §15).
+# Путь — ЛИТЕРАЛ: переменная NODE_PROFILE_DIR живёт только в процессе node,
+# в shieldnode её нет (unbound-баг 2026-09-22 в rollback/contract).
 shield_contract_write() {
-    local conf="$NODE_PROFILE_DIR/stack.conf"
-    mkdir -p "$NODE_PROFILE_DIR" 2>/dev/null || true
+    local conf="/etc/node-profile.d/stack.conf"
+    mkdir -p "/etc/node-profile.d" 2>/dev/null || true
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log info "dry-run" "contract: append [shieldnode] to $conf"
         return 0
@@ -53,7 +55,7 @@ shield_self_test() {
     done
     # 2. наборы существуют
     local s
-    for s in whitelist_v4 protected_tcp ssh_abusers tcp_abusers udp_abusers temporary_blocklist; do
+    for s in whitelist_v4 protected_tcp ssh_abusers tcp_abusers udp_abusers temporary_blocklist ssh_connlimit tcp_connlimit; do
         nft list set inet shieldnode "$s" >/dev/null 2>&1 || { log error "selftest" "набор $s отсутствует"; fails=$((fails+1)); }
     done
     # 3. SSH локально жив (anti-lockout, ТЗ §20): tcp-connect на loopback по каждому SSH-порту
@@ -110,28 +112,34 @@ shield_apply() {
     bdump="$SHIELD_BACKUP_DIR/${ts}.nft"
     shield_table_dump "$bdump" || log info "apply" "таблицы inet shieldnode ещё не было — чистый старт"
 
-    # --- применение: destroy + create, затем немедленная runtime-whitelist админа ---
-    nft destroy table inet shieldnode 2>/dev/null || true
-    if ! nft -f "$tmp" 2>/dev/null; then
+    # --- применение: внешний destroy УБРАН — ruleset начинается с тройки
+    # table/delete/table, замена атомарна одной транзакцией nft -f (ТЗ §26).
+    # Это закрывает и meter EBUSY на re-apply, и fail-open окно destroy→create.
+    if ! nft -f "$tmp" 2>"$tmp.err"; then
+        # stderr nft — в консоль и лог, иначе диагностика теряется (как у nft -c выше)
+        sed 's/^/  nft: /' "$tmp.err" >&2 || true
         # ядро отвергло ruleset (parse-check не ловит kernel-side): восстанавливаем backup
-        log error "apply" "nft -f отклонён ядром — откат к предыдущему ruleset"
+        log error "apply" "nft -f отклонён ядром: $(tr '\n' ';' < "$tmp.err" | cut -c1-400) — откат к предыдущему ruleset"
         if [ -s "$bdump" ]; then
+            # delete перед restore: поверх ЖИВОЙ таблицы restore падает (meter EBUSY)
+            nft delete table inet shieldnode 2>/dev/null || true
             nft -f "$bdump" || shield_emergency on "apply rejected and backup restore failed"
-            rm -f "$tmp"
+            rm -f "$tmp" "$tmp.err"
             die "nft -f failed: ядро отклонило ruleset; восстановлен предыдущий ruleset"
         fi
-        rm -f "$tmp"
+        rm -f "$tmp" "$tmp.err"
         die "nft -f failed: ядро отклонило ruleset; предыдущей таблицы не было — firewall не активен (fail-open)"
     fi
+    rm -f "$tmp.err"
     shield_ssh_whitelist_admin_runtime
 
     # --- self-test; при провале — auto-rollback (ТЗ §20/§27) ---
     if ! shield_self_test; then
         log error "apply" "SELF-TEST ПРОВАЛЕН — откат к предыдущему ruleset"
+        # delete перед restore: поверх ЖИВОЙ новой таблицы restore из bdump падает (meter EBUSY)
+        nft delete table inet shieldnode 2>/dev/null || true
         if [ -s "$bdump" ]; then
             nft -f "$bdump" || shield_emergency on "self-test failed and backup restore failed"
-        else
-            nft destroy table inet shieldnode 2>/dev/null || true
         fi
         rm -f "$tmp"
         die "self-test failed — состояние откачено (backup: $bdump)"

@@ -52,13 +52,26 @@ shield_crowdsec_agent_ensure() {
         fi
         log info "crowdsec" "установка crowdsec (официальный репозиторий)…"
         # официальный способ: packagecloud-репо (install.crowdsec.net) — то же,
-        # что и в старом стеке; без bash|curl-пайпа: добавляем репо явно
-        local arch="amd64"
+        # что и в старом стеке. БЕЗ curl|bash-пайпа: скачиваем скрипт во
+        # временный файл, проверяем, что он непустой, и запускаем файлом.
+        local arch="amd64" cs_install=""
         [ "$(uname -m)" = "aarch64" ] && arch="arm64"
-        curl -fsSL --connect-timeout 15 --max-time 60 https://install.crowdsec.net/install.sh 2>/dev/null | bash -s -- -i -a "$arch" >/dev/null 2>&1 || {
-            warn "crowdsec" "не удалось добавить репозиторий/установить crowdsec (сеть/права?) — фид не будет работать"
+        cs_install="$(mktemp /tmp/crowdsec-install.XXXXXX)" || {
+            warn "crowdsec" "mktemp для install-скрипта не удался — фид не будет работать"
             return 1
         }
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$cs_install" \
+                https://install.crowdsec.net/install.sh 2>/dev/null || [ ! -s "$cs_install" ]; then
+            rm -f "$cs_install"
+            warn "crowdsec" "не удалось скачать install-скрипт crowdsec (сеть/права?) — фид не будет работать"
+            return 1
+        fi
+        if ! bash "$cs_install" -i -a "$arch" >/dev/null 2>&1; then
+            rm -f "$cs_install"
+            warn "crowdsec" "не удалось добавить репозиторий crowdsec — фид не будет работать"
+            return 1
+        fi
+        rm -f "$cs_install"
         DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec >/dev/null 2>&1 || {
             warn "crowdsec" "apt install crowdsec не удался — фид не будет работать"
             return 1
@@ -84,7 +97,8 @@ shield_crowdsec_agent_ensure() {
     if [ "$(shield_conf_get CROWDSEC_WHITELIST_SYNC 1)" = "1" ]; then
         local wip
         for wip in $(shield_crowdsec_whitelist_ips); do
-            if ! cscli decisions list -o json 2>/dev/null | grep -q "\"$wip\""; then
+            # grep -F: точки в IP — regex-wildcards, без -F ложные совпадения
+            if ! cscli decisions list -o json 2>/dev/null | grep -qF "\"$wip\""; then
                 cscli decisions add --ip "$wip" --type whitelist --duration 8760h >/dev/null 2>&1 || true
             fi
         done
@@ -104,7 +118,8 @@ shield_crowdsec_agent_status() {
     command -v cscli >/dev/null 2>&1 || { echo "agent: not-installed"; return 0; }
     local capi="no" n="?"
     cscli capi status >/dev/null 2>&1 && capi="yes"
-    n="$(cscli decisions list -t ban -o json 2>/dev/null | grep -c '"value"' 2>/dev/null || echo 0)"
+    # grep -c уже печатает "0" при 0 совпадений (rc=1) — "|| echo 0" дал бы "0\n0"
+    n="$(cscli decisions list -t ban -o json 2>/dev/null | grep -c '"value"' 2>/dev/null || true)"
     local act; act="$(systemctl is-active crowdsec.service 2>/dev/null || echo inactive)"
     echo "agent: capi=$capi decisions=$n service=$act"
 }

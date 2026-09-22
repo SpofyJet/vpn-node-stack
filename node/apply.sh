@@ -10,7 +10,9 @@ node_persist() {
 node_contract_write() {
     local conf="$NODE_PROFILE_DIR/stack.conf"
     local tmp
-    tmp="$(mktemp)"
+    mkdir -p "$NODE_PROFILE_DIR" 2>/dev/null || true
+    # mktemp в том же каталоге: mv атомарен только внутри одной ФС (/tmp часто tmpfs)
+    tmp="$(mktemp "$NODE_PROFILE_DIR/.stack.conf.XXXXXX")"
     {
         if [ -f "$conf" ]; then
             awk '/^\[node\]/{skip=1; next} /^\[/{skip=0} !skip' "$conf"
@@ -62,7 +64,12 @@ node_apply() {
 
     log info "apply" "sysctl keys planned: $(wc -l < "$NODE_PLAN_FILE")"
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        column -t -s$'\t' "$NODE_PLAN_FILE" | sed 's/^/  /'
+        # column — из bsdmainutils/util-linux, на минимальных образах может отсутствовать
+        if command -v column >/dev/null 2>&1; then
+            column -t -s$'\t' "$NODE_PLAN_FILE" | sed 's/^/  /'
+        else
+            sed 's/^/  /' "$NODE_PLAN_FILE"
+        fi
         log info "apply" "--dry-run: запись не выполнялась"
         return 0
     fi
@@ -71,38 +78,51 @@ node_apply() {
     node_xray_snapshot_meta "$NODE_XRAY_META_BEFORE"
 
     # ---- persist + apply ----
-    node_conntrack_ensure_module  # до sysctl: nf_conntrack_max требует загруженного модуля
+    # rc-аккумуляция: один упавший модуль (напр. systemctl daemon-reload в
+    # chroot/контейнере) не должен ронять весь apply — фиксируем, продолжаем,
+    # отчёт и ненулевой exit — в конце. Критичные этапы (sysctl write/apply,
+    # self-test, контракт) остаются фатальными по текущей логике проекта.
+    local rc=0 failed_steps=""
+    node_run_step() { # <имя> <команда...> — subshell: set -e внутри шага работает, rc копим снаружи
+        local name="$1"; shift
+        ( "$@" ) || { rc=$((rc+1)); failed_steps+=" $name"; log error "apply" "шаг '$name' завершился с ошибкой — продолжаем, итог в конце"; }
+    }
+
+    ( node_conntrack_ensure_module ) || { rc=$((rc+1)); failed_steps+=" conntrack_ensure_module"; log error "apply" "шаг 'conntrack_ensure_module' завершился с ошибкой — продолжаем, итог в конце"; }  # до sysctl: nf_conntrack_max требует загруженного модуля
     node_sysctl_write
     node_sysctl_apply
-    node_conntrack_persist
-    node_conntrack_apply
-    node_services_apply   # irqbalance выключаем ДО ручной IRQ-affinity
-    node_storage_apply
-    node_limits_persist
+    node_run_step conntrack_persist        node_conntrack_persist
+    node_run_step conntrack_apply          node_conntrack_apply
+    node_run_step services_apply           node_services_apply   # irqbalance выключаем ДО ручной IRQ-affinity
+    node_run_step storage_apply            node_storage_apply
+    node_run_step limits_persist           node_limits_persist
 
-    node_nic_diag
-    node_nic_apply_rings
-    node_nic_opt_apply
-    node_nic_lro_off
-    node_nic_low_latency
-    node_irq_diag
-    node_irq_apply
-    node_irq_affinity_apply
-    node_cpu_check
-    node_network_mtu_diag
-    node_network_mss_clamp
-    node_network_docker_integration
-    node_fq_tune_apply
-    node_xanmod_install
-    node_logrotate_persist
-    node_rt_boot_persist
+    node_run_step nic_diag                 node_nic_diag
+    node_run_step nic_apply_rings          node_nic_apply_rings
+    node_run_step nic_opt_apply            node_nic_opt_apply
+    node_run_step nic_lro_off              node_nic_lro_off
+    node_run_step nic_low_latency          node_nic_low_latency
+    node_run_step irq_diag                 node_irq_diag
+    node_run_step irq_apply                node_irq_apply
+    node_run_step irq_affinity_apply       node_irq_affinity_apply
+    node_run_step cpu_check                node_cpu_check
+    node_run_step network_mtu_diag         node_network_mtu_diag
+    node_run_step network_mss_clamp        node_network_mss_clamp
+    node_run_step network_docker           node_network_docker_integration
+    node_run_step fq_tune_apply            node_fq_tune_apply
+    node_run_step xanmod_install           node_xanmod_install
+    node_run_step logrotate_persist        node_logrotate_persist
+    node_run_step rt_boot_persist          node_rt_boot_persist
 
-    node_sysctl_owner_dump
+    node_run_step sysctl_owner_dump        node_sysctl_owner_dump
 
     # ---- self-test ----
     node_self_test "$snapshot_before"
 
     node_contract_write
+    if [ "$rc" -gt 0 ]; then
+        die "apply завершён с ошибками в $rc модуле(ях):${failed_steps}. Система частично применена — смотри $NODE_LOG; при необходимости: bash install.sh rollback"
+    fi
     ok "apply" "apply завершён. status: bash install.sh status"
 }
 
@@ -245,11 +265,26 @@ node_rt_boot_persist() {
 
 node_rt_reapply() {
     log info "rt" "=== rt-reapply: только runtime-твики (sysctl-файлы не трогаем) ==="
+    # main.sh в режиме rt-reapply подключает ТОЛЬКО apply.sh — persist.sh здесь
+    # не засурсен, и node_persist падал бы с «node_persist_stream: command not
+    # found» на node_fq_tune_apply. Подключаем явно (идемпотентно).
+    # shellcheck source=persist.sh
+    if [ -f "$NODE_DIR/persist.sh" ]; then
+        source "$NODE_DIR/persist.sh"
+    else
+        warn "rt" "$NODE_DIR/persist.sh не найден — persist-записи будут пропущены с ошибкой"
+    fi
+    source "$NODE_DIR/lib/sysctl.sh"
     source "$NODE_DIR/lib/conntrack.sh"
     source "$NODE_DIR/lib/nic.sh"
     source "$NODE_DIR/lib/irq.sh"
     source "$NODE_DIR/lib/network.sh"
     source "$NODE_DIR/lib/datapath.sh"
+    # conntrack_plan НЕ вызывался → NODE_CONNTRACK_HASHSIZE был unbound (set -u)
+    # на node_conntrack_apply. План здесь только вычисляет значения (sysctl-файлы
+    # не трогаем — plan_init пишет во временный файл плана).
+    node_sysctl_plan_init
+    node_conntrack_plan
     node_conntrack_ensure_module
     node_conntrack_apply
     node_nic_apply_rings

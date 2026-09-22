@@ -65,6 +65,13 @@ xt_xanmod_gate() {
 }
 t "xanmod_supported требует Debian/Ubuntu x86_64" xt_xanmod_gate
 
+# --- XanMod-ветка: имя пакета по branch (функции живут в текущем шелле — без bash -c) ---
+xt_pkg_bad() { ! node_xanmod_pkg edge v2; }
+t "xanmod pkg: lts -> linux-xanmod-lts-x64v3"   test "$(node_xanmod_pkg lts v3)" = "linux-xanmod-lts-x64v3"
+t "xanmod pkg: main -> linux-xanmod-x64v2"      test "$(node_xanmod_pkg main v2)" = "linux-xanmod-x64v2"
+t "xanmod pkg: дефолт lts (defaults.conf)"      grep -q '^XANMOD_BRANCH=lts$' "$NODE_DIR/node.defaults.conf"
+t "xanmod pkg: мусорная ветка отвергается"      xt_pkg_bad
+
 # --- BBR-active флаг ---
 t "bbr_active без bbr = no" bash -c '! node_bbr_active'
 

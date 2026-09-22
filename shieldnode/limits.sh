@@ -17,7 +17,6 @@ shield_limit_num() {
 
 # shield_limits_resolve — выставить SH_R_* / SH_F_* для lib/nft.sh.
 shield_limits_resolve() {
-    local cpus; cpus="$(shield_cpu_count)"
     export SH_R_SSH_CONN_MAX SH_R_SSH_NEW_RATE SH_R_SSH_NEW_BURST
     export SH_R_TCP_NEW_RATE SH_R_TCP_NEW_BURST SH_R_TCP_SYN_RATE SH_R_TCP_SYN_BURST SH_R_TCP_CONN_MAX SH_R_TCP_GLOBAL_CEIL
     export SH_R_UDP_RATE SH_R_UDP_BURST SH_R_UDP_GLOBAL_CEIL
@@ -34,10 +33,21 @@ shield_limits_resolve() {
     SH_R_TCP_SYN_RATE="$(shield_limit_num TCP_SYN_RATE 50)"
     SH_R_TCP_SYN_BURST="$(shield_limit_num TCP_SYN_BURST 100)"
     SH_R_TCP_CONN_MAX="$(shield_limit_num TCP_CONN_MAX 15000)"
-    SH_R_TCP_GLOBAL_CEIL="$(shield_limit_num TCP_GLOBAL_CEIL $((cpus * 2000)))"
-    SH_R_UDP_RATE="$(shield_limit_num UDP_RATE 500)"
-    SH_R_UDP_BURST="$(shield_limit_num UDP_BURST 1000)"
-    SH_R_UDP_GLOBAL_CEIL="$(shield_limit_num UDP_GLOBAL_CEIL $((cpus * 5000)))"
+    # Глобальные потолки: дефолт 0 (ВЫКЛЮЧЕНЫ) — опасны на CGNAT-нодах:
+    # один NAT-пул клиентов набьёт общий потолок и положит защищённые порты
+    # для всех. Включать осознанно, значением из конфига.
+    SH_R_TCP_GLOBAL_CEIL="$(shield_limit_num TCP_GLOBAL_CEIL 0)"
+    # UDP per-src: 20000/с (≈216 Мбит/с на source-IP при QUIC-датаграмме 1350B,
+    # без учёта GRO). Асимметрия GRO в нашу пользу: легитимный Hysteria2-поток —
+    # один flow, GRO склеивает датаграммы ДО nftables (гигабитный клиент ≈ 3-12k
+    # посчитанных pps); флуд с рандомных портов/IP — каждый пакет отдельный flow,
+    # GRO не склеивает, считается полный wire-pps (реальный флуд = 100k-1M pps,
+    # ловится и под 20000). Стартовая точка — боевые 10000/с старого стека
+    # (v3.20=1500 резало легитимных → v3.22=10000), поднято ×2 под гигабитных
+    # одиночек. CGNAT-экстремум (4K на 50+ устройств за одним IP) — TRUSTED_IPS.
+    SH_R_UDP_RATE="$(shield_limit_num UDP_RATE 20000)"
+    SH_R_UDP_BURST="$(shield_limit_num UDP_BURST 40000)"
+    SH_R_UDP_GLOBAL_CEIL="$(shield_limit_num UDP_GLOBAL_CEIL 0)"
 
     SH_R_SSH_ABUSERS_TIMEOUT="$(shield_limit_num SSH_ABUSERS_TIMEOUT 3600)"
     SH_R_SSH_ABUSERS_SIZE="$(shield_limit_num SSH_ABUSERS_SIZE 65536)"
@@ -102,8 +112,16 @@ shield_limits_resolve() {
     local excl_ports_v4="" excl_v4="" excl_v6="" line op arg
     if [ -f "$SHIELD_EXCLUDE" ]; then
         while read -r line; do
+            # CRLF: exclude.conf могли сохранить из Windows — срезаем \r,
+            # иначе аргумент уезжает в nft с мусором (баг 2026-09-22)
+            line="${line%$'\r'}"
             case "$line" in ''|\#*) continue ;; esac
             op="${line%%[[:space:]]*}"; arg="${line#*[[:space:]]}"
+            # строка без аргумента ("PORT" без значения) — пропускаем с warn
+            if [ "$arg" = "$op" ] || [ -z "$arg" ]; then
+                log warn "exclude" "директива без значения, пропущена: $line"
+                continue
+            fi
             case "$op" in
                 PORT)  excl_ports_v4="$excl_ports_v4 $arg" ;;
                 IP)    case "$arg" in *:*) excl_v6="$excl_v6 $arg" ;; *) excl_v4="$excl_v4 $arg" ;; esac ;;

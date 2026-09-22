@@ -36,7 +36,7 @@ export SH_F_ENABLE_ESTABLISHED=1 SH_F_ENABLE_ABUSE_LIMITING=1
 export SH_R_SSH_CONN_MAX=8 SH_R_SSH_NEW_RATE=10 SH_R_SSH_NEW_BURST=20
 export SH_R_TCP_NEW_RATE=20 SH_R_TCP_NEW_BURST=40 SH_R_TCP_SYN_RATE=500 SH_R_TCP_SYN_BURST=1000
 export SH_R_TCP_CONN_MAX=15000 SH_R_TCP_GLOBAL_CEIL=0
-export SH_R_UDP_RATE=500 SH_R_UDP_BURST=1000 SH_R_UDP_GLOBAL_CEIL=0
+export SH_R_UDP_RATE=20000 SH_R_UDP_BURST=40000 SH_R_UDP_GLOBAL_CEIL=0
 export SH_R_SSH_ABUSERS_TIMEOUT=3600 SH_R_SSH_ABUSERS_SIZE=65536
 export SH_R_TCP_ABUSERS_TIMEOUT=900 SH_R_TCP_ABUSERS_SIZE=131072
 export SH_R_UDP_ABUSERS_TIMEOUT=900 SH_R_UDP_ABUSERS_SIZE=65536
@@ -46,6 +46,10 @@ bash -c "source '$SHIELD_DIR/lib/nft.sh'; shield_nft_build_ruleset" > /tmp/shiel
 
 # применяем ВНУТРИ namespace (затронут только netns)
 ip netns exec "$NS" nft -f /tmp/shieldtest-ruleset.nft || { echo "FAIL: ruleset не применился в netns"; exit 1; }
+
+# re-apply того же ruleset ПОВЕРХ живой таблицы: тройка table/delete/table
+# в начале файла делает замену атомарной (meter — named dynset, иначе EBUSY)
+ip netns exec "$NS" nft -f /tmp/shieldtest-ruleset.nft || { echo "FAIL: повторный apply ruleset не прошёл (meter EBUSY?)"; exit 1; }
 
 fails=0
 t() { local name="$1"; shift

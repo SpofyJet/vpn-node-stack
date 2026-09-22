@@ -45,25 +45,31 @@ node_sysctl_add_probed() {
 node_sysctl_write() {
     local file key value
     for file in "${NODE_SYSCTL_FILES[@]}"; do
-        [ -s "$NODE_PLAN_FILE" ] || continue
-        grep -F "$file" "$NODE_PLAN_FILE" > /dev/null 2>&1 || continue
-        {
-            echo "# node — $(date -u '+%Y-%m-%d') — managed by node, do not edit"
-            grep -F "$file" "$NODE_PLAN_FILE" | sort -u -t$'\t' -k1,1 | \
-                awk -F'\t' '{printf "%s = %s\n", $1, $2}'
-        } | node_persist "$file"
+        if [ -s "$NODE_PLAN_FILE" ] && grep -F "$file" "$NODE_PLAN_FILE" > /dev/null 2>&1; then
+            {
+                echo "# node — $(date -u '+%Y-%m-%d') — managed by node, do not edit"
+                grep -F "$file" "$NODE_PLAN_FILE" | sort -u -t$'\t' -k1,1 | \
+                    awk -F'\t' '{printf "%s = %s\n", $1, $2}'
+            } | node_persist "$file"
+        elif [ -f "$file" ]; then
+            # оператор выключил фичу (в плане ключей файла нет), а наш старый
+            # 99-z*-node-*.conf остался на диске — удаляем, иначе устаревшие
+            # значения молча продолжают действовать. backup — перед удалением.
+            if [ "${DRY_RUN:-0}" = "1" ]; then
+                log info "dry-run" "would remove stale $file (нет в текущем плане)"
+            else
+                backup "$file"
+                rm -f "$file"
+                log info "sysctl" "удалён устаревший $file (ключей нет в плане; backup сохранён)"
+            fi
+        fi
     done
 }
 
-# node_persist <dst> — backup + atomic write из stdin (индirection для тестов)
-node_persist() {
-    local dst="$1"
-    if [ "${DRY_RUN:-0}" = "1" ]; then
-        log info "dry-run" "would write $dst"; cat > /dev/null; return 0
-    fi
-    backup "$dst"
-    atomic_write "$dst"
-}
+# ВАЖНО: node_persist здесь НЕ определяется. Делегат с записью в манифест
+# живёт в apply.sh; fallback — в persist.sh. Локальное определение здесь
+# (баг 2026-09: манифест всегда пуст) перекрывало делегат, т.к. этот файл
+# source'ится внутри node_apply ПОСЛЕ apply.sh, — rollback/uninstall ломались.
 
 node_sysctl_apply() {
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "sysctl -p (skipped)"; return 0; }

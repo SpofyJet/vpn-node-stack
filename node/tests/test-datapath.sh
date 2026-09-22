@@ -47,10 +47,11 @@ t "plan: tcp_max_tw_buckets=524288" bash -c "grep -q 'net.ipv4.tcp_max_tw_bucket
 t "plan: tcp_mem по формуле 25% RAM" bash -c "grep -q \"net.ipv4.tcp_mem	$exp_tcp_mem\" '$PLAN'"
 t "plan: rmem_default tier-aware" bash -c "grep -q \"net.core.rmem_default	$exp_rd\" '$PLAN'"
 t "plan: wmem_default = rmem_default" bash -c "grep -q \"net.core.wmem_default	$exp_rd\" '$PLAN'"
-t "plan: dirty_background_ratio=5" bash -c "grep -q 'vm.dirty_background_ratio	5' '$PLAN'"
-t "plan: dirty_ratio=10" bash -c "grep -q 'vm.dirty_ratio	10' '$PLAN'"
+t "plan: dirty_background_bytes=64MB" bash -c "grep -q 'vm.dirty_background_bytes	67108864' '$PLAN'"
+t "plan: dirty_bytes=256MB" bash -c "grep -q 'vm.dirty_bytes	268435456' '$PLAN'"
+t "plan: dirty_ratio ОТСУТСТВУЮТ (bytes перекрывают ratio)" bash -c "! grep -qE 'vm.dirty_background_ratio|vm.dirty_ratio	' '$PLAN'"
 t "plan: rmem_default идёт в BASE-файл" bash -c "grep -q \"net.core.rmem_default	$exp_rd	$NODE_SYSCTL_BASE\" '$PLAN'"
-t "plan: dirty_ratio идёт в MEM-файл (84)" bash -c "grep -q \"vm.dirty_ratio	10	$NODE_SYSCTL_MEM\" '$PLAN'"
+t "plan: dirty_bytes идут в MEM-файл (84)" bash -c "grep -q \"vm.dirty_bytes	268435456	$NODE_SYSCTL_MEM\" '$PLAN'"
 t "plan: plb probed (DRY_RUN добавляет)" bash -c "grep -q 'net.ipv4.tcp_plb_enabled	1' '$PLAN'"
 if [ "$tier_mb" -le 4096 ]; then
     t "plan: overcommit_memory=1 на tier<=4GB" bash -c "grep -q 'vm.overcommit_memory	1' '$PLAN'"
@@ -62,7 +63,7 @@ t "plan: busy_poll НЕТ по умолчанию" bash -c "! grep -q 'busy_poll
 # --- ENABLE_DATAPATH=0 гасит всё ---
 sed -i 's/^ENABLE_DATAPATH=1$/ENABLE_DATAPATH=0/' "$CONFIG_CACHE"
 replan
-t "мастер-выключатель: план пуст" bash -c "test ! -s '$PLAN' || ! grep -qE 'netdev_budget|tcp_max_tw|dirty_ratio|rmem_default' '$PLAN'"
+t "мастер-выключатель: план пуст" bash -c "test ! -s '$PLAN' || ! grep -qE 'netdev_budget|tcp_max_tw|dirty_bytes|rmem_default' '$PLAN'"
 sed -i 's/^ENABLE_DATAPATH=0$/ENABLE_DATAPATH=1/' "$CONFIG_CACHE"
 
 # --- busy_poll opt-in ---
@@ -72,14 +73,13 @@ t "busy_poll opt-in: poll/read=50" bash -c "grep -q 'net.core.busy_poll	50' '$PL
 sed -i 's/^ENABLE_BUSY_POLL=.*/ENABLE_BUSY_POLL=0/' "$CONFIG_CACHE"
 
 # --- оверрайды (sed in-place: первое совпадение в cache выигрывает) ---
-sed -i -e 's/^NETDEV_BUDGET=.*/NETDEV_BUDGET=900/'        -e 's/^TCP_MAX_TW_BUCKETS=.*/TCP_MAX_TW_BUCKETS=1048576/'        -e 's/^TCP_MEM_PCT=.*/TCP_MEM_PCT=30/'        -e 's/^VM_DIRTY_BG_RATIO=.*/VM_DIRTY_BG_RATIO=3/'        -e 's/^VM_DIRTY_RATIO=.*/VM_DIRTY_RATIO=6/' "$CONFIG_CACHE"
+sed -i -e 's/^NETDEV_BUDGET=.*/NETDEV_BUDGET=900/'        -e 's/^TCP_MAX_TW_BUCKETS=.*/TCP_MAX_TW_BUCKETS=1048576/'        -e 's/^TCP_MEM_PCT=.*/TCP_MEM_PCT=30/' "$CONFIG_CACHE"
 replan
 t "оверрайд: NETDEV_BUDGET=900" bash -c "grep -q 'net.core.netdev_budget	900' '$PLAN'"
 t "оверрайд: TW_BUCKETS=1048576" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	1048576' '$PLAN'"
 m30=$(( pages * 30 / 100 ))
 exp30="$((m30*3/4)) $((m30*7/8)) $m30"
 t "оверрайд: TCP_MEM_PCT=30 пересчитан" bash -c "grep -q \"net.ipv4.tcp_mem	$exp30\" '$PLAN'"
-t "оверрайд: dirty 3/6" bash -c "grep -q 'vm.dirty_background_ratio	3' '$PLAN' && grep -q 'vm.dirty_ratio	6' '$PLAN'"
 
 # --- fq tune: эмиссия юнита (DRY_RUN) ---
 OUT=/tmp/node-dp-test/persist

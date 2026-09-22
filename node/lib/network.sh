@@ -70,7 +70,8 @@ node_network_mss_clamp() {
         echo "WantedBy=multi-user.target"
     } | node_persist "$unit"
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        systemctl daemon-reload
+        # daemon-reload может падать в chroot/контейнере — не роняем apply
+        systemctl daemon-reload 2>/dev/null || warn "network" "systemctl daemon-reload не удался (chroot/контейнер?)"
         systemctl enable --now node-mss-clamp.service >/dev/null 2>&1 || \
             warn "network" "node-mss-clamp.service не поднялся (nft установлен?)"
     fi

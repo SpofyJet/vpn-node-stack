@@ -23,6 +23,8 @@ EOF
     }
     chain prerouting {
         type filter hook prerouting priority -150; policy accept;
+        # loopback ПЕРВЫМ: без него emergency режет lo → мёртвый локальный DNS
+        iifname "lo" accept
         ct state established,related accept
         ip saddr @whitelist_v4 accept
 EOF
@@ -61,8 +63,24 @@ shield_emergency() {
             bdump="$SHIELD_BACKUP_DIR/emergency-$(date '+%Y%m%d-%H%M%S').nft"
             shield_table_dump "$bdump" || true
             if [ "${DRY_RUN:-0}" != "1" ]; then
-                nft destroy table inet shieldnode 2>/dev/null || true
-                nft -c -f "$tmp" && nft -f "$tmp"
+                # порядок: СНАЧАЛА проверка (таблица ещё жива), потом delete, потом apply.
+                # delete решает и meter EBUSY, и дубли правил при повторном `emergency on`.
+                if ! nft -c -f "$tmp"; then
+                    rm -f "$tmp"
+                    die "emergency: nft -c отклонил ruleset — аварийный режим НЕ включён, прежний firewall на месте"
+                fi
+                nft delete table inet shieldnode 2>/dev/null || true
+                if ! nft -f "$tmp"; then
+                    # apply после delete провалился — таблицы нет: восстанавливаем из backup
+                    log error "emergency" "nft -f провалился после delete — восстановление из $bdump"
+                    nft delete table inet shieldnode 2>/dev/null || true
+                    if [ -s "$bdump" ] && nft -f "$bdump"; then
+                        rm -f "$tmp"
+                        die "emergency: apply провалился; восстановлен предыдущий ruleset (backup: $bdump)"
+                    fi
+                    rm -f "$tmp"
+                    die "emergency: apply провалился И restore из backup тоже — firewall отсутствует (fail-open), нужен ручной доступ"
+                fi
                 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$SHIELD_EMERGENCY_MARKER"
                 echo "reason: $reason" >> "$SHIELD_EMERGENCY_MARKER"
             fi

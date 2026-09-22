@@ -3,15 +3,19 @@
 set -euo pipefail
 
 node_conntrack_plan() {
-    local tier max hashsize loose
-    tier="$(node_ram_tier)"
-    case "$tier" in
-        1) max=131072 ;;
-        2) max=262144 ;;
-        3) max=524288 ;;
-        4) max=1048576 ;;
-        *) max=262144 ;;  # неизвестный tier — безопасный средний
-    esac
+    local max hashsize loose
+    # Тиры портированы из старого продакшен-стека (vpn-node-setup.sh, v5.0.6)
+    # по MB-порогам (не по node_ram_tier — гранулярность тоньше):
+    #   ≤1.2GB → 262144  (~200 юзеров), ≤2.5GB → 786432 (~1500 юзеров),
+    #   ≤8.5GB → 1048576 (~3000 юзеров), >8.5GB → 2097152 (~6000 юзеров)
+    # Запись conntrack ≈ 316-320 байт; hashsize = max/4 (netfilter.org).
+    local mb
+    mb="$(node_memtotal_mb)"
+    if   [ "$mb" -le 1200 ]; then max=262144
+    elif [ "$mb" -le 2500 ]; then max=786432
+    elif [ "$mb" -le 8500 ]; then max=1048576
+    else                          max=2097152
+    fi
     max="$(node_conf_get CONNTRACK_MAX "$max")"
     [[ "$max" =~ ^[0-9]+$ ]] || { warn "conntrack" "CONNTRACK_MAX='$max' не число — fallback 262144"; max=262144; }
     # RAM-защита: запись conntrack ≈ 320 байт; таблица max+hashsize+buckets
@@ -37,6 +41,9 @@ node_conntrack_plan() {
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_udp_timeout_stream 600
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_generic_timeout 300
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_loose "$loose"
+    # helper=0: conntrack helper-модули (ftp/sip/...) на VPN-ноде не нужны —
+    # лишний attack surface и неявный NAT-траверсал чужого трафика.
+    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_helper 0
     # стабильность под нагрузкой: conntrack НЕ дропает легитимные ретрансмиты,
     # попавшие «мимо окна» (типично для VPN-потоков с MTU-проблемами)
     if [ "$(node_conf_get ENABLE_CONNTRACK_LIBERAL 1)" = "1" ]; then

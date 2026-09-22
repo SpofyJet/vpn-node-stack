@@ -27,7 +27,9 @@ is_defined() { # $1=fn — определена ли в доступных фа�
     local fn="$1" f
     for f in "${dep_files[@]}"; do
         [ -f "$f" ] || continue
-        grep -qE "^${fn}\(\)|^function ${fn}\b" "$f" && return 0
+        # определение может быть с отступом (fn, объявленная внутри другой fn,
+        # напр. node_run_step внутри node_apply)
+        grep -qE "^[[:space:]]*${fn}\(\)|^[[:space:]]*function ${fn}\b" "$f" && return 0
     done
     return 1
 }
@@ -37,7 +39,7 @@ checks=0
 for fn in $(grep -oE '(^|[[:space:]]+)node_[a-z0-9_]+' apply.sh | grep -oE 'node_[a-z0-9_]+' | grep -vE '_$' | sort -u); do
     # определение самой функции в apply.sh — это не вызов; но мы матчим
     # и заголовки «name() {» — фильтруем: вызовы = token Н в строке-определении
-    if grep -qE "^${fn}\(\)" apply.sh; then
+    if grep -qE "^[[:space:]]*${fn}\(\)" apply.sh; then
         continue   # это определение, не вызов
     fi
     checks=$((checks + 1))

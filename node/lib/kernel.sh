@@ -39,9 +39,24 @@ node_bbr_active() {
 # node_bbr_plan — добавить BBR в sysctl-план, если ядро умеет (иначе warn, не ломаем).
 node_bbr_plan() {
     [ "$(node_conf_get ENABLE_BBR 1)" = "1" ] || { log info "kernel" "ENABLE_BBR=0 — пропуск"; return 0; }
+    # На stock-ядрах модуль tcp_bbr часто НЕ загружен — тогда bbr отсутствует в
+    # tcp_available_congestion_control и BBR молча не включался. Как в старом
+    # стеке: сначала modprobe, потом проверка доступности.
+    if [ "${DRY_RUN:-0}" != "1" ] && command -v modprobe >/dev/null 2>&1; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
     if node_bbr_available; then
         node_sysctl_add "$NODE_SYSCTL_DATAPATH" net.ipv4.tcp_congestion_control bbr
         node_sysctl_add "$NODE_SYSCTL_DATAPATH" net.core.default_qdisc fq
+        # автозагрузка модуля при boot — иначе после reboot sysctl-файл
+        # применяется до загрузки tcp_bbr и congestion_control=bbr не встаёт
+        # (как nf_conntrack через /etc/modules-load.d)
+        if declare -F node_persist >/dev/null 2>&1; then
+            {
+                echo "# node — force-load tcp_bbr (BBR congestion control at boot), managed by node"
+                echo "tcp_bbr"
+            } | node_persist /etc/modules-load.d/tcp_bbr.conf
+        fi
         if [ "$(node_bbr_generation)" = "3" ]; then
             log info "kernel" "BBRv3 доступен (мейнлайн >=6.15) — план: congestion_control=bbr, qdisc=fq"
         else
@@ -77,6 +92,20 @@ node_xanmod_supported() {
     fi
 }
 
+# node_xanmod_pkg — имя метапакета по ветке и CPU-уровню.
+# Ветки XanMod: lts (база LTS-апстрима, стабильные бэкпорты — для прод-нод,
+# дефолт) и main (rolling mainline — свежие фичи, окно регрессий на каждом
+# мажоре; только для тестовых нод). Патчсет (BBRv3, TCP collapse, full-cone
+# NAT) у веток общий — разница в базе.
+node_xanmod_pkg() {
+    local branch="$1" level="$2"
+    case "$branch" in
+        lts)  printf 'linux-xanmod-lts-x64%s' "$level" ;;
+        main) printf 'linux-xanmod-x64%s' "$level" ;;
+        *)    return 1 ;;
+    esac
+}
+
 # node_xanmod_install — установка ядра XanMod (Debian/Ubuntu, apt).
 # Безопасность: backup grub-файла, pin-файл apt, БЕЗ авто-ребута; после ребута
 # повторный `node apply` доведёт BBR (модуль в комплекте ядра).
@@ -85,33 +114,52 @@ node_xanmod_install() {
     node_kernel_is_xanmod && { log info "kernel" "ядро уже XanMod ($(uname -r))"; return 0; }
     node_xanmod_supported || die "XanMod поддерживается только на Debian/Ubuntu x86_64 (тут: $(uname -m), $(grep -oP '^ID=\K.*' /etc/os-release 2>/dev/null || echo '?'))"
 
-    [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "would install XanMod kernel (variant $(node_conf_get XANMOD_VARIANT auto))"; return 0; }
+    local branch
+    branch="$(node_conf_get XANMOD_BRANCH lts)"
+    case "$branch" in lts|main) : ;; *) die "XANMOD_BRANCH: lts|main, получено '$branch'" ;; esac
 
-    local level variant
+    [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "would install XanMod kernel (branch $branch, variant $(node_conf_get XANMOD_VARIANT auto))"; return 0; }
+
+    local level pkg
     level="$(node_conf_get XANMOD_VARIANT "")"; [ -z "$level" ] && level="$(node_cpu_xlevel)"
     case "$level" in v1|v2|v3) : ;; *) die "XANMOD_VARIANT: v1|v2|v3, получено '$level'" ;; esac
+    pkg="$(node_xanmod_pkg "$branch" "$level")"
 
     require_root
-    log info "kernel" "установка linux-xanmod-x64$level (CPU level $level)…"
+    log info "kernel" "установка $pkg (ветка $branch, CPU level $level)…"
     backup /etc/default/grub
     # репозиторий + ключ (backup + atomic + манифест — единые правила проекта)
     backup "$XANMOD_REPO_LIST"
     printf 'deb http://deb.xanmod.org releases main\n' | atomic_write "$XANMOD_REPO_LIST"
     node_manifest_record "$XANMOD_REPO_LIST"
     if command -v wget >/dev/null 2>&1; then
-        wget -qO- https://dl.xanmod.org/gpg.key 2>/dev/null | gpg --dearmor | atomic_write "$XANMOD_GPG" \
-            && node_manifest_record "$XANMOD_GPG" \
-            || log warn "kernel" "gpg key import не удался — продолжаем (apt может ругаться)"
+        # gpg --dearmor при обрыве сети выдавал ПУСТОЙ keyring (apt потом
+        # отвергал репозиторий с невнятной ошибкой). Через temp + проверка -s;
+        # при фейле — rm + die, пустой keyring не оставляем.
+        local ktmp; ktmp="$(mktemp)"
+        if wget -qO- https://dl.xanmod.org/gpg.key 2>/dev/null | gpg --dearmor > "$ktmp" 2>/dev/null && [ -s "$ktmp" ]; then
+            atomic_write "$XANMOD_GPG" < "$ktmp"
+            node_manifest_record "$XANMOD_GPG"
+            rm -f "$ktmp"
+        else
+            rm -f "$ktmp" "$XANMOD_GPG"
+            die "kernel: gpg key import failed (сеть/gpg?) — XanMod не устанавливаем, пустой keyring удалён"
+        fi
     else
         log warn "kernel" "wget отсутствует — добавьте ключ вручную: https://dl.xanmod.org/gpg.key"
     fi
     # сетевой сбой здесь НЕ должен убивать весь apply: система уже оптимизована,
     # контракт ещё не записан — warn + продолжаем (XanMod можно доустановить повторным apply)
     apt-get update -qq || { log warn "kernel" "apt update failed (deb.xanmod.org недоступен?) — XanMod пропущен, повторите apply после исправления сети"; return 0; }
-    apt-get install -y --no-install-recommends "linux-xanmod-x64$level" || { log warn "kernel" "apt install linux-xanmod-x64$level failed — повторите apply"; return 0; }
-    # pin: держим ядро при autoremove
-    printf '%s\n' 'Package: linux-image*xanmod*' 'Pin: release o=XanMod' 'Pin-Priority: 1001' > /etc/apt/preferences.d/xanmod-kernel
-    node_manifest_record /etc/apt/preferences.d/xanmod-kernel
+    apt-get install -y --no-install-recommends "$pkg" || { log warn "kernel" "apt install $pkg failed — повторите apply"; return 0; }
+    # pin: держим ядро при autoremove (через node_persist — backup + манифест,
+    # а не printf > напрямую мимо единой точки записи)
+    if declare -F node_persist >/dev/null 2>&1; then
+        printf '%s\n' 'Package: linux-image*xanmod*' 'Pin: release o=XanMod' 'Pin-Priority: 1001' | node_persist /etc/apt/preferences.d/xanmod-kernel
+    else
+        printf '%s\n' 'Package: linux-image*xanmod*' 'Pin: release o=XanMod' 'Pin-Priority: 1001' | atomic_write /etc/apt/preferences.d/xanmod-kernel
+        node_manifest_record /etc/apt/preferences.d/xanmod-kernel
+    fi
     command -v update-grub >/dev/null 2>&1 && update-grub || true
     node_kernel_reboot_offer
 }

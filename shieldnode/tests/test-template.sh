@@ -38,7 +38,7 @@ export SH_F_ENABLE_ESTABLISHED=1 SH_F_ENABLE_ABUSE_LIMITING=1 SH_F_ENABLE_SYN_PR
 export SH_R_SSH_CONN_MAX=8 SH_R_SSH_NEW_RATE=10 SH_R_SSH_NEW_BURST=20
 export SH_R_TCP_NEW_RATE=300 SH_R_TCP_NEW_BURST=600 SH_R_TCP_SYN_RATE=50 SH_R_TCP_SYN_BURST=100
 export SH_R_TCP_CONN_MAX=15000 SH_R_TCP_GLOBAL_CEIL=8000
-export SH_R_UDP_RATE=500 SH_R_UDP_BURST=1000 SH_R_UDP_GLOBAL_CEIL=20000
+export SH_R_UDP_RATE=20000 SH_R_UDP_BURST=40000 SH_R_UDP_GLOBAL_CEIL=20000
 export SH_R_SSH_ABUSERS_TIMEOUT=3600 SH_R_SSH_ABUSERS_SIZE=65536
 export SH_R_TCP_ABUSERS_TIMEOUT=900 SH_R_TCP_ABUSERS_SIZE=131072
 export SH_R_UDP_ABUSERS_TIMEOUT=900 SH_R_UDP_ABUSERS_SIZE=65536
@@ -60,7 +60,10 @@ shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset.nft
 RS=/tmp/shieldnode-test/ruleset.nft
 
 t "ruleset непуст" test -s "$RS"
+t "идемпотентная тройка: строка 1 = table, строка 2 = delete, затем table {" bash -c "test \"\$(sed -n '1p' '$RS')\" = 'table inet shieldnode' && test \"\$(sed -n '2p' '$RS')\" = 'delete table inet shieldnode' && sed -n '3,\$p' '$RS' | grep -q '^table inet shieldnode {'"
 t "нет destroy table (runtime-файл чистый)" bash -c "! grep -q 'destroy table' '$RS'"
+t "нет nft destroy в генерируемых unit-файлах (persist.sh)" bash -c "! grep -q 'nft destroy' '$SHIELD_DIR/persist.sh'"
+t "нет nft destroy в runtime-скриптах (firewall/emergency/rollback)" bash -c "! grep -q 'nft destroy' '$SHIELD_DIR/firewall.sh' '$SHIELD_DIR/emergency.sh' '$SHIELD_DIR/rollback.sh'"
 t "таблица inet shieldnode" grep -q "table inet shieldnode" "$RS"
 t "цепочка prerouting priority -150 policy accept" grep -q 'chain prerouting' "$RS"
 t "набор whitelist_v4" grep -q 'set whitelist_v4' "$RS"
@@ -75,9 +78,20 @@ set_has_flag() { # $1=ruleset $2=setname $3=flag
 }
 export -f set_has_flag
 t "abuse-наборы: flags dynamic (наполняются из правил — без него падает nft -c)" bash -c "set_has_flag '$RS' ssh_abusers dynamic && set_has_flag '$RS' tcp_abusers dynamic && set_has_flag '$RS' udp_abusers dynamic && set_has_flag '$RS' temporary_blocklist dynamic"
+t "connlimit-наборы: flags dynamic (ssh_connlimit/tcp_connlimit)" bash -c "set_has_flag '$RS' ssh_connlimit dynamic && set_has_flag '$RS' tcp_connlimit dynamic"
+t "connlimit-наборы: БЕЗ timeout (иначе ct count: Operation not supported)" bash -c "set_has_flag '$RS' ssh_connlimit timeout || true; ! set_has_flag '$RS' ssh_connlimit timeout && ! set_has_flag '$RS' tcp_connlimit timeout"
+t "ct count — только внутри add @set (standalone syntax error у nft)" bash -c "! grep -E 'ct count' '$RS' | grep -vq 'add @'"
+t "ct count правила в канонической форме" bash -c "grep -q 'add @ssh_connlimit { ip saddr ct count over' '$RS' && grep -q 'add @tcp_connlimit { ip saddr ct count over' '$RS'"
 t "protected_tcp/udp с портами" bash -c "grep -q 'set protected_tcp' '$RS' && grep -q '8443' '$RS'"
 t "per-src rate-limit ТОЛЬКО через meter" bash -c "grep -q 'meter ssh_new_22' '$RS' && grep -q 'meter tcp_syn' '$RS' && grep -q 'meter udp_rate' '$RS'"
 t "plain limit только для global ceiling" bash -c "grep -q 'limit rate over 8000/minute counter name c_drops_global_tcp drop' '$RS' && grep -q 'limit rate over 20000/second counter name c_drops_global_udp drop' '$RS'"
+t "global ceiling scope: SYN-потолок только на protected_tcp (SSH не задевает)" grep -q 'tcp dport @protected_tcp tcp flags syn ct state new limit rate over 8000/minute' "$RS"
+# --- глобальные потолки: дефолт 0 (off, опасны на CGNAT) — правила НЕ эмитятся ---
+SH_R_TCP_GLOBAL_CEIL=0 SH_R_UDP_GLOBAL_CEIL=0
+shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-noceil.nft
+t "потолки=0: global-правила не эмитятся вообще" bash -c "! grep -q 'counter name c_drops_global_tcp drop' /tmp/shieldnode-test/ruleset-noceil.nft && ! grep -q 'counter name c_drops_global_udp drop' /tmp/shieldnode-test/ruleset-noceil.nft"
+t "потолки=0: счётчики остаются объявлены (наблюдаемость)" bash -c "grep -q 'counter c_drops_global_tcp { }' /tmp/shieldnode-test/ruleset-noceil.nft && grep -q 'counter c_drops_global_udp { }' /tmp/shieldnode-test/ruleset-noceil.nft"
+SH_R_TCP_GLOBAL_CEIL=8000 SH_R_UDP_GLOBAL_CEIL=20000
 t "SSH-правила для обоих портов" bash -c "grep -q 'dport 22 ' '$RS' && grep -q 'dport 2222 ' '$RS'"
 t "ct count SSH_CONN_MAX/TCP_CONN_MAX" bash -c "grep -q 'ct count over 8' '$RS' && grep -q 'ct count over 15000' '$RS'"
 t "invalid-drop флаговые правила (§22)" bash -c "grep -q 'ct state invalid counter name c_drops_invalid drop' '$RS' && grep -q 'fin|syn|rst|ack' '$RS'"
@@ -91,6 +105,11 @@ t "антиспуф выключен по умолчанию" bash -c "! grep -q
 SH_F_ENABLE_ANTISPOOF=1
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-spoof.nft
 t "антиспуф opt-in работает" bash -c "grep -q '10.0.0.0/8' /tmp/shieldnode-test/ruleset-spoof.nft"
+t "антиспуф v6 НЕ эмитится при IPv6=0" bash -c "! grep -q 'c_drops_antispoof_v6 drop' /tmp/shieldnode-test/ruleset-spoof.nft"
+SH_F_IPV6=1
+shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-spoof6.nft
+t "антиспуф v6 opt-in при IPv6=1 (loopback/ULA/link-local/multicast/doc)" bash -c "grep -q 'ip6 saddr { ::1, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32 } counter name c_drops_antispoof_v6 drop' /tmp/shieldnode-test/ruleset-spoof6.nft"
+SH_F_IPV6=0
 SH_F_ENABLE_ANTISPOOF=0
 
 # --- отсутствие абьюз-лимитинга при ENABLE_ABUSE_LIMITING=0 ---
@@ -159,21 +178,30 @@ t "IPv6: abuse-компаньоны _v6" bash -c "grep -q 'ssh_abusers_v6' /tmp/
 SH_F_ADMIN_V4="203.0.113.10"
 shield_emergency_ruleset > /tmp/shieldnode-test/emergency.nft
 t "emergency: только ssh/established/whitelist" bash -c "grep -q 'tcp dport 22 ct state new accept' /tmp/shieldnode-test/emergency.nft && grep -q 'ip protocol tcp drop' /tmp/shieldnode-test/emergency.nft"
+t "emergency: loopback accept первым (иначе мёртвый локальный DNS)" bash -c "grep -q 'iifname \"lo\" accept' /tmp/shieldnode-test/emergency.nft && awk '/chain prerouting/{f=1; next} f && /iifname \"lo\" accept/{ok=1} f && /ct state established/{print ok; exit}' /tmp/shieldnode-test/emergency.nft | grep -q 1"
 t "emergency: скобки сбалансированы" bash -c "test \$(grep -o '{' /tmp/shieldnode-test/emergency.nft | wc -l) = \$(grep -o '}' /tmp/shieldnode-test/emergency.nft | wc -l)"
 
 # --- владение sysctl (§15): net.netfilter.* — жёсткий запрет для shieldnode ---
 t "validate_key_ownership: net.netfilter.* запрещён" bash -c "! validate_key_ownership net.netfilter.nf_conntrack_max"
 t "validate_key_ownership: rp_filter разрешён" validate_key_ownership net.ipv4.conf.all.rp_filter
 
+# --- persist: tcp_rfc1337=1 (защита TIME_WAIT от RST-флуда, old fallback
+#     v5.0.4) — ключ потерялся при разделении старого стека на node/shieldnode;
+#     в DRY_RUN план логируется построчно, файл не пишется.
+source "$SHIELD_DIR/persist.sh"
+shield_persist_security_sysctl > /tmp/shieldnode-test/security-sysctl.log 2>&1
+t "persist: tcp_rfc1337=1 в security-sysctl плане" grep -q 'sysctl net.ipv4.tcp_rfc1337=1' /tmp/shieldnode-test/security-sysctl.log
+t "persist: net.netfilter.* в security-sysctl плане НЕТ (владелец node)" bash -c "! grep -q 'sysctl net.netfilter\.' /tmp/shieldnode-test/security-sysctl.log"
+
 echo
-# базовый цикл = 22; +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 26
-t "counters: 26 именованных счётчиков объявлены (22 базовых + spamhaus/cins/amp/icmp)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 26"
+# базовый цикл = 23 (22 + antispoof_v6); +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 27
+t "counters: 27 именованных счётчиков объявлены (23 базовых + spamhaus/cins/amp/icmp)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 27"
 t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
 t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -q 'icmp type echo-request limit rate over 10/second' '$RS'"
 t "counters: КАЖДОЕ drop-правило несёт counter name" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' '$RS') = \$(grep -c 'counter name c_drops_' '$RS')"
 t "counters: scanner/threat/tor/custom v4+v6 имеют свои счётчики" bash -c "grep -q 'c_drops_scanner_v4' '$RS' && grep -q 'c_drops_threat_v6' '$RS' && grep -q 'c_drops_custom_v4' '$RS'"
-t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS'"
+t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof (v4+v6)" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS' && grep -q 'c_drops_antispoof_v6' '$RS'"
 t "counters: LOG-флуда нет — log statement отсутствует" bash -c "! grep -qE ' counter name c_drops_.* log |log prefix| nflog' '$RS'"
 
 if [ "$fails" -eq 0 ]; then echo "PASS: template (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

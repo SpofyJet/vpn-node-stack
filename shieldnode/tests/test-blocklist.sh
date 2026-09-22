@@ -293,6 +293,54 @@ t "args: scanner НЕ тронут при вызове с 'custom'" bash -c "tes
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT"
 t "args: полный прогон применяет scanner" bash -c "test -s '$OUT/nftdb/set_scanner_blocklist_v4'"
 
+# ================= 6.6) tor: маппинг name=tor -> сеты tor_exit_blocklist_* =================
+cat > "$OUT/fixtures/tor.txt" <<EOF
+185.220.101.4
+91.240.118.9
+EOF
+cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+BL_ENABLED_scanner=0
+BL_ENABLED_threat=0
+BL_ENABLED_tor=1
+BL_ENABLED_custom=0
+BL_ENABLED_crowdsec=0
+BL_ENABLED_spamhaus=0
+BL_ENABLED_cins=0
+BL_URLS_tor="file://$OUT/fixtures/tor.txt"
+BL_MIN_tor=1
+EOF
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" tor
+t "tor: записи попали в tor_exit_blocklist_v4 (не tor_blocklist_v4)" \
+    bash -c "grep -qx '185.220.101.4/32' '$OUT/nftdb/set_tor_exit_blocklist_v4' && grep -qx '91.240.118.9/32' '$OUT/nftdb/set_tor_exit_blocklist_v4' && test ! -e '$OUT/nftdb/set_tor_blocklist_v4'"
+t "tor: drop-правило с counter c_drops_tor_v4 на месте" grep -q 'c_drops_tor_v4' "$OUT/nftdb/rules"
+
+# ================= 6.7) основной lock занят (apply/rollback) → пропуск тика =================
+: > "$OUT/nftdb/set_scanner_blocklist_v4"
+cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+BL_ENABLED_scanner=1
+BL_ENABLED_threat=0
+BL_ENABLED_tor=0
+BL_ENABLED_custom=0
+BL_ENABLED_crowdsec=0
+BL_ENABLED_spamhaus=0
+BL_ENABLED_cins=0
+BL_URLS_custom=""
+BL_URLS_scanner="file://$OUT/fixtures/scanner.txt"
+BL_MIN_scanner=3
+EOF
+# держим основной lock ($SHIELD_LOCK запечён в updater как MAIN_LOCK_FILE)
+( exec 9>"$OUT/lock"; flock -n 9 || exit 1; sleep 3 ) &
+lockpid=$!
+sleep 0.5
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+t "main-lock: тик пропущен при занятом lock'е (set не тронут)" bash -c "test ! -s '$OUT/nftdb/set_scanner_blocklist_v4'"
+wait "$lockpid" || true
+# после освобождения lock'а тик снова работает
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+t "main-lock: после освобождения lock'а updater работает" bash -c "test -s '$OUT/nftdb/set_scanner_blocklist_v4'"
+
 # ================= 7) firewall отсутствует → тихий exit 0 =================
 rm -f "$OUT/nftdb/table"
 t "no-table: exit 0 без таблицы" bash -c "PATH='$OUT/bin:$PATH' FAKE_NFT_DB='$OUT/nftdb' bash '$SHIELD_BLOCKLIST_SCRIPT'"
@@ -396,7 +444,11 @@ SHIELD_BLOCKLIST_SCRIPT=/usr/local/sbin/shieldnode-blocklist
 shield_blocklist_install
 SHIELD_BLOCKLIST_SCRIPT="$OUT/usr/local/sbin/shieldnode-blocklist"
 t "crowdsec: endpoint с ID запечён в updater" bash -c "grep -q '^BL_URLS_crowdsec=\"https://admin.api.crowdsec.net/v1/integrations/integration-4242/content\"' '$SHIELD_BLOCKLIST_SCRIPT'"
-t "crowdsec: креды запечены отдельно от URL" bash -c "grep -q '^CROWDSEC_USER=\"testuser\"' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q '^CROWDSEC_PASSWORD=\"testpass\"' '$SHIELD_BLOCKLIST_SCRIPT'"
+# креды НЕ запекаются в updater (0750 root), а живут в crowdsec.creds (0600)
+t "crowdsec: креды НЕ запечены в updater" bash -c "! grep -q 'testpass' '$SHIELD_BLOCKLIST_SCRIPT' && ! grep -q '^CROWDSEC_USER=\"testuser\"' '$SHIELD_BLOCKLIST_SCRIPT'"
+t "crowdsec: updater читает /etc/shieldnode/crowdsec.creds" grep -q 'crowdsec\.creds' "$SHIELD_BLOCKLIST_SCRIPT"
+t "crowdsec: creds-файл создан (0600) с кредами" bash -c "test -f '$OUT/etc/shieldnode/crowdsec.creds' && grep -q '^CROWDSEC_USER=\"testuser\"' '$OUT/etc/shieldnode/crowdsec.creds' && grep -q '^CROWDSEC_PASSWORD=\"testpass\"' '$OUT/etc/shieldnode/crowdsec.creds' && test \$(stat -c %a '$OUT/etc/shieldnode/crowdsec.creds') = 600"
+t "crowdsec: updater mode 0750 (не world-readable)" bash -c "test \$(stat -c %a '$SHIELD_BLOCKLIST_SCRIPT') = 750"
 t "crowdsec: интервал 1440м (лимит community-тарифа) запечён" grep -q '^BL_INTERVAL_crowdsec="1440"' "$SHIELD_BLOCKLIST_SCRIPT"
 t "crowdsec: updater валиден после перепечки" bash -n "$SHIELD_BLOCKLIST_SCRIPT"
 t "crowdsec: fetch-ветка с Basic-Auth + --compressed присутствует" bash -c "grep -q 'admin.api.crowdsec.net/\*' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q -- '--compressed' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q -- '-u \"\$CROWDSEC_USER:\$CROWDSEC_PASSWORD\"' '$SHIELD_BLOCKLIST_SCRIPT'"
