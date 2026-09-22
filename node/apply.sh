@@ -121,7 +121,7 @@ node_apply() {
 
     node_contract_write
     if [ "$rc" -gt 0 ]; then
-        die "apply завершён с ошибками в $rc модуле(ях):${failed_steps}. Система частично применена — смотри $NODE_LOG; при необходимости: bash install.sh rollback"
+        die "apply завершён с ошибками в $rc модуле(ях):${failed_steps}. Система частично применена — смотри $NODE_LOG; при необходимости: bash $NODE_DIR/install.sh rollback"
     fi
     ok "apply" "apply завершён. status: bash install.sh status"
 }
@@ -169,7 +169,7 @@ node_self_test() {
     [ -n "$snapshot_before" ] && [ -f "$snapshot_before" ] || { warn "selftest" "FAIL: снапшот детекта не найден"; fails=$((fails+1)); }
 
     if [ "$fails" -gt 0 ]; then
-        die "self-test: $fails провалов — выполни rollback: bash install.sh rollback"
+        die "self-test: $fails провалов — выполни rollback: bash $NODE_DIR/install.sh rollback"
     fi
     ok "selftest" "all checks passed"
 }

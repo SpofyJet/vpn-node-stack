@@ -67,7 +67,7 @@ node_status() {
     echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 0) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)$(node_kernel_version_ge 6 15 && echo ' | mainline>=6.15: BBRv3 уже есть, XanMod не нужен' || true)"
     echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0) nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0) irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
     echo "datapath=$(node_conf_get ENABLE_DATAPATH 1) fq_tune=$(node_conf_get ENABLE_FQ_TUNE 1) busy_poll=$(node_conf_get ENABLE_BUSY_POLL 0) netdev_budget=$(node_conf_get NETDEV_BUDGET 600)/$(node_conf_get NETDEV_BUDGET_USECS 8000)"
-    echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash install.sh rollback)"
+    echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash $NODE_DIR/install.sh rollback)"
     # runtime-твики и reboot-напоминание — против молчаливой потери после reboot
     if node_rt_boot_needed 2>/dev/null; then
         if systemctl is-enabled node-rt-tweaks.service >/dev/null 2>&1; then

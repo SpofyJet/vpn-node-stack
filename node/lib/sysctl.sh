@@ -76,7 +76,7 @@ node_sysctl_apply() {
     local f
     for f in "${NODE_SYSCTL_FILES[@]}"; do
         [ -f "$f" ] || continue
-        sysctl -p "$f" >/dev/null || die "sysctl -p failed: $f (система в частично применённом состоянии — выполни: bash install.sh rollback)"
+        sysctl -p "$f" >/dev/null || die "sysctl -p failed: $f (система в частично применённом состоянии — выполни: bash $NODE_DIR/install.sh rollback)"
         log info "sysctl" "applied $f"
     done
 }

@@ -85,9 +85,11 @@ t "tcp: keepalive_intvl=15"   bash -c "grep -q 'net.ipv4.tcp_keepalive_intvl	15'
 t "tcp: keepalive_probes=5"   bash -c "grep -q 'net.ipv4.tcp_keepalive_probes	5' '$PLAN'"
 t "tcp: старых 600/30 в плане НЕТ" bash -c "! grep -qE 'tcp_keepalive_time	600|tcp_keepalive_intvl	30' '$PLAN'"
 
-# ============ conntrack helper off ============
-t "conntrack: nf_conntrack_helper=0" bash -c "grep -q 'net.netfilter.nf_conntrack_helper	0' '$PLAN'"
-t "conntrack: helper идёт в CONNTRACK-файл" bash -c "grep -q \"net.netfilter.nf_conntrack_helper	0	$NODE_SYSCTL_CONNTRACK\" '$PLAN'"
+# ============ conntrack helper off (best-effort runtime, НЕ в sysctl-файле:
+# sysctl зависит от CONFIG_NF_CONNTRACK_HELPER ядра; в файле его нет даже после
+# modprobe на части конфигов -> sysctl -p убивал apply. Баг на prod-ноде 2026-09-22) ============
+t "conntrack: helper НЕ в плане (runtime best-effort)" bash -c "! grep -q 'nf_conntrack_helper' '$PLAN'"
+t "conntrack: helper отключается runtime" grep -q 'nf_conntrack_helper' "$NODE_DIR/lib/conntrack.sh"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: vmfs (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi
