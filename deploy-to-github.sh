@@ -13,7 +13,9 @@
 #   2. Проверяет токен и права (нужен scope repo для приватного репозитория).
 #   3. Создаёт репозиторий, если его ещё нет.
 #   4. Генерирует README.md (если отсутствует).
-#   5. git init → commit → push (токен передаётся через временный askpass-скрипт
+#   5. Генерирует SHA256SUMS (node.tar.gz + shieldnode.tar.gz + vpn-node-setup.sh)
+#      — vpn-node-setup.sh верифицирует архивы по нему при однострочной установке.
+#   6. git init → commit → push (токен передаётся через временный askpass-скрипт
 #      и НИКОГДА не попадает в URL remote, .git/config и history).
 #
 # Неинтерактивный режим (для CI): переменные окружения
@@ -56,6 +58,17 @@ extract_if_needed() { # $1=папка $2=архив
 }
 extract_if_needed node node.tar.gz
 extract_if_needed shieldnode shieldnode.tar.gz
+
+# ---------- SHA256SUMS для однострочной установки ----------
+# vpn-node-setup.sh качает архивы с raw.githubusercontent и проверяет по этому файлу.
+# Без vpn-node-setup.sh checksum'и всё равно генерируем (дешево), но предупреждаем.
+command -v sha256sum >/dev/null 2>&1 || warn "нет sha256sum — SHA256SUMS не сгенерирую (vpn-node-setup.sh будет ругаться)"
+if command -v sha256sum >/dev/null 2>&1; then
+    SUM_FILES=(node.tar.gz shieldnode.tar.gz)
+    [ -f vpn-node-setup.sh ] && SUM_FILES+=(vpn-node-setup.sh) || warn "vpn-node-setup.sh не найден рядом — в репозиторий уйдут только архивы"
+    sha256sum "${SUM_FILES[@]}" > SHA256SUMS
+    echo "Сгенерирован SHA256SUMS (${#SUM_FILES[@]} файлов)"
+fi
 
 # ---------- токен ----------
 if [ -n "${GITHUB_TOKEN:-}" ]; then
@@ -158,7 +171,15 @@ __REPO_DESCRIPTION__
 
 ## Установка
 
-Скрипты не устанавливаются curl-pipe: они читают свои lib/ рядом с собой, поэтому ставятся из клонированного репозитория:
+Одной командой (скрипт сам скачает архивы из этого репозитория, проверит SHA256 и запустит оба инсталлятора):
+
+```bash
+sudo bash <(curl -sL https://raw.githubusercontent.com/__LOGIN__/__REPO_NAME__/main/vpn-node-setup.sh)
+```
+
+Опции: `--dry-run` (только план), `status` (без root), `rollback` (откат).
+
+Либо из клонированного репозитория:
 
 ```bash
 git clone https://github.com/__LOGIN__/__REPO_NAME__.git
@@ -242,7 +263,7 @@ git config user.email >/dev/null 2>&1 || git config user.email "$LOGIN@users.nor
 
 # коммитим только наши пути — ничего лишнего из /opt
 paths=()
-for p in README.md .gitignore node shieldnode "$(basename "$0")"; do
+for p in README.md .gitignore node shieldnode node.tar.gz shieldnode.tar.gz SHA256SUMS vpn-node-setup.sh "$(basename "$0")"; do
     [ -e "$SCRIPT_DIR/$p" ] && paths+=("$p")
 done
 for md in "$SCRIPT_DIR"/*.md; do
