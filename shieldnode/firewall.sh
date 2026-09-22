@@ -94,10 +94,14 @@ shield_apply() {
     fi
 
     # --- атомарная проверка ДО разрушения текущего состояния (ТЗ §26) ---
-    if ! nft -c -f "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        die "nft -c: сгенерированный ruleset не проходит проверку (см. выше)"
+    if ! nft -c -f "$tmp" 2>"$tmp.err"; then
+        # stderr nft — в консоль и лог, иначе диагностика теряется ("см. выше" — пусто)
+        sed 's/^/  nft: /' "$tmp.err" >&2 || true
+        log error "firewall" "nft -c rejected ruleset: $(tr '\n' ';' < "$tmp.err" | cut -c1-400)"
+        rm -f "$tmp" "$tmp.err"
+        die "nft -c: сгенерированный ruleset не проходит проверку (причина выше)"
     fi
+    rm -f "$tmp.err"
 
     # --- backup текущей таблицы для auto-rollback ---
     mkdir -p "$SHIELD_BACKUP_DIR"

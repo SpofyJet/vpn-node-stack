@@ -67,6 +67,14 @@ t "набор whitelist_v4" grep -q 'set whitelist_v4' "$RS"
 t "whitelist с CIDR-исключением" grep -q '198.51.100.0/24' "$RS"
 t "admin IP в whitelist" grep -q '203.0.113.10' "$RS"
 t "abuse-наборы (§21–24)" bash -c "grep -q 'set ssh_abusers' '$RS' && grep -q 'set tcp_abusers' '$RS' && grep -q 'set udp_abusers' '$RS' && grep -q 'set temporary_blocklist' '$RS'"
+# блок объявления сета между «set NAME {» и отступом «    }»; флаг — словом в строке flags
+set_has_flag() { # $1=ruleset $2=setname $3=flag
+    awk -v pat="set $2 {" 'index($0, pat) > 0 {f=1; next}
+        f && /^    \}/ {exit}
+        f && index($0, "flags ") > 0 {print}' "$1" | grep -qw "$3"
+}
+export -f set_has_flag
+t "abuse-наборы: flags dynamic (наполняются из правил — без него падает nft -c)" bash -c "set_has_flag '$RS' ssh_abusers dynamic && set_has_flag '$RS' tcp_abusers dynamic && set_has_flag '$RS' udp_abusers dynamic && set_has_flag '$RS' temporary_blocklist dynamic"
 t "protected_tcp/udp с портами" bash -c "grep -q 'set protected_tcp' '$RS' && grep -q '8443' '$RS'"
 t "per-src rate-limit ТОЛЬКО через meter" bash -c "grep -q 'meter ssh_new_22' '$RS' && grep -q 'meter tcp_syn' '$RS' && grep -q 'meter udp_rate' '$RS'"
 t "plain limit только для global ceiling" bash -c "grep -q 'limit rate over 8000/minute counter name c_drops_global_tcp drop' '$RS' && grep -q 'limit rate over 20000/second counter name c_drops_global_udp drop' '$RS'"

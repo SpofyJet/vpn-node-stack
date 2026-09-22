@@ -95,8 +95,9 @@ rm -rf "$DL"; trap - EXIT
 say "==> распаковано в $WORK_DIR"
 
 # ---------- запуск ----------
-# apply:  фаервол ПЕРВЫМ (защита важнее тюнинга; см. шапку),
-#         откат — в обратном порядке (node → shieldnode).
+# apply:  фаервол ПЕРВЫМ. Принцип «нет фаервола — вообще не начинаем»:
+#         если shieldnode не поднялся — откатываем его и НЕ трогаем node
+#         (система остаётся в исходном состоянии). Откат — в обратном порядке.
 rc_node=0; rc_shield=0
 case "$CMD" in
     rollback)
@@ -105,10 +106,21 @@ case "$CMD" in
         say "==> [2/2] shieldnode: откат фаервола"
         bash "$SHIELD_DIR/install.sh" "$@" || rc_shield=$?
         ;;
-    *)
+    apply|install|emergency)
         say "==> [1/2] shieldnode (nftables-фаервол)"
-        bash "$SHIELD_DIR/install.sh" "$@" || rc_shield=$?
+        if ! bash "$SHIELD_DIR/install.sh" "$@"; then
+            rc_shield=$?
+            warn "shieldnode завершился с ошибкой $rc_shield — откатываем его правки"
+            bash "$SHIELD_DIR/install.sh" rollback || warn "авто-откат shieldnode не полностью (см. /var/log/shieldnode.log)"
+            die "установка ОТМЕНЕНА: фаервол не поднят — node (оптимизация) намеренно не запускался"
+        fi
         say "==> [2/2] node (оптимизация ОС/сети)"
+        bash "$NODE_DIR/install.sh" "$@" || rc_node=$?
+        ;;
+    *)
+        say "==> [1/2] shieldnode"
+        bash "$SHIELD_DIR/install.sh" "$@" || rc_shield=$?
+        say "==> [2/2] node"
         bash "$NODE_DIR/install.sh" "$@"   || rc_node=$?
         ;;
 esac

@@ -55,14 +55,16 @@ EOF
         fi
 
         echo "    # --- abuse-наборы: timeout + max size (ТЗ §21–24)"
-        printf '' | shield_nft_emit_set ssh_abusers ipv4_addr "size $SH_R_SSH_ABUSERS_SIZE" "timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s"
-        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set ssh_abusers_v6 ipv6_addr "size $SH_R_SSH_ABUSERS_SIZE" "timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s"
-        printf '' | shield_nft_emit_set tcp_abusers ipv4_addr "size $SH_R_TCP_ABUSERS_SIZE" "timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s"
-        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set tcp_abusers_v6 ipv6_addr "size $SH_R_TCP_ABUSERS_SIZE" "timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s"
-        printf '' | shield_nft_emit_set udp_abusers ipv4_addr "size $SH_R_UDP_ABUSERS_SIZE" "timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s"
-        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set udp_abusers_v6 ipv6_addr "size $SH_R_UDP_ABUSERS_SIZE" "timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s"
-        printf '' | shield_nft_emit_set temporary_blocklist ipv4_addr "size $SH_R_TEMP_BLOCKLIST_SIZE" "timeout ${SH_R_TEMP_BLOCKLIST_TIMEOUT}s"
-        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set temporary_blocklist_v6 ipv6_addr "size $SH_R_TEMP_BLOCKLIST_SIZE" "timeout ${SH_R_TEMP_BLOCKLIST_TIMEOUT}s"
+        # flags dynamic ОБЯЗАТЕЛЕН: наборы наполняются ИЗ ПРАВИЛ (add @...).
+        # Без него nft -c падает — реальный баг 2026-09-22 (nft 1.8.10/Ubuntu 24.04)
+        printf '' | shield_nft_emit_set ssh_abusers ipv4_addr "size $SH_R_SSH_ABUSERS_SIZE" "flags dynamic" "timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s"
+        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set ssh_abusers_v6 ipv6_addr "size $SH_R_SSH_ABUSERS_SIZE" "flags dynamic" "timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s"
+        printf '' | shield_nft_emit_set tcp_abusers ipv4_addr "size $SH_R_TCP_ABUSERS_SIZE" "flags dynamic" "timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s"
+        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set tcp_abusers_v6 ipv6_addr "size $SH_R_TCP_ABUSERS_SIZE" "flags dynamic" "timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s"
+        printf '' | shield_nft_emit_set udp_abusers ipv4_addr "size $SH_R_UDP_ABUSERS_SIZE" "flags dynamic" "timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s"
+        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set udp_abusers_v6 ipv6_addr "size $SH_R_UDP_ABUSERS_SIZE" "flags dynamic" "timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s"
+        printf '' | shield_nft_emit_set temporary_blocklist ipv4_addr "size $SH_R_TEMP_BLOCKLIST_SIZE" "flags dynamic" "timeout ${SH_R_TEMP_BLOCKLIST_TIMEOUT}s"
+        [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set temporary_blocklist_v6 ipv6_addr "size $SH_R_TEMP_BLOCKLIST_SIZE" "flags dynamic" "timeout ${SH_R_TEMP_BLOCKLIST_TIMEOUT}s"
 
         echo "    # --- защищаемые порты (ssh + Xray-detected; exclude §30 вычтен)"
         for p in $SH_F_PROTECTED_TCP; do echo "$p"; done | shield_nft_emit_set protected_tcp inet_service "flags interval" "auto-merge"
