@@ -18,7 +18,15 @@
 
 ## Установка
 
-Скрипты не устанавливаются curl-pipe: они читают свои lib/ рядом с собой, поэтому ставятся из клонированного репозитория:
+Одной командой (скрипт сам скачает архивы из этого репозитория, проверит SHA256 и запустит оба инсталлятора):
+
+```bash
+sudo bash <(curl -sL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)
+```
+
+Опции: `--dry-run` (только план), `status` (без root), `rollback` (откат).
+
+Либо из клонированного репозитория:
 
 ```bash
 git clone https://github.com/SpofyJet/vpn-node-stack.git

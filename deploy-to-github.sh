@@ -12,7 +12,7 @@
 #   1. Спрашивает GitHub Classic Token (ввод скрыт, в логи/историю не попадает).
 #   2. Проверяет токен и права (нужен scope repo для приватного репозитория).
 #   3. Создаёт репозиторий, если его ещё нет.
-#   4. Генерирует README.md (если отсутствует).
+#   4. Генерирует README.md заново (старый перезаписывается).
 #   5. Генерирует SHA256SUMS (node.tar.gz + shieldnode.tar.gz + vpn-node-setup.sh)
 #      — vpn-node-setup.sh верифицирует архивы по нему при однострочной установке.
 #   6. git init → commit → push (токен передаётся через временный askpass-скрипт
@@ -115,13 +115,14 @@ case "$REPO_VISIBILITY" in
     private|public) ;;
     *)
         if [ -t 0 ]; then
-            printf "Приватный репозиторий? [Y/n]: "; read -r ans || ans=""
-            case "${ans:-y}" in
-                n|N|no|NO) REPO_VISIBILITY=public ;;
-                *)         REPO_VISIBILITY=private ;;
+            printf "Приватный репозиторий? Однострочник установки работает только с публичным. [y/N]: "; read -r ans || ans=""
+            case "${ans:-n}" in
+                y|Y|yes|YES) REPO_VISIBILITY=private ;;
+                *)           REPO_VISIBILITY=public ;;
             esac
         else
             REPO_VISIBILITY=private
+            warn "неинтерактивный режим: репозиторий будет приватным — однострочник работать НЕ будет"
         fi
         ;;
 esac
@@ -140,6 +141,11 @@ fi
 api GET "/repos/$LOGIN/$REPO_NAME"
 if [ "$HTTP_CODE" = "200" ]; then
     echo "Репозиторий $LOGIN/$REPO_NAME уже существует — пушу в него"
+    if grep -q '"private": *true' "$API_BODY"; then
+        warn "репозиторий ПРИВАТНЫЙ — однострочник через raw.githubusercontent.com работать НЕ будет (там 404 без токена). Сделай публичным: Settings → Danger zone → Change visibility → Public"
+    else
+        echo "Видимость: публичный — однострочник будет работать"
+    fi
 else
     printf '{"name":"%s","private":%s,"description":"%s","auto_init":false}' \
         "$REPO_NAME" "$([ "$REPO_VISIBILITY" = "private" ] && echo true || echo false)" "$REPO_DESCRIPTION" > "$PAYLOAD"
@@ -148,9 +154,8 @@ else
     echo "Создан репозиторий: https://github.com/$LOGIN/$REPO_NAME ($REPO_VISIBILITY)"
 fi
 
-# ---------- README.md ----------
-if [ ! -f README.md ]; then
-    cat > README.md <<'READMEEOF'
+# ---------- README.md (всегда перегенерируется — старый вариант перезаписывается) ----------
+cat > README.md <<'READMEEOF'
 # __REPO_NAME__
 
 __REPO_DESCRIPTION__
@@ -236,10 +241,7 @@ READMEEOF
     awk -v d="$REPO_DESCRIPTION" -v n="$REPO_NAME" -v l="$LOGIN" \
         '{gsub(/__REPO_DESCRIPTION__/,d); gsub(/__REPO_NAME__/,n); gsub(/__LOGIN__/,l)} 1' \
         README.md > README.md.tmp.$$ && mv README.md.tmp.$$ README.md
-    echo "Сгенерирован README.md"
-else
-    echo "README.md уже существует — оставляю как есть"
-fi
+    echo "Сгенерирован README.md (перезаписан)"
 
 # ---------- .gitignore ----------
 if [ ! -f .gitignore ]; then
@@ -261,7 +263,9 @@ fi
 git config user.name  >/dev/null 2>&1 || git config user.name  "$LOGIN"
 git config user.email >/dev/null 2>&1 || git config user.email "$LOGIN@users.noreply.github.com"
 
-# коммитим только наши пути — ничего лишнего из /opt
+# коммитим ТОЛЬКО наш набор путей — ничего лишнего из /opt.
+# Индекс перед этим чистим (rm --cached не трогает файлы на диске):
+# файлы, которые мы раньше коммитили, а теперь их нет в списке — удалятся из репозитория.
 paths=()
 for p in README.md .gitignore node shieldnode node.tar.gz shieldnode.tar.gz SHA256SUMS vpn-node-setup.sh "$(basename "$0")"; do
     [ -e "$SCRIPT_DIR/$p" ] && paths+=("$p")
@@ -269,6 +273,9 @@ done
 for md in "$SCRIPT_DIR"/*.md; do
     [ -e "$md" ] && paths+=("$(basename "$md")")
 done
+if [ -n "$(git ls-files)" ]; then
+    git rm -r --cached . >/dev/null
+fi
 git add -- "${paths[@]}"
 
 if git diff --cached --quiet; then
