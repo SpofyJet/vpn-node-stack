@@ -55,6 +55,9 @@ backup() {
 # atomic_write <dst> — прочитать stdin, записать tmp в той же ФС, mv
 atomic_write() {
     local dst="$1" tmp
+    # mktemp требует существующий каталог (аналогичный баг был в shieldnode)
+    mkdir -p -- "$(dirname "$dst")" 2>/dev/null \
+        || die "не удалось создать каталог $(dirname "$dst") для $dst"
     tmp="$(mktemp "$(dirname "$dst")/.node-write.XXXXXX")" || die "mktemp failed for $dst"
     cat > "$tmp"
     chmod 0644 "$tmp"

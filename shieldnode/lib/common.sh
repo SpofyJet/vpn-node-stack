@@ -55,6 +55,10 @@ backup() {
 # atomic_write <dst> [mode] — stdin → tmp в той же ФС → mv. mode по умолчанию 0644.
 atomic_write() {
     local dst="$1" mode="${2:-0644}" tmp
+    # mktemp требует существующий каталог: на fresh-ноде /etc/shieldnode ещё
+    # нет при первой записи config.conf (баг 2026-09-22: fatal mktemp failed)
+    mkdir -p -- "$(dirname "$dst")" 2>/dev/null \
+        || die "не удалось создать каталог $(dirname "$dst") для $dst"
     tmp="$(mktemp "$(dirname "$dst")/.shieldnode-write.XXXXXX")" || die "mktemp failed for $dst"
     cat > "$tmp"
     chmod "$mode" "$tmp"
