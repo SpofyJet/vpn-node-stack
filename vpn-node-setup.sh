@@ -56,8 +56,9 @@ if [ "$(id -u)" -ne 0 ]; then
             : ;;  # read-only дашборд
         *)
             die "команда '$CMD' требует root. Запусти:
-  sudo bash <(curl -sL $RAW_BASE/vpn-node-setup.sh) $*
-(process-substitution сохраняет stdin=терминал — интерактивные prompt'ы работают)"
+  sudo bash -c 'bash <(curl -sL $RAW_BASE/vpn-node-setup.sh) $*'
+(process-substitution должна создаваться ВНУТРИ sudo-shell: fd 63 не переживает sudo;
+ stdin=терминал сохраняется — интерактивные prompt'ы работают)"
             ;;
     esac
 fi

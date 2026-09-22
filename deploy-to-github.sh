@@ -1,10 +1,11 @@
 #!/bin/bash
 # deploy-to-github.sh — деплой проектов node/ и shieldnode/ в GitHub-репозиторий.
 #
-# РАЗМЕЩЕНИЕ: в /opt рядом с этим скриптом должны лежать ЛИБО папки, ЛИБО архивы:
-#   вариант А:  /opt/node/...  /opt/shieldnode/...  /opt/deploy-to-github.sh
-#   вариант Б:  /opt/node.tar.gz  /opt/shieldnode.tar.gz  /opt/deploy-to-github.sh
-#              (папок нет — скрипт распакует архивы сам, с проверкой безопасности)
+# РАЗМЕЩЕНИЕ: в /opt рядом с этим скриптом должны лежать архивы (источник правды):
+#   /opt/node.tar.gz  /opt/shieldnode.tar.gz  /opt/deploy-to-github.sh
+# Скрипт сам распакует архивы с ЧИСТОЙ ЗАМЕНОЙ папок node/ и shieldnode/
+# (stale-файлов не останется, ручное rm -rf не нужно). Если архива нет —
+# используется существующая папка как есть.
 #
 # ЗАПУСК:   bash /opt/deploy-to-github.sh
 #
@@ -39,30 +40,29 @@ command -v git  >/dev/null 2>&1 || die "нужен git: apt-get install -y git"
 command -v curl >/dev/null 2>&1 || die "нужен curl: apt-get install -y curl"
 command -v tar  >/dev/null 2>&1 || die "нужен tar"
 
-# ---------- распаковка архивов (если папки не распакованы) ----------
-extract_if_needed() { # $1=папка $2=архив
+# ---------- распаковка архивов: чистая замена папок ----------
+# Тарболл — источник правды. Архив рядом есть → папка ВСЕГДА заменяется его
+# содержимым целиком (rm -rf + extract): никакого наложения, никаких
+# stale-файлов, ручное удаление не нужно. Архива нет → используем папку как есть.
+extract_replace() { # $1=папка $2=архив
     local dir="$1" tgz="$2"
-    if [ -f "$dir/install.sh" ]; then
-        if [ -f "$tgz" ] && [ "$tgz" -nt "$dir/install.sh" ]; then
-            warn "$dir/ распакован РАНЬШЕ, чем изменён $tgz — в репозиторий уйдёт СТАРОЕ содержимое папки. Обнови: rm -rf $dir && bash deploy-to-github.sh"
-        fi
-        return 0
-    fi
     if [ ! -f "$tgz" ]; then
-        [ -d "$dir" ] && die "$dir/ существует, но $dir/install.sh в ней нет — сломанная папка. Удали $dir/ или положи рядом $tgz"
-        die "не найдено ни $dir/install.sh, ни $tgz — положи рядом с этим скриптом папки node/ и shieldnode/ ИЛИ архивы node.tar.gz и shieldnode.tar.gz"
+        [ -f "$dir/install.sh" ] && { echo "Архива $tgz нет — использую существующую папку $dir/"; return 0; }
+        [ -d "$dir" ] && die "$dir/ существует, но $dir/install.sh в ней нет — сломанная папка. Положи рядом $tgz или восстанови папку"
+        die "не найдено ни $dir/install.sh, ни $tgz — положи рядом с этим скриптом архивы node.tar.gz и shieldnode.tar.gz ИЛИ папки node/ и shieldnode/"
     fi
-    echo "Распаковываю $tgz ..."
     # безопасность: не распаковываем архивы с абсолютными путями или ..
     if tar -tzf "$tgz" | grep -qE '(^\.\./|(^|/)\.\.(/|$)|^/)'; then
         die "$tgz содержит опасные пути (.. или абсолютные) — распаковка отменена"
     fi
+    rm -rf -- "$dir"
+    echo "Распаковываю $tgz (чистая замена $dir/) ..."
     tar -xzf "$tgz" || die "не удалось распаковать $tgz"
     [ -f "$dir/install.sh" ] || die "в $tgz нет $dir/install.sh — архив не тот?"
-    echo "Распаковано: $dir/"
+    echo "Свежее содержимое: $dir/"
 }
-extract_if_needed node node.tar.gz
-extract_if_needed shieldnode shieldnode.tar.gz
+extract_replace node node.tar.gz
+extract_replace shieldnode shieldnode.tar.gz
 
 # ---------- SHA256SUMS для однострочной установки ----------
 # vpn-node-setup.sh качает архивы с raw.githubusercontent и проверяет по этому файлу.
@@ -184,7 +184,7 @@ __REPO_DESCRIPTION__
 Одной командой (скрипт сам скачает архивы из этого репозитория, проверит SHA256 и запустит оба инсталлятора):
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/__LOGIN__/__REPO_NAME__/main/vpn-node-setup.sh)
+sudo bash -c 'bash <(curl -sL https://raw.githubusercontent.com/__LOGIN__/__REPO_NAME__/main/vpn-node-setup.sh)'
 ```
 
 Опции: `--dry-run` (только план), `status` (без root), `rollback` (откат).

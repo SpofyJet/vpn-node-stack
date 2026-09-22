@@ -21,7 +21,7 @@
 Одной командой (скрипт сам скачает архивы из этого репозитория, проверит SHA256 и запустит оба инсталлятора):
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)
+sudo bash -c 'bash <(curl -sL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)'
 ```
 
 Опции: `--dry-run` (только план), `status` (без root), `rollback` (откат).

@@ -55,6 +55,9 @@ node_apply() {
     source "$NODE_DIR/lib/limits.sh";    node_limits_plan
     source "$NODE_DIR/lib/services.sh";  node_services_plan; node_harden_ipv6
     source "$NODE_DIR/lib/storage.sh";   node_storage_plan
+    source "$NODE_DIR/lib/nic.sh"        # node_nic_* (диагностика обязательна §12)
+    source "$NODE_DIR/lib/irq.sh"        # node_irq_*
+    source "$NODE_DIR/lib/cpu.sh"        # node_cpu_check
     source "$NODE_DIR/lib/xray.sh"
 
     log info "apply" "sysctl keys planned: $(wc -l < "$NODE_PLAN_FILE")"
