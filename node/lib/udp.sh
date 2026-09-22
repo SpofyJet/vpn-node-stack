@@ -16,4 +16,5 @@ node_udp_plan() {
     udp_mem="$(node_conf_get UDP_MEM "$udp_mem")"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_mem "$udp_mem"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_rmem_min 8192
+    node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_wmem_min 8192
 }

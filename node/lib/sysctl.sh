@@ -3,11 +3,17 @@
 # Запрещено: sysctl --system. Применяем только свои файлы через sysctl -p.
 set -euo pipefail
 
-NODE_SYSCTL_BASE="/etc/sysctl.d/80-node-base.conf"
-NODE_SYSCTL_DATAPATH="/etc/sysctl.d/81-node-datapath.conf"
-NODE_SYSCTL_CONNTRACK="/etc/sysctl.d/82-node-conntrack.conf"
-NODE_SYSCTL_IPV6="/etc/sysctl.d/83-node-ipv6.conf"
-NODE_SYSCTL_MEM="/etc/sysctl.d/84-node-vm.conf"
+# Имена с суффиксом 99-zN выбраны не случайно: sysctl.d применяет файлы в
+# лексикографическом порядке, а штатные дистрибутивные/облачные файлы
+# (99-sysctl.conf на Debian, 99-cloudimg-*.conf на Ubuntu cloud images)
+# иначе перекрывали бы наши значения. 'z' идёт после 's'/'c', поэтому наши
+# файлы применяются последними и побеждают. Админ всё ещё может перекрыть
+# нас своим файлом с суффиксом выше (например 99-z9-*.conf).
+NODE_SYSCTL_BASE="/etc/sysctl.d/99-z0-node-base.conf"
+NODE_SYSCTL_DATAPATH="/etc/sysctl.d/99-z1-node-datapath.conf"
+NODE_SYSCTL_CONNTRACK="/etc/sysctl.d/99-z2-node-conntrack.conf"
+NODE_SYSCTL_IPV6="/etc/sysctl.d/99-z3-node-ipv6.conf"
+NODE_SYSCTL_MEM="/etc/sysctl.d/99-z4-node-vm.conf"
 # Единый список наших sysctl-файлов (запись/применение/self-test итерируют его)
 NODE_SYSCTL_FILES=("$NODE_SYSCTL_BASE" "$NODE_SYSCTL_DATAPATH" "$NODE_SYSCTL_CONNTRACK" "$NODE_SYSCTL_IPV6" "$NODE_SYSCTL_MEM")
 

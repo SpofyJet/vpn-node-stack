@@ -88,7 +88,46 @@ EOF
                 printf '' | shield_nft_emit_set custom_blocklist_v4 ipv4_addr "size $SH_R_CUSTOM_BLOCKLIST_SIZE" "flags interval" "auto-merge"
                 [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set custom_blocklist_v6 ipv6_addr "size $SH_R_CUSTOM_BLOCKLIST_SIZE" "flags interval" "auto-merge"
             fi
+            # crowdsec community blocklist (Blocklist-as-a-Service, plain-text feed):
+            # качается updater'ом с Basic-Auth endpoint'а консоли, 1 раз/24ч (лимит тарифа)
+            if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
+                printf '' | shield_nft_emit_set crowdsec_blocklist_v4 ipv4_addr "size $SH_R_CROWDSEC_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set crowdsec_blocklist_v6 ipv6_addr "size $SH_R_CROWDSEC_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+            fi
+            # spamhaus DROP/EDROP (+v6) — worst-of-the-worst hijacked space, бесплатно,
+            # без ключа. Формат "S24-x.y.z.w/24 ; comment" — парсится updater'ом.
+            if [ "${SH_F_ENABLE_SPAMHAUS_LIST:-1}" = "1" ]; then
+                printf '' | shield_nft_emit_set spamhaus_blocklist_v4 ipv4_addr "size $SH_R_SPAMHAUS_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set spamhaus_blocklist_v6 ipv6_addr "size $SH_R_SPAMHAUS_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+            fi
+            # CINS Army (Collective Intelligence Network Security, ~30k IP) — бесплатно, без ключа
+            if [ "${SH_F_ENABLE_CINS_LIST:-1}" = "1" ]; then
+                printf '' | shield_nft_emit_set cins_blocklist_v4 ipv4_addr "size $SH_R_CINS_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+            fi
         fi
+
+        # --- named counters: наблюдаемость дропов БЕЗ log (ТЗ запрещает log-флуд).
+        # Счётчик = метаданные ядра, в userspace ничего не копируется, стоимость ~0.
+        echo "    # --- drop-counters (zero-cost observability)"
+        local __c
+        for __c in scanner_v4 scanner_v6 threat_v4 threat_v6 tor_v4 tor_v6 custom_v4 custom_v6 antispoof invalid temp_v4 temp_v6 ssh_abusers_v4 ssh_abusers_v6 tcp_abusers_v4 tcp_abusers_v6 udp_abusers_v4 udp_abusers_v6 syn_v4 syn_v6 global_tcp global_udp; do
+            echo "    counter c_drops_$__c { }"
+        done
+        # crowdsec/spamhaus/cins-counters — только при включённом фиде (правила тоже условные)
+        if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
+            echo "    counter c_drops_crowdsec_v4 { }"
+            [ "$SH_F_IPV6" = "1" ] && echo "    counter c_drops_crowdsec_v6 { }"
+        fi
+        if [ "${SH_F_ENABLE_SPAMHAUS_LIST:-1}" = "1" ]; then
+            echo "    counter c_drops_spamhaus_v4 { }"
+            [ "$SH_F_IPV6" = "1" ] && echo "    counter c_drops_spamhaus_v6 { }"
+        fi
+        if [ "${SH_F_ENABLE_CINS_LIST:-1}" = "1" ]; then
+            echo "    counter c_drops_cins_v4 { }"
+        fi
+        # amp/icmp-counters — при включённых соответствующих гардах
+        [ "${SH_F_ENABLE_AMP_GUARD:-1}" = "1" ] && echo "    counter c_drops_amp { }"
+        [ "${SH_F_ENABLE_ICMP_GUARD:-1}" = "1" ] && echo "    counter c_drops_icmp { }"
 
         # ---------- prerouting (ТЗ §21–25): priority -150, policy accept ----------
         cat <<EOF
@@ -116,55 +155,89 @@ EOF
         # чтобы админ и TRUSTED_IPS никогда не резались списками
         if [ "$SH_F_ENABLE_BLOCKLISTS" = "1" ]; then
             if [ "$SH_F_ENABLE_SCANNER_LIST" = "1" ]; then
-                echo "        ip saddr @scanner_blocklist_v4 drop"
-                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @scanner_blocklist_v6 drop"
+                echo "        ip saddr @scanner_blocklist_v4 counter name c_drops_scanner_v4 drop"
+                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @scanner_blocklist_v6 counter name c_drops_scanner_v6 drop"
             fi
             if [ "$SH_F_ENABLE_THREAT_LIST" = "1" ]; then
-                echo "        ip saddr @threat_blocklist_v4 drop"
-                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @threat_blocklist_v6 drop"
+                echo "        ip saddr @threat_blocklist_v4 counter name c_drops_threat_v4 drop"
+                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @threat_blocklist_v6 counter name c_drops_threat_v6 drop"
             fi
             if [ "$SH_F_BLOCK_TOR" = "1" ]; then
-                echo "        ip saddr @tor_exit_blocklist_v4 drop"
-                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @tor_exit_blocklist_v6 drop"
+                echo "        ip saddr @tor_exit_blocklist_v4 counter name c_drops_tor_v4 drop"
+                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @tor_exit_blocklist_v6 counter name c_drops_tor_v6 drop"
             fi
             if [ "$SH_F_ENABLE_CUSTOM_LIST" = "1" ]; then
-                echo "        ip saddr @custom_blocklist_v4 drop"
-                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @custom_blocklist_v6 drop"
+                echo "        ip saddr @custom_blocklist_v4 counter name c_drops_custom_v4 drop"
+                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @custom_blocklist_v6 counter name c_drops_custom_v6 drop"
             fi
+            if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
+                echo "        ip saddr @crowdsec_blocklist_v4 counter name c_drops_crowdsec_v4 drop"
+                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @crowdsec_blocklist_v6 counter name c_drops_crowdsec_v6 drop"
+            fi
+            if [ "${SH_F_ENABLE_SPAMHAUS_LIST:-1}" = "1" ]; then
+                echo "        ip saddr @spamhaus_blocklist_v4 counter name c_drops_spamhaus_v4 drop"
+                [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @spamhaus_blocklist_v6 counter name c_drops_spamhaus_v6 drop"
+            fi
+            if [ "${SH_F_ENABLE_CINS_LIST:-1}" = "1" ]; then
+                echo "        ip saddr @cins_blocklist_v4 counter name c_drops_cins_v4 drop"
+            fi
+        fi
+
+        # --- amplification-guard (anti-reflection, opt-out): входящие NEW UDP с
+        # известных amplifier source-портов (DNS/NTP/SSDP/memcached/CLDAP) — это
+        # неспрошенные ответы. Свои запросы (DNS и т.п.) идут как ESTABLISHED
+        # (conntrack у нас же) — правило их не трогает.
+        if [ "${SH_F_ENABLE_AMP_GUARD:-1}" = "1" ]; then
+            cat <<'EOF'
+        # anti-amplification: NEW udp с source-портов 53/123/1900/11211/389 -> drop
+        meta l4proto udp ct state new udp sport { 53, 123, 1900, 11211, 389 } counter name c_drops_amp drop
+EOF
+        fi
+
+        # --- ICMP-политика (opt-out): PMTUD для v6 НЕ ломаем (packet-too-big/
+        # time-exceeded/parameter-problem всегда accept), echo-request душим.
+        if [ "${SH_F_ENABLE_ICMP_GUARD:-1}" = "1" ]; then
+            cat <<'EOF'
+        # ICMPv6 essentials: без packet-too-big IPv6-туннели деградируют молча (PMTUD)
+        icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept
+        # echo-request: rate-limit per-src (здоровый ping жив, флод душим)
+        ip protocol icmp icmp type echo-request limit rate over 10/second burst 20 packets counter name c_drops_icmp drop
+        icmpv6 type echo-request limit rate over 10/second burst 20 packets counter name c_drops_icmp drop
+EOF
         fi
 
         # --- анти-спуф (opt-in): приватные SRC на WAN-интерфейсе недопустимы
         if [ "$SH_F_ENABLE_ANTISPOOF" = "1" ] && [ -n "$SH_F_WAN_IFACE" ]; then
             cat <<EOF
         # анти-спуф: private/loopback/link-local/multicast SRC на $SH_F_WAN_IFACE -> drop
-        iifname "$SH_F_WAN_IFACE" ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4 } drop
+        iifname "$SH_F_WAN_IFACE" ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4 } counter name c_drops_antispoof drop
 EOF
         fi
 
         if [ "$SH_F_ENABLE_INVALID_DROP" = "1" ]; then
             cat <<'EOF'
         # invalid-пакеты (ТЗ §22): битые CT + классические сканы флагами
-        ct state invalid drop
-        tcp flags & (fin|syn|rst|ack) == 0 drop
-        tcp flags & (fin|syn) == fin|syn drop
-        tcp flags & (syn|rst) == syn|rst drop
-        tcp flags & (fin|rst) == fin|rst drop
-        tcp flags & (fin|syn|rst|ack) == fin|syn|rst|ack drop
-        tcp flags & (ack|fin) == fin drop
+        ct state invalid counter name c_drops_invalid drop
+        tcp flags & (fin|syn|rst|ack) == 0 counter name c_drops_invalid drop
+        tcp flags & (fin|syn) == fin|syn counter name c_drops_invalid drop
+        tcp flags & (syn|rst) == syn|rst counter name c_drops_invalid drop
+        tcp flags & (fin|rst) == fin|rst counter name c_drops_invalid drop
+        tcp flags & (fin|syn|rst|ack) == fin|syn|rst|ack counter name c_drops_invalid drop
+        tcp flags & (ack|fin) == fin counter name c_drops_invalid drop
 EOF
         fi
 
         cat <<'EOF'
         # temporary_blocklist (§24): ручные/аварийные блокировки с TTL
-        ip saddr @temporary_blocklist drop
+        ip saddr @temporary_blocklist counter name c_drops_temp_v4 drop
 EOF
-        [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @temporary_blocklist_v6 drop"
+        [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @temporary_blocklist_v6 counter name c_drops_temp_v6 drop"
 
         cat <<'EOF'
         # повторные abusers — сразу drop (§21–23)
-        ip saddr @ssh_abusers drop
+        ip saddr @ssh_abusers counter name c_drops_ssh_abusers_v4 drop
 EOF
-        [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @ssh_abusers_v6 drop"
+        [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @ssh_abusers_v6 counter name c_drops_ssh_abusers_v6 drop"
 
         # --- SSH-защита (ТЗ §19–20): только новые соединения; meter = per-source
         if [ "$SH_F_ENABLE_SSH_PROTECTION" = "1" ]; then
@@ -172,73 +245,73 @@ EOF
             for port in $SH_F_SSH_PORTS; do
                 cat <<EOF
         # SSH port $port: новые > $SH_R_SSH_NEW_RATE/min burst $SH_R_SSH_NEW_BURST (per-src) -> ban
-        tcp dport $port ct state new meter ssh_new_$port { ip saddr limit rate over $SH_R_SSH_NEW_RATE/minute burst $SH_R_SSH_NEW_BURST packets } add @ssh_abusers { ip saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } drop
+        tcp dport $port ct state new meter ssh_new_$port { ip saddr limit rate over $SH_R_SSH_NEW_RATE/minute burst $SH_R_SSH_NEW_BURST packets } add @ssh_abusers { ip saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } counter name c_drops_ssh_abusers_v4 drop
 EOF
                 [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport $port ct state new meter ssh_new6_$port { ip6 saddr limit rate over $SH_R_SSH_NEW_RATE/minute burst $SH_R_SSH_NEW_BURST packets } add @ssh_abusers_v6 { ip6 saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } drop
+        tcp dport $port ct state new meter ssh_new6_$port { ip6 saddr limit rate over $SH_R_SSH_NEW_RATE/minute burst $SH_R_SSH_NEW_BURST packets } add @ssh_abusers_v6 { ip6 saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } counter name c_drops_ssh_abusers_v6 drop
 EOF
                 cat <<EOF
         # SSH port $port: > $SH_R_SSH_CONN_MAX conntrack с одного src -> ban (CGNAT: см. config.conf)
-        tcp dport $port ip saddr ct count over $SH_R_SSH_CONN_MAX add @ssh_abusers { ip saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } drop
+        tcp dport $port ip saddr ct count over $SH_R_SSH_CONN_MAX add @ssh_abusers { ip saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } counter name c_drops_ssh_abusers_v4 drop
 EOF
                 [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport $port ip6 saddr ct count over $SH_R_SSH_CONN_MAX add @ssh_abusers_v6 { ip6 saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } drop
+        tcp dport $port ip6 saddr ct count over $SH_R_SSH_CONN_MAX add @ssh_abusers_v6 { ip6 saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } counter name c_drops_ssh_abusers_v6 drop
 EOF
             done
         fi
 
         if [ "$SH_F_ENABLE_ABUSE_LIMITING" = "1" ]; then
             cat <<'EOF'
-        ip saddr @tcp_abusers drop
+        ip saddr @tcp_abusers counter name c_drops_tcp_abusers_v4 drop
 EOF
-            [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @tcp_abusers_v6 drop"
+            [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @tcp_abusers_v6 counter name c_drops_tcp_abusers_v6 drop"
 
             # ENABLE_SYN_PROTECTION: мастер-выключатель именно SYN-rate правила
             # (new-rate и conn-limit независимы и остаются при SYN_PROTECTION=0)
             if [ "${SH_F_ENABLE_SYN_PROTECTION:-1}" = "1" ]; then
                 cat <<EOF
         # TCP-политика (§23): SYN-флуд per-src > $SH_R_TCP_SYN_RATE/s burst $SH_R_TCP_SYN_BURST
-        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn { ip saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } drop
+        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn { ip saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v4 drop
 EOF
                 [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn6 { ip6 saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } drop
+        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn6 { ip6 saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v6 drop
 EOF
             fi
             cat <<EOF
         # TCP-политика: новые соединения per-src > $SH_R_TCP_NEW_RATE/min burst $SH_R_TCP_NEW_BURST
-        tcp dport @protected_tcp ct state new meter tcp_new { ip saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } drop
+        tcp dport @protected_tcp ct state new meter tcp_new { ip saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_tcp_abusers_v4 drop
 EOF
             [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport @protected_tcp ct state new meter tcp_new6 { ip6 saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } drop
+        tcp dport @protected_tcp ct state new meter tcp_new6 { ip6 saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_tcp_abusers_v6 drop
 EOF
             cat <<EOF
         # TCP-политика: > $SH_R_TCP_CONN_MAX conntrack с одного src (CGNAT-лояльно)
-        tcp dport @protected_tcp ct state new ip saddr ct count over $SH_R_TCP_CONN_MAX add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } drop
+        tcp dport @protected_tcp ct state new ip saddr ct count over $SH_R_TCP_CONN_MAX add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_tcp_abusers_v4 drop
 EOF
             [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport @protected_tcp ct state new ip6 saddr ct count over $SH_R_TCP_CONN_MAX add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } drop
+        tcp dport @protected_tcp ct state new ip6 saddr ct count over $SH_R_TCP_CONN_MAX add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_tcp_abusers_v6 drop
 EOF
             if [ "$SH_R_TCP_GLOBAL_CEIL" -gt 0 ]; then
                 cat <<EOF
         # TCP global ceiling (§23): > $SH_R_TCP_GLOBAL_CEIL SYN/мин на ВСЮ ноду -> drop (бан не вешаем)
-        tcp flags syn ct state new limit rate over $SH_R_TCP_GLOBAL_CEIL/minute drop
+        tcp flags syn ct state new limit rate over $SH_R_TCP_GLOBAL_CEIL/minute counter name c_drops_global_tcp drop
 EOF
             fi
             cat <<'EOF'
-        ip saddr @udp_abusers drop
+        ip saddr @udp_abusers counter name c_drops_udp_abusers_v4 drop
 EOF
-            [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @udp_abusers_v6 drop"
+            [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @udp_abusers_v6 counter name c_drops_udp_abusers_v6 drop"
             cat <<EOF
         # UDP-политика (§23): per-src > $SH_R_UDP_RATE/s burst $SH_R_UDP_BURST
-        udp dport @protected_udp meter udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } add @udp_abusers { ip saddr timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s } drop
+        udp dport @protected_udp meter udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } add @udp_abusers { ip saddr timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s } counter name c_drops_udp_abusers_v4 drop
 EOF
             [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        udp dport @protected_udp meter udp_rate6 { ip6 saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } add @udp_abusers_v6 { ip6 saddr timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s } drop
+        udp dport @protected_udp meter udp_rate6 { ip6 saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } add @udp_abusers_v6 { ip6 saddr timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s } counter name c_drops_udp_abusers_v6 drop
 EOF
             if [ "$SH_R_UDP_GLOBAL_CEIL" -gt 0 ]; then
                 cat <<EOF
         # UDP global ceiling: > $SH_R_UDP_GLOBAL_CEIL пакетов/с на всю ноду -> drop
-        udp dport @protected_udp limit rate over $SH_R_UDP_GLOBAL_CEIL/second drop
+        udp dport @protected_udp limit rate over $SH_R_UDP_GLOBAL_CEIL/second counter name c_drops_global_udp drop
 EOF
             fi
         fi

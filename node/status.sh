@@ -4,6 +4,7 @@ set -euo pipefail
 
 node_status() {
     # rebuild plan (dry, no writes)
+    source "$NODE_DIR/apply.sh"          # node_rt_boot_needed (только определения)
     source "$NODE_DIR/lib/sysctl.sh";    node_sysctl_plan_init
     source "$NODE_DIR/lib/conntrack.sh"; node_conntrack_plan
     source "$NODE_DIR/lib/tcp.sh";       node_tcp_plan; node_tcp_perf_plan
@@ -34,6 +35,21 @@ node_status() {
     if systemctl is-active --quiet irqbalance 2>/dev/null; then
         echo "note: irqbalance active (node не отключает; конфликтует с ENABLE_RSS_BALANCE=1)"
     fi
+    # conntrack: утилизация таблицы. Ранняя тревога задолго до «table full,
+    # dropping packet» — к тому моменту новые VPN-подключения уже не встают.
+    if [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        local ccnt cmax cpct
+        ccnt="$(cat /proc/sys/net/netfilter/nf_conntrack_count)"
+        cmax="$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+        if [ "$cmax" -gt 0 ] 2>/dev/null; then
+            cpct=$(( ccnt * 100 / cmax ))
+            if [ "$cpct" -ge 80 ]; then
+                echo "WARN: conntrack usage ${cpct}% (${ccnt}/${cmax}) — при 100% новые соединения будут дропаться; подними CONNTRACK_MAX или проверь утечки (LAST_ACK/CLOSE_WAIT)"
+            else
+                echo "conntrack usage: ${cpct}% (${ccnt}/${cmax})"
+            fi
+        fi
+    fi
     if [ "$(node_conf_get ENABLE_MSS_CLAMP 0)" = "1" ]; then
         if nft list table inet node_mss_clamp >/dev/null 2>&1; then echo "note: MSS clamp: ON (inet node_mss_clamp)"; else echo "note: MSS clamp: enabled in config, table missing"; fi
     fi
@@ -46,12 +62,25 @@ node_status() {
     # --- kernel/BBR/NIC-opt секция ---
     echo "----------------------------------------------------------------------"
     echo "kernel: $(uname -r) $(node_kernel_is_xanmod && echo '[XanMod]' || echo '[stock]')"
-    echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
+    echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) gen=$(node_bbr_generation) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
     echo "congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 0) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)"
+    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 0) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)$(node_kernel_version_ge 6 15 && echo ' | mainline>=6.15: BBRv3 уже есть, XanMod не нужен' || true)"
     echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0) nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0) irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
     echo "datapath=$(node_conf_get ENABLE_DATAPATH 1) fq_tune=$(node_conf_get ENABLE_FQ_TUNE 1) busy_poll=$(node_conf_get ENABLE_BUSY_POLL 0) netdev_budget=$(node_conf_get NETDEV_BUDGET 600)/$(node_conf_get NETDEV_BUDGET_USECS 8000)"
     echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash install.sh rollback)"
+    # runtime-твики и reboot-напоминание — против молчаливой потери после reboot
+    if node_rt_boot_needed 2>/dev/null; then
+        if systemctl is-enabled node-rt-tweaks.service >/dev/null 2>&1; then
+            echo "rt boot re-apply: node-rt-tweaks.service enabled (runtime-твики переживут reboot)"
+        else
+            echo "rt boot re-apply: MISSING (runtime-твики испарятся после reboot — запусти apply)"
+        fi
+    else
+        echo "rt boot re-apply: не нужен (runtime-твики выключены)"
+    fi
+    if [ -f /run/node/reboot-required ] && ! node_kernel_is_xanmod; then
+        echo "reboot: ТРЕБУЕТСЯ (новое ядро установлено $(cat /run/node/reboot-required 2>/dev/null), активно $(uname -r))"
+    fi
     source "$NODE_DIR/lib/xray.sh"
     echo "xray/remnanode sockets: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
 }

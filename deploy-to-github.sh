@@ -42,7 +42,12 @@ command -v tar  >/dev/null 2>&1 || die "нужен tar"
 # ---------- распаковка архивов (если папки не распакованы) ----------
 extract_if_needed() { # $1=папка $2=архив
     local dir="$1" tgz="$2"
-    [ -f "$dir/install.sh" ] && return 0
+    if [ -f "$dir/install.sh" ]; then
+        if [ -f "$tgz" ] && [ "$tgz" -nt "$dir/install.sh" ]; then
+            warn "$dir/ распакован РАНЬШЕ, чем изменён $tgz — в репозиторий уйдёт СТАРОЕ содержимое папки. Обнови: rm -rf $dir && bash deploy-to-github.sh"
+        fi
+        return 0
+    fi
     if [ ! -f "$tgz" ]; then
         [ -d "$dir" ] && die "$dir/ существует, но $dir/install.sh в ней нет — сломанная папка. Удали $dir/ или положи рядом $tgz"
         die "не найдено ни $dir/install.sh, ни $tgz — положи рядом с этим скриптом папки node/ и shieldnode/ ИЛИ архивы node.tar.gz и shieldnode.tar.gz"

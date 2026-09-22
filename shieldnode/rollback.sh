@@ -43,7 +43,7 @@ shield_rollback() {
         while read -r k; do
             [ -z "$k" ] && continue
             # ключ ещё управляется оставшимся файлом shieldnode?
-            if grep -qsE "^${k}[[:space:]]*=" /etc/sysctl.d/85-shieldnode-security.conf 2>/dev/null; then
+            if grep -qsE "^${k}[[:space:]]*=" /etc/sysctl.d/99-z5-shieldnode-security.conf 2>/dev/null; then
                 continue
             fi
             v="$(awk -v key="$k" 'found && /^## /{exit} /^## sysctl-managed-baseline/{found=1; next} found && $1==key {print $3; exit}' "$snap")"
@@ -63,6 +63,8 @@ shield_rollback() {
         # откат = удаление нашего firewall (возврат к состоянию «shieldnode не было»)
         nft destroy table inet shieldnode 2>/dev/null || true
         rm -f /run/shieldnode/emergency
+        # guard-symlink (в manifest, удалится и вместе с файлами; тут — явно)
+        [ -L /usr/local/sbin/guard ] && [ "$(readlink /usr/local/sbin/guard 2>/dev/null || true)" = "$SHIELD_DIR/install.sh" ] && rm -f /usr/local/sbin/guard || true
     else
         log info "dry-run" "would: disable timers/service, destroy table inet shieldnode, rm emergency marker"
     fi

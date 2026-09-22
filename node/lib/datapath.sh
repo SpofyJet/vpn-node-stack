@@ -35,7 +35,7 @@ node_datapath_plan() {
 
     # tcp_mem: потолок ≈ TCP_MEM_PCT% RAM (страницы), pressure 75%/87.5% от него
     local kb pages memp pct
-    kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 1048576)"
+    kb="$(awk '/MemTotal/{print $2}' "${NODE_PROC_MEMINFO:-/proc/meminfo}" 2>/dev/null || echo 1048576)"
     [[ "$kb" =~ ^[0-9]+$ ]] || kb=1048576
     pages=$(( kb / 4 ))
     pct="$(node_conf_get TCP_MEM_PCT 25)"
@@ -63,6 +63,10 @@ node_datapath_plan() {
     if [ "$tier" -le 2 ]; then
         node_sysctl_add "$NODE_SYSCTL_MEM" vm.overcommit_memory "$(node_conf_get VM_OVERCOMMIT 1)"
     fi
+    # max_map_count: Xray — Go-приложение с тысячами горутин/коннектов,
+    # дефолтных 65530 map'ов нагруженной ноде мало (ломается не сразу,
+    # а под пиковой нагрузкой — mmap: cannot allocate memory).
+    node_sysctl_add "$NODE_SYSCTL_MEM" vm.max_map_count "$(node_conf_get VM_MAX_MAP_COUNT 1048576)"
 
     # PLB (kernel >=6.3): сглаживание повторных RTO в loss recovery
     node_sysctl_add_probed "$f" net.ipv4.tcp_plb_enabled 1

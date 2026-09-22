@@ -14,6 +14,16 @@ node_conntrack_plan() {
     esac
     max="$(node_conf_get CONNTRACK_MAX "$max")"
     [[ "$max" =~ ^[0-9]+$ ]] || { warn "conntrack" "CONNTRACK_MAX='$max' не число — fallback 262144"; max=262144; }
+    # RAM-защита: запись conntrack ≈ 320 байт; таблица max+hashsize+buckets
+    # не должна съедать больше четверти RAM, иначе под пиковой нагрузкой
+    # (таблица заполнена) система уйдёт в OOM, а conntrack — первый кандидат
+    # на отстрел oom-killer'ом, что уронит ВСЮ связность ноды разом.
+    local ram_mb=$(( $(node_memtotal_mb) ))
+    local ram_cap=$(( ram_mb * 1024 * 1024 / 4 / 320 ))
+    if [ "$max" -gt "$ram_cap" ]; then
+        warn "conntrack" "CONNTRACK_MAX=$max превышает RAM-бюджет (таблица >25% RAM ≈ $ram_cap записей) — clamp до $ram_cap"
+        max="$ram_cap"
+    fi
     hashsize=$((max / 4))
     loose="$(node_conf_get CONNTRACK_TCP_LOOSE 1)"
 
@@ -38,7 +48,7 @@ node_conntrack_plan() {
 
 # node_conntrack_ensure_module — на чистом сервере nf_conntrack может быть
 # НЕ загружен (ни одного ct-правила в системе): без модуля sysctl -p на
-# 82-node-conntrack.conf умрёт и утащит за собой весь apply. Загружаем заранее.
+# 99-z2-node-conntrack.conf умрёт и утащит за собой весь apply. Загружаем заранее.
 node_conntrack_ensure_module() {
     [ "${DRY_RUN:-0}" = "1" ] && return 0
     [ -f /proc/sys/net/netfilter/nf_conntrack_max ] && return 0

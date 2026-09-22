@@ -45,7 +45,7 @@ node_rollback() {
         while read -r k; do
             [ -z "$k" ] && continue
             # ключ ещё управляется оставшимися файлами node?
-            if grep -rqsE "^${k}[[:space:]]*=" /etc/sysctl.d/8[01234]-node-*.conf 2>/dev/null; then
+            if grep -rqsE "^${k}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null; then
                 continue
             fi
             v="$(awk -v key="$k" 'found && /^## /{exit} /^## sysctl-managed-baseline/{found=1; next} found && $1==key {print $3; exit}' "$snap")"
@@ -68,6 +68,11 @@ node_rollback() {
     if systemctl cat node-mss-clamp.service >/dev/null 2>&1; then
         systemctl disable --now node-mss-clamp.service >/dev/null 2>&1 || true
     fi
+    if systemctl cat node-rt-tweaks.service >/dev/null 2>&1; then
+        systemctl disable --now node-rt-tweaks.service >/dev/null 2>&1 || true
+    fi
+    rm -f /usr/local/sbin/node-rt-tweaks.sh /etc/udev/rules.d/99-node-rt-hotplug.rules
+    udevadm control --reload >/dev/null 2>&1 || true
     nft delete table inet node_mss_clamp 2>/dev/null || true
     # grub-файл (если XanMod-установка правила /etc/default/grub) — восстанавливаем
     local g; g="$(ls -1t /etc/default/grub.pre-node-* 2>/dev/null | head -1 || true)"

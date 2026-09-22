@@ -5,7 +5,7 @@ set -euo pipefail
 
 SHIELD_MANIFEST="$SHIELD_STATE_DIR/applied-files.txt"
 SHIELD_NFT_PERSIST=/etc/nftables.d/shieldnode.conf
-SHIELD_SYSCTL_SECURITY=/etc/sysctl.d/85-shieldnode-security.conf
+SHIELD_SYSCTL_SECURITY=/etc/sysctl.d/99-z5-shieldnode-security.conf
 
 shield_manifest_record() {
     local dst="$1"
@@ -59,6 +59,39 @@ EOF
         systemctl daemon-reload
         systemctl enable shieldnode.service >/dev/null 2>&1 || log warn "persist" "systemctl enable shieldnode.service не удался"
     fi
+}
+
+# shield_guard_link — symlink /usr/local/sbin/guard → install.sh: «пульт» одной командой,
+# как в старой ветке. Удаляется в rollback/uninstall вместе с остальными файлами.
+shield_guard_link() {
+    local link="${SHIELD_GUARD_LINK:-/usr/local/sbin/guard}"
+    local target="$SHIELD_DIR/install.sh"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log info "dry-run" "would symlink $link -> $target"
+        return 0
+    fi
+    mkdir -p "$(dirname "$link")" 2>/dev/null || true
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
+        return 0
+    fi
+    ln -sfn "$target" "$link" 2>/dev/null \
+        && { shield_manifest_record "$link"; ok "persist" "$link -> install.sh (команда: guard)"; } \
+        || log warn "persist" "symlink $link не создан"
+}
+
+# shield_logrotate_persist — ротация лога (без неё shieldnode.log растёт бесконечно)
+shield_logrotate_persist() {
+    {
+        echo "# shieldnode — ротация лога (managed by shieldnode)"
+        echo "${SHIELD_LOG} {"
+        echo "    size 10M"
+        echo "    rotate 4"
+        echo "    compress"
+        echo "    missingok"
+        echo "    notifempty"
+        echo "    copytruncate"
+        echo "}"
+    } | shield_persist_stream /etc/logrotate.d/shieldnode
 }
 
 # shield_persist_security_sysctl — ТЗ §22/§25: security-sysctl БЕЗ conntrack.

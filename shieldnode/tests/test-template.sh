@@ -47,6 +47,10 @@ export SH_F_ENABLE_BLOCKLISTS=1 SH_F_ENABLE_SCANNER_LIST=1 SH_F_ENABLE_THREAT_LI
 export SH_F_BLOCK_TOR=0 SH_F_ENABLE_CUSTOM_LIST=1
 export SH_R_SCANNER_BLOCKLIST_SIZE=262144 SH_R_THREAT_BLOCKLIST_SIZE=131072
 export SH_R_TOR_BLOCKLIST_SIZE=16384 SH_R_CUSTOM_BLOCKLIST_SIZE=65536
+export SH_R_CROWDSEC_BLOCKLIST_SIZE=262144
+export SH_R_SPAMHAUS_BLOCKLIST_SIZE=8192 SH_R_CINS_BLOCKLIST_SIZE=65536
+export SH_F_ENABLE_CROWDSEC_LIST=0 SH_F_ENABLE_SPAMHAUS_LIST=1 SH_F_ENABLE_CINS_LIST=1
+export SH_F_ENABLE_AMP_GUARD=1 SH_F_ENABLE_ICMP_GUARD=1
 
 fails=0
 t() { local name="$1"; shift
@@ -65,10 +69,10 @@ t "admin IP в whitelist" grep -q '203.0.113.10' "$RS"
 t "abuse-наборы (§21–24)" bash -c "grep -q 'set ssh_abusers' '$RS' && grep -q 'set tcp_abusers' '$RS' && grep -q 'set udp_abusers' '$RS' && grep -q 'set temporary_blocklist' '$RS'"
 t "protected_tcp/udp с портами" bash -c "grep -q 'set protected_tcp' '$RS' && grep -q '8443' '$RS'"
 t "per-src rate-limit ТОЛЬКО через meter" bash -c "grep -q 'meter ssh_new_22' '$RS' && grep -q 'meter tcp_syn' '$RS' && grep -q 'meter udp_rate' '$RS'"
-t "plain limit только для global ceiling" bash -c "grep -q 'limit rate over 8000/minute drop' '$RS' && grep -q 'limit rate over 20000/second drop' '$RS'"
+t "plain limit только для global ceiling" bash -c "grep -q 'limit rate over 8000/minute counter name c_drops_global_tcp drop' '$RS' && grep -q 'limit rate over 20000/second counter name c_drops_global_udp drop' '$RS'"
 t "SSH-правила для обоих портов" bash -c "grep -q 'dport 22 ' '$RS' && grep -q 'dport 2222 ' '$RS'"
 t "ct count SSH_CONN_MAX/TCP_CONN_MAX" bash -c "grep -q 'ct count over 8' '$RS' && grep -q 'ct count over 15000' '$RS'"
-t "invalid-drop флаговые правила (§22)" bash -c "grep -q 'ct state invalid drop' '$RS' && grep -q 'fin|syn|rst|ack' '$RS'"
+t "invalid-drop флаговые правила (§22)" bash -c "grep -q 'ct state invalid counter name c_drops_invalid drop' '$RS' && grep -q 'fin|syn|rst|ack' '$RS'"
 t "established accept" grep -q 'ct state established,related accept' "$RS"
 t "loopback chain input" grep -q 'iifname "lo" accept' "$RS"
 t "фигурные скобки сбалансированы" bash -c "test \$(grep -o '{' '$RS' | wc -l) = \$(grep -o '}' '$RS' | wc -l)"
@@ -99,23 +103,38 @@ t "SYN_PROTECTION=1 возвращает syn-meter" bash -c "grep -q 'meter tcp_
 # --- агрегаторские блоклисты: сеты + drop-правила ПОСЛЕ whitelist ---
 t "blocklist: наборы scanner/threat/custom (tor выключен)" bash -c "grep -q 'set scanner_blocklist_v4' '$RS' && grep -q 'set threat_blocklist_v4' '$RS' && grep -q 'set custom_blocklist_v4' '$RS' && ! grep -q 'set tor_exit_blocklist_v4' '$RS'"
 t "blocklist: interval+auto-merge на сетах" bash -c "grep -A4 'set scanner_blocklist_v4' '$RS' | grep -q 'flags interval' && grep -A4 'set scanner_blocklist_v4' '$RS' | grep -q 'auto-merge'"
-t "blocklist: drop-правила после whitelist-accept" bash -c "awk '/ip saddr @whitelist_v4 accept/{f=1; next} f && /ip saddr @scanner_blocklist_v4 drop/{print; exit}' '$RS' | grep -q drop"
-t "blocklist: tor drop-правил нет при BLOCK_TOR=0" bash -c "! grep -q 'tor_exit_blocklist_v4 drop' '$RS'"
+t "blocklist: drop-правила после whitelist-accept" bash -c "awk '/ip saddr @whitelist_v4 accept/{f=1; next} f && /ip saddr @scanner_blocklist_v4 counter name/{print; exit}' '$RS' | grep -q drop"
+t "blocklist: tor drop-правил нет при BLOCK_TOR=0" bash -c "! grep -q 'tor_exit_blocklist_v4 counter name' '$RS'"
 SH_F_BLOCK_TOR=1
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-tor.nft
-t "blocklist: BLOCK_TOR=1 добавляет tor-сет и drop" bash -c "grep -q 'set tor_exit_blocklist_v4' /tmp/shieldnode-test/ruleset-tor.nft && grep -q 'ip saddr @tor_exit_blocklist_v4 drop' /tmp/shieldnode-test/ruleset-tor.nft"
+t "blocklist: BLOCK_TOR=1 добавляет tor-сет и drop" bash -c "grep -q 'set tor_exit_blocklist_v4' /tmp/shieldnode-test/ruleset-tor.nft && grep -q 'ip saddr @tor_exit_blocklist_v4 counter name' /tmp/shieldnode-test/ruleset-tor.nft"
 SH_F_BLOCK_TOR=0
 SH_F_ENABLE_BLOCKLISTS=0
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-nobl.nft
 t "blocklist: мастер-выключатель убирает сеты и правила" bash -c "! grep -q 'blocklist_v4' /tmp/shieldnode-test/ruleset-nobl.nft"
 SH_F_ENABLE_BLOCKLISTS=1
 
+# --- crowdsec community blocklist (opt-in) ---
+t "crowdsec: по умолчанию выключен — сетов/правил/счётчиков нет" bash -c "! grep -q 'crowdsec_blocklist' '$RS' && ! grep -q 'c_drops_crowdsec' '$RS'"
+SH_F_ENABLE_CROWDSEC_LIST=1
+SH_R_CROWDSEC_BLOCKLIST_SIZE=262144
+shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-cs.nft
+t "crowdsec: сеты v4/v6 + drop-правила с counter" bash -c "grep -q 'set crowdsec_blocklist_v4' /tmp/shieldnode-test/ruleset-cs.nft && grep -q 'ip saddr @crowdsec_blocklist_v4 counter name c_drops_crowdsec_v4 drop' /tmp/shieldnode-test/ruleset-cs.nft"
+t "crowdsec: drop ПОСЛЕ whitelist-accept" bash -c "awk '/ip saddr @whitelist_v4 accept/{f=1; next} f && /ip saddr @crowdsec_blocklist_v4 counter name/{print; exit}' /tmp/shieldnode-test/ruleset-cs.nft | grep -q drop"
+t "crowdsec: drop-правило несёт counter (инвариант счётчиков)" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' /tmp/shieldnode-test/ruleset-cs.nft) = \$(grep -c 'counter name c_drops_' /tmp/shieldnode-test/ruleset-cs.nft)"
+SH_F_IPV6=1
+shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-cs6.nft
+t "crowdsec: v6-компаньон при IPv6" bash -c "grep -q 'set crowdsec_blocklist_v6' /tmp/shieldnode-test/ruleset-cs6.nft && grep -q 'c_drops_crowdsec_v6' /tmp/shieldnode-test/ruleset-cs6.nft"
+SH_F_IPV6=0
+SH_F_ENABLE_CROWDSEC_LIST=0
+unset SH_R_CROWDSEC_BLOCKLIST_SIZE
+
 # --- IPv6: блоклист-компаньоны _v6 ---
 SH_F_IPV6=1
 SH_F_ADMIN_V6="2001:db8::42"
 SH_F_BLOCK_TOR=1
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-v6bl.nft
-t "IPv6: блоклисты _v6 + drop v6" bash -c "grep -q 'set scanner_blocklist_v6' /tmp/shieldnode-test/ruleset-v6bl.nft && grep -q 'ip6 saddr @threat_blocklist_v6 drop' /tmp/shieldnode-test/ruleset-v6bl.nft && grep -q 'ip6 saddr @tor_exit_blocklist_v6 drop' /tmp/shieldnode-test/ruleset-v6bl.nft"
+t "IPv6: блоклисты _v6 + drop v6" bash -c "grep -q 'set scanner_blocklist_v6' /tmp/shieldnode-test/ruleset-v6bl.nft && grep -q 'ip6 saddr @threat_blocklist_v6 counter name' /tmp/shieldnode-test/ruleset-v6bl.nft && grep -q 'ip6 saddr @tor_exit_blocklist_v6 counter name' /tmp/shieldnode-test/ruleset-v6bl.nft"
 SH_F_IPV6=0
 SH_F_BLOCK_TOR=0
 SH_F_ADMIN_V6=""
@@ -139,4 +158,14 @@ t "validate_key_ownership: net.netfilter.* запрещён" bash -c "! validate
 t "validate_key_ownership: rp_filter разрешён" validate_key_ownership net.ipv4.conf.all.rp_filter
 
 echo
+# базовый цикл = 22; +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 26
+t "counters: 26 именованных счётчиков объявлены (22 базовых + spamhaus/cins/amp/icmp)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 26"
+t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
+t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
+t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -q 'icmp type echo-request limit rate over 10/second' '$RS'"
+t "counters: КАЖДОЕ drop-правило несёт counter name" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' '$RS') = \$(grep -c 'counter name c_drops_' '$RS')"
+t "counters: scanner/threat/tor/custom v4+v6 имеют свои счётчики" bash -c "grep -q 'c_drops_scanner_v4' '$RS' && grep -q 'c_drops_threat_v6' '$RS' && grep -q 'c_drops_custom_v4' '$RS'"
+t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS'"
+t "counters: LOG-флуда нет — log statement отсутствует" bash -c "! grep -qE ' counter name c_drops_.* log |log prefix| nflog' '$RS'"
+
 if [ "$fails" -eq 0 ]; then echo "PASS: template (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

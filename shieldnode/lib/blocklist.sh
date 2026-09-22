@@ -33,6 +33,24 @@ shield_blocklist_install() {
     svc_threat="$(shield_conf_get BLOCKLIST_THREAT_URLS "")"
     svc_tor="$(shield_conf_get BLOCKLIST_TOR_URLS "")"
 
+    # crowdsec Blocklist-as-a-Service: console → Blocklist → Integrations →
+    # "Raw IP List" → ID + Basic-Auth логин/пароль (показываются ОДИН раз).
+    # Креды живут в config.conf (0640 root). Community-тариф: не чаще 1 pull/24ч
+    # (иначе HTTP 429) — updater сам душит интервал через BL_INTERVAL_crowdsec.
+    local cs_id cs_user cs_pass cs_endpoint="" cs_mode
+    cs_id="$(shield_conf_get CROWDSEC_INTEGRATION_ID "")"
+    cs_user="$(shield_conf_get CROWDSEC_USER "")"
+    cs_pass="$(shield_conf_get CROWDSEC_PASSWORD "")"
+    cs_mode="$(shield_crowdsec_resolve_mode)"
+    if [ "$cs_mode" = "feed" ] && [ -n "$cs_id" ] && [ -n "$cs_user" ] && [ -n "$cs_pass" ]; then
+        cs_endpoint="https://admin.api.crowdsec.net/v1/integrations/${cs_id}/content"
+    elif [ "$cs_mode" = "agent" ]; then
+        # локальный источник: updater читает cscli decisions (демон тянет CAPI сам)
+        cs_endpoint="local://cscli-decisions"
+    elif [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
+        log warn "blocklist" "ENABLE_CROWDSEC_LIST=1, но креды не заданы — будет agent-режим (нужен crowdsec-демон); либо задай CROWDSEC_INTEGRATION_ID/USER/PASSWORD для feed"
+    fi
+
     # --- 1) updater-скрипт ---
     {
         cat <<'HEADER_EOF'
@@ -57,19 +75,55 @@ HEADER_EOF
         printf 'BL_ENABLED_threat="%s"\n' "$SH_F_ENABLE_THREAT_LIST"
         printf 'BL_ENABLED_tor="%s"\n' "$SH_F_BLOCK_TOR"
         printf 'BL_ENABLED_custom="%s"\n' "$SH_F_ENABLE_CUSTOM_LIST"
+        printf 'BL_ENABLED_crowdsec="%s"\n' "${SH_F_ENABLE_CROWDSEC_LIST:-0}"
+        printf 'BL_ENABLED_spamhaus="%s"\n' "${SH_F_ENABLE_SPAMHAUS_LIST:-1}"
+        printf 'BL_ENABLED_cins="%s"\n' "${SH_F_ENABLE_CINS_LIST:-1}"
         printf 'BL_URLS_scanner="%s"\n' "$svc_scanner"
         printf 'BL_URLS_threat="%s"\n' "$svc_threat"
         printf 'BL_URLS_tor="%s"\n' "$svc_tor"
-        printf 'BL_URLS_custom=""\n'
+        # custom: локальный файл /etc/shieldnode/lists/custom.txt (оператор) +
+        # опциональный центральный URL (BLOCKLIST_CUSTOM_URLS — например raw
+        # custom.txt из операторского репо; синкается каждый тик таймера)
+        printf 'BL_URLS_custom="%s"\n' "$(shield_conf_get BLOCKLIST_CUSTOM_URLS "")"
+        printf 'BL_URLS_crowdsec="%s"\n' "$cs_endpoint"
+        # spamhaus DROP/EDROP (v4) + dropv6 (v6): формат "S24-x.y.z.w/24 ; comment"
+        # (префикс S<len>- и хвост после ';' срезаются парсером)
+        printf 'BL_URLS_spamhaus="https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/dropv6.txt https://www.spamhaus.org/drop/edrop.txt"\n'
+        # CINS Army: plain IP list (v4 only)
+        printf 'BL_URLS_cins="https://cinsscore.com/list/ci-badguys.txt"\n'
+        # креды — отдельно от URL, чтобы они не светились в логах fetch'а
+        printf 'CROWDSEC_USER="%s"\n' "$cs_user"
+        printf 'CROWDSEC_PASSWORD="%s"\n' "$cs_pass"
         printf 'BL_MIN_scanner="%s"\n' "$(shield_conf_get MIN_ENTRIES_SCANNER 1000)"
         printf 'BL_MIN_threat="%s"\n' "$(shield_conf_get MIN_ENTRIES_THREAT 500)"
         printf 'BL_MIN_tor="%s"\n' "$(shield_conf_get MIN_ENTRIES_TOR 100)"
         printf 'BL_MIN_custom="%s"\n' "$(shield_conf_get MIN_ENTRIES_CUSTOM 0)"
-        printf 'BL_MAX_scanner=100000\nBL_MAX_threat=200000\nBL_MAX_tor=10000\nBL_MAX_custom=50000\n'
+        printf 'BL_MIN_crowdsec="%s"\n' "$(shield_conf_get MIN_ENTRIES_CROWDSEC 500)"
+        printf 'BL_MIN_spamhaus="%s"\n' "$(shield_conf_get MIN_ENTRIES_SPAMHAUS 50)"
+        printf 'BL_MIN_cins="%s"\n' "$(shield_conf_get MIN_ENTRIES_CINS 2000)"
+        printf 'BL_MAX_scanner=100000\nBL_MAX_threat=200000\nBL_MAX_tor=10000\nBL_MAX_custom=50000\nBL_MAX_crowdsec=400000\nBL_MAX_spamhaus=20000\nBL_MAX_cins=200000\n'
+        # размер сетов (для tmp-сета при атомарном swap — должен совпадать с firewall)
+        printf 'BL_SIZE_scanner="%s"\nBL_SIZE_threat="%s"\nBL_SIZE_tor="%s"\nBL_SIZE_custom="%s"\nBL_SIZE_crowdsec="%s"\nBL_SIZE_spamhaus="%s"\nBL_SIZE_cins="%s"\n' \
+            "${SH_R_SCANNER_BLOCKLIST_SIZE:-262144}" "${SH_R_THREAT_BLOCKLIST_SIZE:-131072}" \
+            "${SH_R_TOR_BLOCKLIST_SIZE:-16384}" "${SH_R_CUSTOM_BLOCKLIST_SIZE:-65536}" \
+            "${SH_R_CROWDSEC_BLOCKLIST_SIZE:-262144}" "${SH_R_SPAMHAUS_BLOCKLIST_SIZE:-8192}" \
+            "${SH_R_CINS_BLOCKLIST_SIZE:-65536}"
         # min-prefix v4/v6: threat — /16 (анти-compromise), scanner/custom — /8,
-        # tor — только /32 (single IPs) / v6 /128
-        printf 'BL_MINP4_scanner=8 BL_MINP4_threat=16 BL_MINP4_tor=32 BL_MINP4_custom=8\n'
-        printf 'BL_MINP6_scanner=24 BL_MINP6_threat=29 BL_MINP6_tor=128 BL_MINP6_custom=24\n'
+        # tor — только /32 (single IPs) / v6 /128, crowdsec — /24 (CAPI отдаёт
+        # одиночные IP, но консольные листы могут содержать CIDR)
+        printf 'BL_MINP4_scanner=8 BL_MINP4_threat=16 BL_MINP4_tor=32 BL_MINP4_custom=8 BL_MINP4_crowdsec=24 BL_MINP4_spamhaus=16 BL_MINP4_cins=20\n'
+        printf 'BL_MINP6_scanner=24 BL_MINP6_threat=29 BL_MINP6_tor=128 BL_MINP6_custom=24 BL_MINP6_crowdsec=64 BL_MINP6_spamhaus=32 BL_MINP6_cins=64\n'
+        # crowdsec interval: feed — community-тариф не чаще 1 pull/24ч (иначе 429);
+        # agent — читаем ЛОКАЛЬНУЮ БД демона (демон сам тянет CAPI ~раз/2ч),
+        # дефолт 30 мин без риска рейт-лимита. Ключи разведены: у feed своё,
+        # у agent своё — иначе значение feed'а (1440) молча душило бы agent.
+        local cs_interval
+        if [ "$cs_mode" = "agent" ]; then
+            cs_interval="$(shield_conf_get CROWDSEC_AGENT_INTERVAL_MIN 30)"
+        else
+            cs_interval="$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)"
+        fi
+        printf 'BL_INTERVAL_crowdsec="%s"\n' "$cs_interval"
         cat <<'BODY_EOF'
 
 # операторские оверрайды (не перезаписываются apply)
@@ -109,7 +163,8 @@ except Exception:
 out = []
 def walk(o):
     if isinstance(o, dict):
-        for k in ("cidr", "prefix", "ip", "address"):
+        # cscli decisions list -o json отдаёт объекты с полем "value"
+        for k in ("cidr", "prefix", "ip", "address", "value"):
             v = o.get(k)
             if isinstance(v, str) and ("/" in v or ":" in v or "." in v):
                 out.append(v.strip())
@@ -141,18 +196,64 @@ update_list() { # update_list <name>
     tmp="$(mktemp -d /tmp/shieldnode-bl.XXXXXX)" || return 1
     : > "$tmp/all.raw"
 
+    # 0) per-feed interval-guard: для crowdsec community-тариф разрешает pull
+    #    не чаще раза в N минут (default 1440 = 24ч, иначе API шлёт 429).
+    #    Пропуск = set остаётся как есть (last-known-good), fail-counter не трогаем.
+    #    FORCE=1 — ручной обход гарда (отладка/первичная заливка).
+    eval "interval_guard=\"\$BL_INTERVAL_$name\""
+    interval_guard="${interval_guard:-0}"
+    if [ "${FORCE:-0}" = "1" ]; then interval_guard=0; fi
+    if [ "$interval_guard" -gt 0 ] 2>/dev/null; then
+        local lastok_f="$STATE_DIR/lastok-$name.ts" now lastok
+        now="$(date +%s)"
+        lastok="$([ -f "$lastok_f" ] && cat "$lastok_f" || echo 0)"
+        if [ $(( now - lastok )) -lt $(( interval_guard * 60 )) ]; then
+            bl_log info "$name: interval-guard ${interval_guard}m не истёк — пропуск fetch (set не тронут)"
+            rm -rf "$tmp"
+            return 0
+        fi
+    fi
+
     # 1) remote-источники (ан aggregator'ов). JSON — через извлекатель, иначе raw.
+    #    crowdsec-endpoint — Basic-Auth + --compressed (без сжатия ответы >5MB
+    #    ТРУНЦИРУЮТСЯ на ~350k записей — docs.crowdsec.net/u/integrations).
     local u f
     for u in $urls; do
         f="$tmp/$(echo "$u" | sha256sum | cut -c1-12).raw"
-        if curl -fsSL --connect-timeout 10 --max-time 60 -o "$f" "$u" 2>/dev/null && [ -s "$f" ]; then
+        local curl_rc=0
+        case "$u" in
+            local://cscli-decisions)
+                # agent-режим: читаем ЛОКАЛЬНУЮ БД crowdsec (CAPI уже стянул демон)
+                if ! command -v cscli >/dev/null 2>&1; then
+                    bl_log warn "$name: agent-режим, но cscli не найден — пропущен"
+                    continue
+                fi
+                cscli decisions list -t ban -o json > "$f" 2>/dev/null || curl_rc=$? ;;
+            https://admin.api.crowdsec.net/*)
+                if [ -z "${CROWDSEC_USER:-}" ] || [ -z "${CROWDSEC_PASSWORD:-}" ]; then
+                    bl_log warn "$name: CROWDSEC_USER/CROWDSEC_PASSWORD не заданы — fetch пропущен"
+                    continue
+                fi
+                curl -fsSL --compressed --connect-timeout 10 --max-time 120 \
+                     -u "$CROWDSEC_USER:$CROWDSEC_PASSWORD" -o "$f" "$u" 2>/dev/null || curl_rc=$? ;;
+            *)
+                curl -fsSL --connect-timeout 10 --max-time 60 -o "$f" "$u" 2>/dev/null || curl_rc=$? ;;
+        esac
+        if [ "$curl_rc" -eq 0 ] && [ -s "$f" ]; then
             remote_ok=$((remote_ok + 1))
             case "$u" in
+                # lastok пишем и в agent-режиме — иначе interval-guard (BL_INTERVAL_crowdsec)
+                # не будет иметь метки и пропускать прогоны (local-чтение дёшево, но гард
+                # сохраняет поведение фида и не дёргает cscli чаще интервала)
+                https://admin.api.crowdsec.net/*|local://*) date +%s > "$STATE_DIR/lastok-$name.ts" ;;
+            esac
+            case "$u" in
+                local://*) extract_json_ips "$f" >> "$tmp/all.raw" 2>/dev/null || cat "$f" >> "$tmp/all.raw" ;;
                 *.json|*.json\?*) extract_json_ips "$f" >> "$tmp/all.raw" 2>/dev/null || cat "$f" >> "$tmp/all.raw" ;;
                 *) cat "$f" >> "$tmp/all.raw" ;;
             esac
         else
-            bl_log warn "$name: fetch failed: $u"
+            bl_log warn "$name: fetch failed (rc=$curl_rc): $u"
         fi
     done
 
@@ -173,7 +274,9 @@ update_list() { # update_list <name>
     # 4) парсинг v4: plain IP / CIDR / "CIDR ; SBLxxx" / inline-комментарии.
     #    Bogon-фильтр (RFC1918/CGNAT/loopback/multicast/reserved/test) — в листы
     #    такое не должно попадать, а если попало (compromised feed) — отсекаем.
-    grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$tmp/all.raw" 2>/dev/null | \
+    #    Нормализация spamhaus: "S24-1.2.3.0/24 ; Spamhaus DROP" -> "1.2.3.0/24".
+    sed -E 's/^S[0-9]+-([0-9])/\1/' "$tmp/all.raw" 2>/dev/null | \
+        grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' | \
         awk '{ sub(/^[[:space:]]+/, ""); print }' | \
         awk -F'[./]' -v minprefix="$minp4" '
         {
@@ -272,21 +375,82 @@ update_list() { # update_list <name>
         fi
     fi
 
-    # 9) атомарный swap: v4 транзакция, затем ИЗОЛИРОВАННАЯ v6 (битый v6 не ломает v4)
+    # 9) swap содержимого сета. Предпочтительно АТОМАРНЫЙ: новое содержимое
+    #    заливается в <set>__next (не прибит к правилам — трафик его не видит),
+    #    затем ОДНА транзакция: delete rule → delete set → rename next→live →
+    #    insert rule на прежнюю позицию. Окно «частично заполненного сета» = 0.
+    #    Fallback (старый nft / нет handle'ов / mixed-version таблица): legacy
+    #    flush+refill одним batch — семантика прежних версий.
     local rc=0 v6_failed=0
-    if nft list set $TABLE "$set_v4" >/dev/null 2>&1; then
+    local short="$name"
+    case "$set_v4" in tor_exit_*) short="tor" ;; esac
+
+    swap_one() { # swap_one <live_set> <af:4|6> <loadfile> ; 0=ok, 1=fallback-needed
+        local set="$1" af="$2" load="$3"
+        local tmp_set="${set}__next" afword="ip" stype="ipv4_addr" sz
+        if [ "$af" = "6" ]; then afword="ip6"; stype="ipv6_addr"; fi
+        eval "sz=\"\$BL_SIZE_${name}\""
+        # 1) tmp-set с теми же свойствами + заливка (окна для трафика нет)
         {
-            echo "flush set $TABLE $set_v4"
-            awk -v setname="$set_v4" '
+            echo "add set inet shieldnode $tmp_set { type $stype; flags interval; auto-merge; size ${sz:-262144}; }"
+            awk -v setname="$tmp_set" '
                 NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet shieldnode %s { ", setname }
                 { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
-                END { print " }" }' "$tmp/load.list"
-        } > "$tmp/nft-batch"
-        if nft -c -f "$tmp/nft-batch" >/dev/null 2>"$tmp/nft.err" && nft -f "$tmp/nft-batch" 2>>"$tmp/nft.err"; then
+                END { print " }" }' "$load"
+        } > "$tmp/swap-fill.$af"
+        if ! nft -c -f "$tmp/swap-fill.$af" >/dev/null 2>"$tmp/swap.$af.err" || ! nft -f "$tmp/swap-fill.$af" 2>>"$tmp/swap.$af.err"; then
+            bl_log error "$name: tmp-set $tmp_set fill failed: $(head -c 300 "$tmp/swap.$af.err")"
+            nft delete set inet shieldnode "$tmp_set" 2>/dev/null || true
+            return 1
+        fi
+        # 2) handle drop-правила и позиция следующего правила
+        local listing rule_handle="" pos_handle=""
+        listing="$(nft -a list chain inet shieldnode prerouting 2>/dev/null)" || { nft delete set inet shieldnode "$tmp_set" 2>/dev/null; return 1; }
+        rule_handle="$(printf '%s\n' "$listing" | awk -v pat="$afword saddr @${set} counter" '$0 ~ pat { if (match($0, /# handle [0-9]+/)) { print substr($0, RSTART+9, RLENGTH-9); exit } }')"
+        if [ -z "$rule_handle" ]; then
+            nft delete set inet shieldnode "$tmp_set" 2>/dev/null || true
+            return 1   # правила нет (mixed-version) — legacy refill корректен
+        fi
+        pos_handle="$(printf '%s\n' "$listing" | awk -v rh="$rule_handle" '
+            found && match($0, /# handle [0-9]+/) { print substr($0, RSTART+9, RLENGTH-9); exit }
+            $0 ~ ("# handle " rh "$") { found=1 }')"
+        # 3) swap одной транзакцией
+        {
+            echo "delete rule inet shieldnode prerouting handle $rule_handle"
+            echo "delete set inet shieldnode $set"
+            echo "rename set inet shieldnode $tmp_set $set"
+            if [ -n "$pos_handle" ]; then
+                echo "insert rule inet shieldnode prerouting position $pos_handle $afword saddr @$set counter name c_drops_${short}_v${af} drop"
+            else
+                echo "add rule inet shieldnode prerouting $afword saddr @$set counter name c_drops_${short}_v${af} drop"
+            fi
+        } > "$tmp/swap.$af"
+        if nft -c -f "$tmp/swap.$af" >/dev/null 2>"$tmp/swap.$af.err" && nft -f "$tmp/swap.$af" 2>>"$tmp/swap.$af.err"; then
+            return 0
+        fi
+        nft delete set inet shieldnode "$tmp_set" 2>/dev/null || true
+        bl_log warn "$name: atomic swap v$af недоступен ($(head -c 200 "$tmp/swap.$af.err")) — legacy flush+refill"
+        return 1
+    }
+
+    legacy_refill() { # legacy_refill <set> <loadfile> ; 0=ok
+        local set="$1" load="$2"
+        {
+            echo "flush set inet shieldnode $set"
+            awk -v setname="$set" '
+                NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet shieldnode %s { ", setname }
+                { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
+                END { print " }" }' "$load"
+        } > "$tmp/legacy.nft"
+        nft -c -f "$tmp/legacy.nft" >/dev/null 2>"$tmp/legacy.err" && nft -f "$tmp/legacy.nft" 2>>"$tmp/legacy.err"
+    }
+
+    if nft list set $TABLE "$set_v4" >/dev/null 2>&1; then
+        if swap_one "$set_v4" 4 "$tmp/load.list" || legacy_refill "$set_v4" "$tmp/load.list"; then
             echo 0 > "$fail_counter"
             rm -f "$STATE_DIR/.alert-$name"
         else
-            bl_log error "$name: nft swap v4 failed: $(head -c 300 "$tmp/nft.err")"
+            bl_log error "$name: nft swap v4 failed"
             bump_fail "$name" "$fail_counter"
             rc=1
         fi
@@ -296,16 +460,9 @@ update_list() { # update_list <name>
     fi
 
     if nft list set $TABLE "$set_v6" >/dev/null 2>&1 && [ -s "$tmp/load6.list" ]; then
-        {
-            echo "flush set $TABLE $set_v6"
-            awk -v setname="$set_v6" '
-                NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet shieldnode %s { ", setname }
-                { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
-                END { print " }" }' "$tmp/load6.list"
-        } > "$tmp/nft-batch6"
-        if ! nft -c -f "$tmp/nft-batch6" >/dev/null 2>"$tmp/nft6.err" || ! nft -f "$tmp/nft-batch6" 2>>"$tmp/nft6.err"; then
+        if ! swap_one "$set_v6" 6 "$tmp/load6.list" && ! legacy_refill "$set_v6" "$tmp/load6.list"; then
             v6_failed=1
-            bl_log warn "$name: v6 swap failed: $(head -c 300 "$tmp/nft6.err") — v4 не затронут"
+            bl_log warn "$name: v6 swap failed — v4 не затронут"
         fi
     fi
 
@@ -357,7 +514,7 @@ rc=0
 # аргументы = подмножество списков (systemd path-триггер зовёт с "custom");
 # без аргументов — все включённые
 lists="$*"
-[ -n "$lists" ] || lists="scanner threat tor custom"
+[ -n "$lists" ] || lists="scanner threat tor custom crowdsec spamhaus cins"
 for list_name in $lists; do
     update_list "$list_name" || rc=1
 done
@@ -445,7 +602,9 @@ EOF
 # shieldnode custom blocklist — операторские вручную добавленные IP/CIDR.
 # Формат: одна запись на строку (IP или CIDR, опционально комментарий после #).
 # MIN_ENTRIES_CUSTOM=0 — пустой список допустим. Изменения подхватываются
-# shieldnode-blocklist.timer (см. BLOCKLIST_UPDATE_INTERVAL в config.conf).
+# МГНОВЕННО (systemd path-триггер на этот файл).
+# Второй источник — центральный URL в config.conf: BLOCKLIST_CUSTOM_URLS
+# (аналог старого репо SpofyJet/shield lists/custom.txt). Оба объединяются.
 EOF
         chmod 0644 "$SHIELD_LISTS_DIR/custom.txt"
     else

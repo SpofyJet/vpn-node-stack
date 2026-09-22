@@ -41,10 +41,15 @@ node_load_config() {
     fi
 }
 
+# MemTotal в MB; NODE_PROC_MEMINFO — тестовый override фикстуры meminfo
+node_memtotal_mb() {
+    awk '/MemTotal/{print int($2/1024)}' "${NODE_PROC_MEMINFO:-/proc/meminfo}" 2>/dev/null || echo 1024
+}
+
 # RAM tier: T1<=2GB T2<=4GB T3<=8GB T4>8GB (auto-выбор консервативных веток)
 node_ram_tier() {
     local mb
-    mb="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+    mb="$(node_memtotal_mb)"
     if   [ "$mb" -le 2048 ]; then echo 1
     elif [ "$mb" -le 4096 ]; then echo 2
     elif [ "$mb" -le 8192 ]; then echo 3

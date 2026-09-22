@@ -21,6 +21,7 @@ shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.0.
   apply               применить политики (по умолчанию; с --dry-run — только показ)
   detect              снапшот окружения (без изменений)
   status              ожидаемое vs фактическое состояние
+  guard               пульт: дропы, наборы, conntrack, службы, алерты (read-only)
   rollback [id]       откат к backup-набору (без id — последний/удаление своих)
   emergency on|off    аварийный минимальный режим
   uninstall           полный откат + удаление своих файлов
@@ -49,11 +50,17 @@ done
 cmd="${POSITIONAL[0]:-apply}"
 subarg="${POSITIONAL[1]:-}"
 
+# вызов как `guard` (symlink /usr/local/sbin/guard → install.sh) = дашборд
+if [ "$cmd" = "apply" ] && [ "$(basename "$0")" = "guard" ]; then
+    cmd="guard"
+fi
+
 # shellcheck source=lib/common.sh
 source "$SHIELD_DIR/lib/common.sh"
 
 case "$cmd" in
     detect|status) : ;;  # root не обязателен (только чтение)
+    guard) : ;;  # read-only дашборд; nft list всё равно требует CAP_NET_ADMIN, но не роняем
     *) require_root ;;
 esac
 
@@ -75,6 +82,8 @@ case "$cmd" in
         source "$SHIELD_DIR/emergency.sh"
         # shellcheck source=firewall.sh
         source "$SHIELD_DIR/firewall.sh"
+        # shellcheck source=lib/crowdsec.sh
+        source "$SHIELD_DIR/lib/crowdsec.sh"
         # shellcheck source=ssh.sh
         source "$SHIELD_DIR/ssh.sh"
         # shellcheck source=limits.sh
@@ -95,9 +104,18 @@ case "$cmd" in
         source "$SHIELD_DIR/detect.sh"
         # shellcheck source=ssh.sh
         source "$SHIELD_DIR/ssh.sh"
+        # shellcheck source=lib/crowdsec.sh
+        source "$SHIELD_DIR/lib/crowdsec.sh"
         # shellcheck source=status.sh
         source "$SHIELD_DIR/status.sh"
         shield_status
+        ;;
+    guard)
+        # shellcheck source=detect.sh
+        source "$SHIELD_DIR/detect.sh"
+        # shellcheck source=guard.sh
+        source "$SHIELD_DIR/guard.sh"
+        shield_guard
         ;;
     rollback)
         acquire_lock

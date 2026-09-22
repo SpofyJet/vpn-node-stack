@@ -23,7 +23,8 @@ shield_limits_resolve() {
     export SH_R_UDP_RATE SH_R_UDP_BURST SH_R_UDP_GLOBAL_CEIL
     export SH_R_SSH_ABUSERS_TIMEOUT SH_R_SSH_ABUSERS_SIZE SH_R_TCP_ABUSERS_TIMEOUT SH_R_TCP_ABUSERS_SIZE
     export SH_R_UDP_ABUSERS_TIMEOUT SH_R_UDP_ABUSERS_SIZE SH_R_TEMP_BLOCKLIST_TIMEOUT SH_R_TEMP_BLOCKLIST_SIZE
-    export SH_R_SCANNER_BLOCKLIST_SIZE SH_R_THREAT_BLOCKLIST_SIZE SH_R_TOR_BLOCKLIST_SIZE SH_R_CUSTOM_BLOCKLIST_SIZE
+    export SH_R_SCANNER_BLOCKLIST_SIZE SH_R_THREAT_BLOCKLIST_SIZE SH_R_TOR_BLOCKLIST_SIZE SH_R_CUSTOM_BLOCKLIST_SIZE SH_R_CROWDSEC_BLOCKLIST_SIZE
+    export SH_R_SPAMHAUS_BLOCKLIST_SIZE SH_R_CINS_BLOCKLIST_SIZE
 
     SH_R_SSH_CONN_MAX="$(shield_limit_num SSH_CONN_MAX 8)"
     SH_R_SSH_NEW_RATE="$(shield_limit_num SSH_NEW_RATE 10)"
@@ -50,15 +51,32 @@ shield_limits_resolve() {
     SH_R_THREAT_BLOCKLIST_SIZE="$(shield_limit_num THREAT_BLOCKLIST_SIZE 131072)"
     SH_R_TOR_BLOCKLIST_SIZE="$(shield_limit_num TOR_BLOCKLIST_SIZE 16384)"
     SH_R_CUSTOM_BLOCKLIST_SIZE="$(shield_limit_num CUSTOM_BLOCKLIST_SIZE 65536)"
+    # crowdsec community blocklist (opt-in, нужны креды консоли): CAPI ~28k-350k записей
+    SH_R_CROWDSEC_BLOCKLIST_SIZE="$(shield_limit_num CROWDSEC_BLOCKLIST_SIZE 262144)"
+    # spamhaus DROP/EDROP (~2k диапазонов worst-of-the-worst, v4+v6) и CINS Army (~30k IP)
+    SH_R_SPAMHAUS_BLOCKLIST_SIZE="$(shield_limit_num SPAMHAUS_BLOCKLIST_SIZE 8192)"
+    SH_R_CINS_BLOCKLIST_SIZE="$(shield_limit_num CINS_BLOCKLIST_SIZE 65536)"
 
-    # blocklists: мастер-флаг + per-list (агрегаторы scanner/threat/tor/custom)
+    # blocklists: мастер-флаг + per-list (агрегаторы scanner/threat/tor/custom/crowdsec/spamhaus/cins)
     export SH_F_ENABLE_BLOCKLISTS SH_F_ENABLE_SCANNER_LIST SH_F_ENABLE_THREAT_LIST
-    export SH_F_BLOCK_TOR SH_F_ENABLE_CUSTOM_LIST
+    export SH_F_BLOCK_TOR SH_F_ENABLE_CUSTOM_LIST SH_F_ENABLE_CROWDSEC_LIST
+    export SH_F_ENABLE_SPAMHAUS_LIST SH_F_ENABLE_CINS_LIST
     SH_F_ENABLE_BLOCKLISTS="$(shield_conf_get ENABLE_BLOCKLISTS 1)"
     SH_F_ENABLE_SCANNER_LIST="$(shield_conf_get ENABLE_SCANNER_LIST 1)"
     SH_F_ENABLE_THREAT_LIST="$(shield_conf_get ENABLE_THREAT_LIST 1)"
     SH_F_BLOCK_TOR="$(shield_conf_get BLOCK_TOR 0)"
     SH_F_ENABLE_CUSTOM_LIST="$(shield_conf_get ENABLE_CUSTOM_LIST 1)"
+    # crowdsec: opt-in (default 0) — без креденшелов консоли фид бессмысленен
+    SH_F_ENABLE_CROWDSEC_LIST="$(shield_conf_get ENABLE_CROWDSEC_LIST 0)"
+    # spamhaus/cins: бесплатные фиды без ключа — default 1 (worst-of-the-worst, ложных срабатываний почти нет)
+    SH_F_ENABLE_SPAMHAUS_LIST="$(shield_conf_get ENABLE_SPAMHAUS_LIST 1)"
+    SH_F_ENABLE_CINS_LIST="$(shield_conf_get ENABLE_CINS_LIST 1)"
+
+    # amplification-guard (anti-reflection): NEW UDP от известных amplifier source-портов
+    # (53/123/1900/11211/389) — неспрошенные ответы. Свои DNS-запросы = ESTABLISHED, не трогаем.
+    export SH_F_ENABLE_AMP_GUARD SH_F_ENABLE_ICMP_GUARD
+    SH_F_ENABLE_AMP_GUARD="$(shield_conf_get ENABLE_AMP_GUARD 1)"
+    SH_F_ENABLE_ICMP_GUARD="$(shield_conf_get ENABLE_ICMP_GUARD 1)"
 
     # SSH-порты: config SSH_PORT (если задан) иначе авто-детект (ТЗ §19)
     local cfg_port; cfg_port="$(shield_conf_get SSH_PORT "")"

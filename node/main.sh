@@ -58,7 +58,7 @@ done
 
 for arg in "${POSITIONAL[@]}"; do
     case "$arg" in
-        apply|status|detect|uninstall|rollback) MODE="$arg" ;;
+        apply|status|detect|uninstall|rollback|rt-reapply) MODE="$arg" ;;
         [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ROLLBACK_ID="$arg" ;;
         *) echo "unknown argument: '$arg'" >&2; usage >&2; exit 64 ;;
     esac
@@ -128,6 +128,13 @@ case "$MODE" in
         # shellcheck source=uninstall.sh
         source "$NODE_DIR/uninstall.sh"
         node_uninstall
+        ;;
+    rt-reapply)
+        # внутренний режим (вызывается node-rt-tweaks.service при boot):
+        # только runtime-твики; sysctl/сервисы/файлы не трогаем
+        # shellcheck source=apply.sh
+        source "$NODE_DIR/apply.sh"
+        node_rt_reapply
         ;;
     *)
         die "unknown mode: $MODE (apply|status|rollback|detect|uninstall)"

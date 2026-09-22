@@ -137,8 +137,15 @@ shield_apply() {
     shield_persist_nft "$tmp"
     shield_persist_service
     shield_persist_security_sysctl
+    shield_logrotate_persist
     shield_cleanup_timer_install
+    # crowdsec agent-режим (БЕЗ аккаунта): демон + анонимная CAPI-регистрация.
+    # До blocklist_install — updater сразу читает cscli decisions.
+    if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ] && [ "$(shield_crowdsec_resolve_mode)" = "agent" ]; then
+        shield_crowdsec_agent_ensure || true
+    fi
     shield_blocklist_install
+    shield_guard_link
     rm -f "$tmp"
 
     # --- журнал abuse стартуем сразу ---

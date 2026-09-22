@@ -27,7 +27,7 @@ t() { local name="$1"; shift
 TS=20240101-000000
 
 # --- сценарий 1: файл с backup → восстановление содержимого ---
-F1=/tmp/node-test-rollback/fake-etc/80-node-base.conf
+F1=/tmp/node-test-rollback/fake-etc/99-z0-node-base.conf
 echo "ORIGINAL" > "$F1"
 cp -a "$F1" "$F1.pre-node-$TS"          # имитация backup() от предыдущего прогона
 echo "MODIFIED" > "$F1"                 # «применённое» состояние
@@ -46,7 +46,7 @@ t "orphan-файл удалён" bash -c "! test -e '$F2'"
 t "манифест очищен" bash -c "! test -s '$NODE_STATE_DIR/applied-files.txt'"
 
 # --- сценарий 3: откат без ts (удаление всех своих файлов) ---
-F3=/tmp/node-test-rollback/fake-etc/81-node-datapath.conf
+F3=/tmp/node-test-rollback/fake-etc/99-z1-node-datapath.conf
 echo "X" > "$F3"
 echo "$F3" > "$NODE_STATE_DIR/applied-files.txt"
 node_rollback ""

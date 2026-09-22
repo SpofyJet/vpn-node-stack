@@ -91,6 +91,8 @@ node_apply() {
     node_network_docker_integration
     node_fq_tune_apply
     node_xanmod_install
+    node_logrotate_persist
+    node_rt_boot_persist
 
     node_sysctl_owner_dump
 
@@ -147,4 +149,113 @@ node_self_test() {
         die "self-test: $fails провалов — выполни rollback: bash install.sh rollback"
     fi
     ok "selftest" "all checks passed"
+}
+
+# ---------- runtime-твики: boot re-apply (переживаемость reboot) ----------
+# Сильные режимы (rings/offloads/RPS/XPS/IRQ-affinity/fq-tune/mss) применяются
+# runtime. Без этой службы они молча испарялись бы после reboot: unit
+# перезапускает ТОЛЬКО runtime-функции (sysctl-файлы — на диске, их systemd
+# применяет сам). Диспетчеризация: bash install.sh rt-reapply.
+
+node_rt_boot_needed() {
+    [ -n "$(node_conf_get NIC_RING_RX "")" ] && return 0
+    [ -n "$(node_conf_get NIC_RING_TX "")" ] && return 0
+    [ "$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)" = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_RSS_BALANCE 0)"    = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_RPS 0)"            = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_XPS 0)"            = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_IRQ_AFFINITY 0)"   = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_FQ_TUNE 1)"        = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_MSS_CLAMP 0)"      = "1" ] && return 0
+    return 1
+}
+
+node_logrotate_persist() {
+    {
+        echo "# node — ротация лога (managed by node)"
+        echo "$NODE_LOG {"
+        echo "    size 10M"
+        echo "    rotate 4"
+        echo "    compress"
+        echo "    missingok"
+        echo "    notifempty"
+        echo "    copytruncate   # демон-переоткрытие лога не предусмотрено; race окна микроскопичны при нашем rate"
+        echo "}"
+    } | node_persist /etc/logrotate.d/node
+}
+
+node_rt_boot_persist() {
+    local script="${NODE_RT_SCRIPT:-/usr/local/sbin/node-rt-tweaks.sh}" unit="${NODE_RT_UNIT:-/etc/systemd/system/node-rt-tweaks.service}" udev="${NODE_UDEV_RULE:-/etc/udev/rules.d/99-node-rt-hotplug.rules}"
+    if ! node_rt_boot_needed; then
+        # disable/rm на несуществующем unit безвредны — guard по файлу не нужен
+        if [ "${DRY_RUN:-0}" != "1" ]; then
+            systemctl disable --now node-rt-tweaks.service >/dev/null 2>&1 || true
+            rm -f "$unit" "$script" "$udev" 2>/dev/null || true
+            udevadm control --reload >/dev/null 2>&1 || true
+            log info "rt" "node-rt-tweaks.service удалён (все runtime-твики выключены в конфиге)"
+        fi
+        return 0
+    fi
+    {
+        echo '# node — re-apply runtime tweaks at boot (generated, managed by node; do not edit)'
+        echo "cd '$NODE_DIR' && exec bash install.sh rt-reapply"
+    } | node_persist "$script"
+    chmod 0755 "$script" 2>/dev/null || true
+    {
+        echo "[Unit]"
+        echo "Description=node runtime tweaks re-apply (managed by node)"
+        echo "After=network-online.target"
+        echo "Wants=network-online.target"
+        echo ""
+        echo "[Service]"
+        echo "Type=oneshot"
+        echo "RemainAfterExit=yes"
+        echo "ExecStart=$script"
+        echo "NoNewPrivileges=yes"
+        echo "ProtectSystem=strict"
+        echo "ProtectHome=yes"
+        echo "PrivateTmp=yes"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=multi-user.target"
+    } | node_persist "$unit"
+    # hotplug: новый NIC (virtio hot-add, USB-ethernet, sriov-vf) после boot
+    # не получит rings/offloads/RPS/XPS. SYSTEMD_WANTS ловит add-ивент до
+    # multi-user; для уже активного (RemainAfterExit) unit повторный триггер
+    # не перезапустит его — поэтому RUN+=restart: твики идемпотентны, повторный
+    # прогон дёшев. Правило ловит ЛЮБОЙ net-add, не только дефолтный iface —
+    # tun/tap VPN-тоже (хуже не будет, persist-записи только по реальным iface).
+    {
+        echo '# node — re-apply runtime tweaks on NIC hotplug (managed by node; do not edit)'
+        echo 'ACTION=="add", SUBSYSTEM=="net", TAG+="systemd", ENV{SYSTEMD_WANTS}="node-rt-tweaks.service", RUN+="/bin/systemctl restart node-rt-tweaks.service"'
+    } | node_persist "$udev"
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        udevadm control --reload >/dev/null 2>&1 || true
+        systemctl enable node-rt-tweaks.service >/dev/null 2>&1 \
+            && ok "rt" "node-rt-tweaks.service: runtime-твики переживут reboot и hotplug NIC" \
+            || warn "rt" "systemctl enable node-rt-tweaks.service не удался"
+    else
+        log info "dry-run" "rt: would enable node-rt-tweaks.service + udev hotplug rule"
+    fi
+}
+
+node_rt_reapply() {
+    log info "rt" "=== rt-reapply: только runtime-твики (sysctl-файлы не трогаем) ==="
+    source "$NODE_DIR/lib/conntrack.sh"
+    source "$NODE_DIR/lib/nic.sh"
+    source "$NODE_DIR/lib/irq.sh"
+    source "$NODE_DIR/lib/network.sh"
+    source "$NODE_DIR/lib/datapath.sh"
+    node_conntrack_ensure_module
+    node_conntrack_apply
+    node_nic_apply_rings
+    node_nic_opt_apply
+    node_nic_lro_off
+    node_nic_low_latency
+    node_irq_apply
+    node_irq_affinity_apply
+    node_network_mss_clamp
+    node_fq_tune_apply
+    ok "rt" "rt-reapply завершён"
 }
