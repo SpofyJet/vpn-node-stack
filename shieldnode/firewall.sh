@@ -30,7 +30,8 @@ shield_contract_write() {
         log info "dry-run" "contract: append [shieldnode] to $conf"
         return 0
     fi
-    local tmp; tmp="$(mktemp)"
+    # 2026-09-23: mktemp в каталоге назначения (как в node) — mv из /tmp не атомарен
+    local tmp; tmp="$(mktemp "/etc/node-profile.d/.stack.conf.XXXXXX")"
     if [ -f "$conf" ]; then
         awk '/^\[shieldnode\]/{skip=1; next} /^\[/{skip=0} !skip' "$conf" > "$tmp" || true
     fi

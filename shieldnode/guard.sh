@@ -51,7 +51,15 @@ shield_guard() {
     local total_lines
     total_lines="$(guard_counters | wc -l)"
     if [ "$total_lines" -eq 0 ]; then
-        echo "  (нет счётчиков — firewall не применён?)"
+        # Различаем «firewall не применён» и «применён, но дропов нет».
+        # (история: `nft list counters inet <table>` — синтакс-ошибка на
+        # nft < 1.0.8, из-за чего guard всегда показывал это сообщение
+        # на работающем firewall — исправлено на глобальную форму в common.sh)
+        if [ "$fw_state" = "ABSENT" ]; then
+            echo "  (нет счётчиков — firewall не применён: запусти install.sh)"
+        else
+            echo "  (счётчики пустые — это нормально: дропов пока не было)"
+        fi
     else
         guard_counters | sort -k2,2nr | while read -r name packets bytes; do
             local d="-"
@@ -69,8 +77,12 @@ shield_guard() {
             echo "  --- $nonzero/$total_lines счётчиков ненулевые ---"
         fi
         # снапшот для следующего запуска — только при живом firewall
-        { echo "$now_ts"; guard_counters; } > "$SHIELD_GUARD_SNAPSHOT.tmp" 2>/dev/null \
-            && mv "$SHIELD_GUARD_SNAPSHOT.tmp" "$SHIELD_GUARD_SNAPSHOT" 2>/dev/null || true
+        # 2026-09-23 (v1.1.2): уникальный tmp — два guard одновременно (watch/два
+        # админа) писали в один «.tmp» и мешали снапшоты -> мусорные дельты
+        local gt; gt="$(mktemp "$SHIELD_GUARD_SNAPSHOT.XXXXXX" 2>/dev/null)" || gt=""
+        if [ -n "$gt" ] && { echo "$now_ts"; guard_counters; } > "$gt" 2>/dev/null; then
+            mv "$gt" "$SHIELD_GUARD_SNAPSHOT" 2>/dev/null || rm -f "$gt"
+        else rm -f "$gt" 2>/dev/null; fi
     fi
     echo
 
@@ -108,14 +120,21 @@ shield_guard() {
     echo
 
     # --- 5) службы ---
+    # is-active/is-enabled НЕ различают «unit не существует» и «unit есть, но
+    # inactive»: обе возвращают rc!=0 с текстом. Поэтому «not-found»
+    # показываем только если `systemctl cat` не нашёл unit-файл (баг 2026-09-22:
+    # на рабочей ноде служба выводилась как not-found, хотя юнит был и просто
+    # был выключен).
     echo "--- services ---"
-    local svc st
+    local svc st en
     for svc in shieldnode.service shieldnode-blocklist.timer shieldnode-blocklist-custom.path; do
-        if st="$(systemctl is-active "$svc" 2>/dev/null)"; then
-            printf '  %-34s %s\n' "$svc" "$st"
-        else
-            printf '  %-34s %s\n' "$svc" "not-found"
+        if ! systemctl cat "$svc" >/dev/null 2>&1; then
+            printf '  %-34s %s\n' "$svc" "not-found (systemctl daemon-reload?)"
+            continue
         fi
+        st="$(systemctl is-active "$svc" 2>/dev/null || true)"
+        en="$(systemctl is-enabled "$svc" 2>/dev/null || echo '?')"
+        printf '  %-34s active=%-10s enabled=%s\n' "$svc" "${st:-?}" "$en"
     done
     # последний прогон updater'а по снапшотам списков
     local lg

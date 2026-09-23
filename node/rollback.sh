@@ -18,12 +18,22 @@ node_rollback() {
     log info "rollback" "target backup set: ${ts:-<none — только удаление своих файлов>}"
 
     # 1. восстановление/удаление по манифесту
-    local dropdirs=()
+    local dropdirs=() reg="$NODE_STATE_DIR/file-origins.tsv" origin
     if [ -f "$NODE_MANIFEST" ]; then
         while read -r f; do
             [ -e "$f" ] || continue
             # запоминаем наши drop-in каталоги (limits) для очистки ниже
             case "$f" in /etc/systemd/system/*.d/*.conf) dropdirs+=("$(dirname "$f")") ;; esac
+            # 2026-09-23: откат без id — по реестру происхождения (persist.sh):
+            # «created» удаляем, иначе возвращаем копию состояния ДО node. Бэкапы
+            # .pre-node-* после повторного apply — собственные версии node.
+            origin=""
+            [ -z "$id" ] && [ -f "$reg" ] && origin="$(awk -F'\t' -v p="$f" '$1==p{print $2; exit}' "$reg")"
+            if [ "$origin" = "created" ]; then
+                rm -f "$f"; log info "rollback" "removed own file $f (создан node)"; continue
+            elif [ -n "$origin" ] && { [ -e "$origin" ] || [ -L "$origin" ]; }; then
+                cp -a -- "$origin" "$f"; log info "rollback" "restored $f <- состояние до node"; continue
+            fi
             # Если есть хоть один .pre-node-* бэкап — файл существовал ДО node:
             # ВОССТАНАНВЛИВАЕМ, а не удаляем (раньше при пустом ts делался rm -f
             # и стирались чужие pre-existing файлы, напр. /etc/fstab, хотя рядом
@@ -56,15 +66,37 @@ node_rollback() {
             [ -n "$d" ] && rmdir "$d" 2>/dev/null || true
         done
         : > "$NODE_MANIFEST"
+        # жизненный цикл манифеста закончен — реестр происхождения тоже
+        rm -f "$reg" "$NODE_STATE_DIR"/origins/* 2>/dev/null || true
+        rmdir "$NODE_STATE_DIR/origins" 2>/dev/null || true
     fi
 
     # 2. runtime-откат ключей, которым больше не принадлежит файл
-    local snap keys_f="$NODE_STATE_DIR/owner-keys.txt"
+    local snap keys_f="$NODE_STATE_DIR/owner-keys.txt" sreg="$NODE_STATE_DIR/sysctl-orig.tsv" restored=""
+    # 2a. 2026-09-23: исходные значения из реестра (lib/sysctl.sh) — приоритет над
+    # снапшотом (тот после повторного apply хранит значения node). Ключи, ещё
+    # управляемые оставшимися файлами (откат к набору id), остаются в реестре.
+    if [ -s "$sreg" ]; then
+        local rk rv skre stmp; restored=""; stmp="$(mktemp "$NODE_STATE_DIR/.sysctl-orig.XXXXXX")"
+        while IFS=$'\t' read -r rk rv; do
+            [ -n "$rk" ] || continue
+            skre="${rk//./\\.}"
+            if grep -rqsE "^${skre}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null; then
+                printf '%s\t%s\n' "$rk" "$rv" >> "$stmp"; continue
+            fi
+            sysctl -w "$rk=$rv" >/dev/null 2>&1 && log info "rollback" "runtime restored $rk=$rv (до node)" || true
+            restored+="$rk"$'\n'
+        done < "$sreg"
+        mv "$stmp" "$sreg"; [ -s "$sreg" ] || rm -f "$sreg"
+    fi
     snap="$(ls -1t "$NODE_DIAG_DIR"/*.txt 2>/dev/null | head -1 || true)"
     if [ -f "$keys_f" ] && [ -n "$snap" ]; then
         local k v
         while read -r k; do
             [ -z "$k" ] && continue
+            # уже восстановлен из реестра исходных значений (2a) или ещё в нём
+            if grep -qxF -- "$k" <<<"$restored"; then continue; fi
+            if [ -f "$sreg" ] && awk -F'\t' -v k="$k" '$1==k{f=1} END{exit !f}' "$sreg"; then continue; fi
             # ключ ещё управляется оставшимися файлами node?
             # (точки ключа экранируем: regex-точка в «net.ipv4...» матчила любой символ)
             local kre="${k//./\\.}"
@@ -77,6 +109,9 @@ node_rollback() {
             fi
         done < "$keys_f"
     fi
+    # ни одного sysctl-файла node не осталось — реестр владения пуст (иначе следующий
+    # apply счёл бы ключи «legacy» и не записал их исходные значения)
+    if ! ls /etc/sysctl.d/99-z[01234]-node-*.conf >/dev/null 2>&1 && [ -f "$keys_f" ]; then : > "$keys_f"; fi
 
     # 3. runtime-твики (ethtool/rings/offloads/txqueuelen/irq affinity) — явный откат
     node_rt_rollback

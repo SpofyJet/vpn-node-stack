@@ -31,11 +31,104 @@
 # в v5.2.0 — tcp_collapse ~59/сек на проде).
 set -euo pipefail
 
+# --- softnet-обратная связь (v1.1.3, 2026-09-23) ---
+# /proc/net/softnet_stat (по строке на CPU, hex): 1 = processed, 2 = dropped
+# (переполнение backlog: netdev_max_backlog), 3 = time_squeeze (NAPI-цикл
+# упёрся в netdev_budget/_usecs при оставшейся работе) — см. Documentation/
+# admin-guide/sysctl/net.rst. Счётчики — с boot, читаем ОДИН раз за прогон.
+node_softnet_read() {
+    [ -n "${_NODE_SN_READ:-}" ] && return 0
+    local t
+    t="$(awk '{p += strtonum_hex($1); d += strtonum_hex($2); s += strtonum_hex($3)}
+        function strtonum_hex(h,   i, v, c) { v = 0; h = tolower(h)
+            for (i = 1; i <= length(h); i++) { c = index("0123456789abcdef", substr(h, i, 1)); if (!c) return v; v = v * 16 + c - 1 }
+            return v }
+        END {printf "%d %d %d\n", p, d, s}' "${NODE_PROC_ROOT:-/proc}/net/softnet_stat" 2>/dev/null || echo "0 0 0")"
+    read -r _NODE_SN_PROC _NODE_SN_DROP _NODE_SN_SQZ <<<"$t"
+    _NODE_SN_READ=1
+}
+# ключ задан оператором ЯВНО (в node.conf, не defaults) — авто-решение не трогает его
+node_conf_user_set() { [ -f "${NODE_CONFIG:-/etc/node/node.conf}" ] && grep -qE "^$1=" "${NODE_CONFIG:-/etc/node/node.conf}"; }
+# node_softnet_value <ключ-конфига> <значение-плана> <drop|squeeze> — шаг вверх (x2)
+# ТОЛЬКО при доказанном насыщении и AUTO_SOFTNET_TUNE=1; иначе значение плана как есть.
+node_softnet_value() {
+    local key="$1" v="$2" kind="$3"
+    [ "$(node_conf_get AUTO_SOFTNET_TUNE 1)" = "1" ] || { echo "$v"; return 0; }
+    node_conf_user_set "$key" && { echo "$v"; return 0; }
+    case "$kind" in
+        drop)    [ "${_NODE_SN_DROP:-0}" -gt 0 ] && v=$((v * 2)) ;;
+        # squeeze > 0.1% processed: единичные исторические squeeze не в счёт
+        squeeze) [ $(( ${_NODE_SN_SQZ:-0} * 1000 )) -gt "${_NODE_SN_PROC:-0}" ] && [ "${_NODE_SN_SQZ:-0}" -gt 0 ] && v=$((v * 2)) ;;
+    esac
+    echo "$v"
+}
+
+# --- perf-снапшот и отчёт «что упирается» (v1.1.3, 2026-09-23) ---
+# Только чтение /proc и /sys (корни переопределяемы NODE_PROC_ROOT/NODE_SYS_ROOT).
+# apply сохраняет снапшот как baseline; status показывает дельты с момента apply —
+# видно, помогли ли твики и где текущий предел (softirq/backlog, accept-очередь,
+# UDP-буферы, потери пути, steal гипервизора, кольца NIC).
+node_perf_snapshot() {
+    local pr="${NODE_PROC_ROOT:-/proc}" sr="${NODE_SYS_ROOT:-/sys}" ifname k
+    echo "ts=$(date +%s)"
+    if declare -F node_softnet_read >/dev/null 2>&1; then
+        unset _NODE_SN_READ; node_softnet_read   # свежее чтение, не кэш плана
+        echo "softnet_processed=$_NODE_SN_PROC"; echo "softnet_dropped=$_NODE_SN_DROP"; echo "softnet_squeeze=$_NODE_SN_SQZ"
+    fi
+    # /proc/net/netstat и /proc/net/snmp: пары строк «Префикс: имена» / «Префикс: значения»
+    awk '$1 == "TcpExt:" || $1 == "Tcp:" || $1 == "Udp:" {
+            if (!(($1) in hdr)) { hdr[$1] = 1; for (i = 2; i <= NF; i++) name[$1, i] = $i; next }
+            for (i = 2; i <= NF; i++) v[$1 name[$1, i]] = $i }
+        END { n = split("TcpExt:ListenOverflows TcpExt:ListenDrops TcpExt:TCPBacklogDrop TcpExt:TCPRcvQDrop Tcp:RetransSegs Tcp:OutSegs Udp:RcvbufErrors Udp:SndbufErrors Udp:InErrors", want, " ")
+              for (j = 1; j <= n; j++) { key = want[j]; sub(":", "", key); printf "%s=%d\n", key, v[want[j]] + 0 } }' \
+        "$pr/net/netstat" "$pr/net/snmp" 2>/dev/null || true
+    # /proc/stat: cpu user nice system idle iowait irq softirq steal
+    awk '$1 == "cpu" { t = 0; for (i = 2; i <= 9; i++) t += $i; printf "cpu_total=%d\ncpu_softirq=%d\ncpu_steal=%d\n", t, $8, $9 }' "$pr/stat" 2>/dev/null || true
+    ifname="$(node_default_iface 2>/dev/null || true)"
+    if [ -n "$ifname" ]; then
+        echo "nic=$ifname"
+        for k in rx_packets rx_dropped rx_missed_errors tx_dropped; do
+            echo "nic_$k=$(cat "$sr/class/net/$ifname/statistics/$k" 2>/dev/null || echo 0)"
+        done
+    fi
+}
+
+node_perf_report() {   # <baseline-file>: дельты «сейчас − apply» и подсказки по пределам
+    local base="$1" cur
+    [ -f "$base" ] || { echo "perf: baseline нет (появится после следующего apply)"; return 0; }
+    cur="$(mktemp)"; node_perf_snapshot > "$cur"
+    awk -F= 'NR == FNR { b[$1] = $2; next } { c[$1] = $2 }
+        function d(k) { return c[k] - b[k] }
+        END {
+            dt = d("ts"); if (dt <= 0) dt = 1
+            if (d("softnet_processed") < 0 || d("cpu_total") < 0) { print "perf: счётчики меньше baseline — был reboot; повтори apply для нового baseline"; exit }
+            ret = (d("TcpOutSegs") > 0) ? 100 * d("TcpRetransSegs") / d("TcpOutSegs") : 0
+            sq  = (d("softnet_processed") > 0) ? 100 * d("softnet_squeeze") / d("softnet_processed") : 0
+            st  = (d("cpu_total") > 0) ? 100 * d("cpu_steal") / d("cpu_total") : 0
+            si  = (d("cpu_total") > 0) ? 100 * d("cpu_softirq") / d("cpu_total") : 0
+            printf "perf since apply (%ds): pps_in=%d/s softnet drop=+%d squeeze=%.3f%% | listen_ovf=+%d | tcp_retrans=%.2f%% | udp_rcvbuf_err=+%d | cpu steal=%.1f%% softirq=%.1f%% | nic rx_drop=+%d missed=+%d\n", \
+                dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, d("UdpRcvbufErrors"), st, si, d("nic_rx_dropped"), d("nic_rx_missed_errors")
+            n = 0
+            if (d("softnet_dropped") > 0)        { n++; print "  LIMIT: softnet backlog overflow — netdev_max_backlog (AUTO_SOFTNET_TUNE при следующем apply) / ENABLE_RPS" }
+            if (sq > 0.1)                        { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
+            if (d("TcpExtListenOverflows") > 0 || d("TcpExtListenDrops") > 0) { n++; print "  LIMIT: accept-очередь переполняется — somaxconn/tcp_max_syn_backlog или backlog inbound xray" }
+            if (d("UdpRcvbufErrors") > 0)        { n++; print "  LIMIT: UDP receive buffer — rmem_default/udp_mem (QUIC/Hysteria2)" }
+            if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
+            if (st > 5)                          { n++; printf "  NOTE: CPU steal %.1f%% — конкуренция на гипервизоре; тюнинг хоста не поможет\n", st }
+            if (d("nic_rx_missed_errors") > 0 || d("nic_rx_dropped") > 0) { n++; print "  LIMIT: NIC дропает на приёме — NIC_RING_RX / ENABLE_NIC_OFFLOAD_OPT (кольца до max)" }
+            if (n == 0) print "  нет сигналов узкого места на стороне хоста с момента apply"
+        }' "$base" "$cur"
+    rm -f "$cur"
+}
+
 node_datapath_plan() {
     [ "$(node_conf_get ENABLE_DATAPATH 1)" = "1" ] || { log info "datapath" "ENABLE_DATAPATH=0 — пропуск"; return 0; }
     local f="$NODE_SYSCTL_DATAPATH"
 
-    node_sysctl_add "$f" net.core.netdev_budget "$(node_conf_get NETDEV_BUDGET 600)"
+    node_softnet_read
+    local nb; nb="$(node_softnet_value NETDEV_BUDGET "$(node_conf_get NETDEV_BUDGET 600)" squeeze)"
+    [ "$nb" != "$(node_conf_get NETDEV_BUDGET 600)" ] && log info "datapath" "softnet: time_squeeze=${_NODE_SN_SQZ}/${_NODE_SN_PROC} (>0.1%) — netdev_budget -> $nb (AUTO_SOFTNET_TUNE)"
+    node_sysctl_add "$f" net.core.netdev_budget "$nb"
     node_sysctl_add "$f" net.core.netdev_budget_usecs "$(node_conf_get NETDEV_BUDGET_USECS 8000)"
     node_sysctl_add "$f" net.ipv4.tcp_max_tw_buckets "$(node_conf_get TCP_MAX_TW_BUCKETS 524288)"
 
@@ -131,6 +224,11 @@ node_fq_tune_apply() {
     limit="$(node_conf_get FQ_LIMIT 100000)"
     fl="$(node_conf_get FQ_FLOW_LIMIT 1000)"
     buckets="$(node_conf_get FQ_BUCKETS 32768)"
+    # 2026-09-23: значения попадают в генерируемый root-скрипт (LIM=...) —
+    # только числа, иначе дефолт (мусор/инъекция из конфига не исполняется)
+    [[ "$limit" =~ ^[0-9]+$ ]]   || { warn "datapath" "FQ_LIMIT='$limit' не число — 100000"; limit=100000; }
+    [[ "$fl" =~ ^[0-9]+$ ]]      || { warn "datapath" "FQ_FLOW_LIMIT='$fl' не число — 1000"; fl=1000; }
+    [[ "$buckets" =~ ^[0-9]+$ ]] || { warn "datapath" "FQ_BUCKETS='$buckets' не число — 32768"; buckets=32768; }
 
     # скрипт применения: live сейчас + юнитом при boot (network-pre)
     local script=/usr/local/sbin/node-fq-tune.sh

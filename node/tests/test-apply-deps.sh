@@ -28,7 +28,7 @@ is_defined() { # $1=fn — определена ли в доступных фа�
     for f in "${dep_files[@]}"; do
         [ -f "$f" ] || continue
         # определение может быть с отступом (fn, объявленная внутри другой fn,
-        # напр. node_run_step внутри node_apply)
+        # напр. функция, объявленная внутри другой fn)
         grep -qE "^[[:space:]]*${fn}\(\)|^[[:space:]]*function ${fn}\b" "$f" && return 0
     done
     return 1

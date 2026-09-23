@@ -25,11 +25,17 @@
 #   VPN_STACK_TARBALL_URL=https://mirror.example.com/repo.tar.gz bash <(curl -sL ...)
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.2"
 REPO="${VPN_STACK_REPO:-SpofyJet/vpn-node-stack}"
 RAW_BASE="${VPN_STACK_RAW_BASE:-https://raw.githubusercontent.com/$REPO/main}"
 TARBALL_URL="${VPN_STACK_TARBALL_URL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/main}"
 WORK_DIR="${VPN_STACK_WORK_DIR:-/opt/vpn-node-stack}"
+# 2026-09-23: read-only команды без root (status/detect/guard — «root не нужен»)
+# падали на mkdir /opt/vpn-node-stack. Не-root без явного VPN_STACK_WORK_DIR —
+# личный временный каталог (установленную копию в /opt не трогаем).
+if [ "$(id -u)" -ne 0 ] && [ -z "${VPN_STACK_WORK_DIR:-}" ]; then
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vpn-node-stack.XXXXXX")"
+fi
 NODE_DIR="$WORK_DIR/node"
 SHIELD_DIR="$WORK_DIR/shieldnode"
 
@@ -50,19 +56,28 @@ command -v curl >/dev/null 2>&1 || die "нужен curl: apt-get install -y curl
 command -v tar  >/dev/null 2>&1 || die "нужен tar"
 
 # ---------- команда (первый не-флаг аргумент) + флаг --dry-run ----------
+# 2026-09-23: --dry-run ищем во ВСЕХ аргументах (раньше break на команде: для
+# `apply --dry-run` dry=0 -> пост-проверка nft давала ложную «ФАЕРВОЛ НЕ АКТИВЕН»)
 CMD="apply"
-dry=0
+dry=0; cmd_seen=0
 for a in "$@"; do
-    [ "$a" = "--dry-run" ] && dry=1
     case "$a" in
-        -*) continue ;;
-        *)  CMD="$a"; break ;;
+        --dry-run) dry=1 ;;
+        -*) : ;;
+        *)  [ "$cmd_seen" = 1 ] || { CMD="$a"; cmd_seen=1; } ;;
     esac
 done
 case "$CMD" in
     apply|status|detect|rollback|uninstall|install|emergency|guard) : ;;
     *) die "неизвестная команда '$CMD' (ожидалось: apply|status|detect|rollback|...)" ;;
 esac
+# 2026-09-23: `install` не знает ни один из стеков — shieldnode падал, авто-откат
+# снимал рабочий фаервол. Это алиас apply: подменяем слово в пробрасываемых аргументах.
+if [ "$CMD" = "install" ]; then
+    CMD="apply"; _args=()
+    for a in "$@"; do if [ "$a" = "install" ]; then _args+=("apply"); else _args+=("$a"); fi; done
+    set -- "${_args[@]}"
+fi
 
 # ---------- root ----------
 if [ "$(id -u)" -ne 0 ]; then
@@ -111,17 +126,28 @@ tar -xzf "$DL/repo.tar.gz" --strip-components=1 -C "$DL/extract" \
     || die "распаковка снапшота не удалась — старые $NODE_DIR и $SHIELD_DIR на месте"
 [ -f "$DL/extract/node/install.sh" ]       || die "в снапшоте нет node/install.sh — репозиторий не тот?"
 [ -f "$DL/extract/shieldnode/install.sh" ] || die "в снапшоте нет shieldnode/install.sh — репозиторий не тот?"
+# git-архивы не хранят exec-биты: без этого симлинк guard → main.sh даст
+# "Permission denied" на ноде (инцидент 2026-09-22). Восстанавливаем явно.
+chmod +x "$DL/extract/node/install.sh"       "$DL/extract/node/main.sh"
+chmod +x "$DL/extract/shieldnode/install.sh" "$DL/extract/shieldnode/main.sh"
 rm -rf "$NODE_DIR" "$SHIELD_DIR"
 mv "$DL/extract/node"       "$NODE_DIR"
 mv "$DL/extract/shieldnode" "$SHIELD_DIR"
 rm -rf "$DL"; trap - EXIT
-say "==> распаковано в $WORK_DIR"
+say "==> распаковано в $WORK_DIR (exec-биты восстановлены)"
 
 # ---------- запуск ----------
 # apply:  фаервол ПЕРВЫМ. Принцип «нет фаервола — вообще не начинаем»:
 #         если shieldnode не поднялся — откатываем его и НЕ трогаем node
 #         (система остаётся в исходном состоянии). Откат — в обратном порядке.
 rc_node=0; rc_shield=0
+# 2026-09-23: был ли фаервол ДО этого запуска. shieldnode при сбое apply сам
+# оставляет/восстанавливает прежний ruleset (nft -c до изменений, restore из
+# backup при nft -f/self-test fail) — внешний rollback на такой ноде СНИМАЛ
+# рабочий фаервол (fail-open) и стирал config.conf. Авто-откат — только когда
+# фаервола до нас не было (чистая установка, частичное состояние убираем).
+had_fw=0
+command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1 && had_fw=1
 case "$CMD" in
     rollback)
         say "==> [1/2] node: откат оптимизаций"
@@ -129,12 +155,22 @@ case "$CMD" in
         say "==> [2/2] shieldnode: откат фаервола"
         bash "$SHIELD_DIR/install.sh" "$@" || rc_shield=$?
         ;;
-    apply|install|emergency)
+    emergency|guard)
+        # 2026-09-23: команды ТОЛЬКО shieldnode — node их не знает (exit 64 ->
+        # ложное «node завершился с ошибкой» после успешного emergency on)
+        say "==> shieldnode $CMD"
+        bash "$SHIELD_DIR/install.sh" "$@" || rc_shield=$?
+        ;;
+    apply)
         say "==> [1/2] shieldnode (nftables-фаервол)"
         if bash "$SHIELD_DIR/install.sh" "$@"; then
             :
         else
             rc_shield=$?   # код берём в else: в then-ветке $? был бы 0
+            if [ "$had_fw" = 1 ]; then
+                warn "shieldnode завершился с ошибкой $rc_shield — прежний фаервол сохранён (shieldnode откатывает свой ruleset сам); авто-rollback НЕ выполняется"
+                die "обновление ОТМЕНЕНО: фаервол прежней версии активен — node (оптимизация) намеренно не запускался"
+            fi
             warn "shieldnode завершился с ошибкой $rc_shield — откатываем его правки"
             bash "$SHIELD_DIR/install.sh" rollback || warn "авто-откат shieldnode не полностью (см. /var/log/shieldnode.log)"
             die "установка ОТМЕНЕНА: фаервол не поднят — node (оптимизация) намеренно не запускался"
@@ -152,8 +188,10 @@ esac
 
 # ---------- пост-проверка: фаервол реально включён ----------
 # «Применили, а таблицы нет» — самый неприятный сценарий, ловим жёстко.
-case "$CMD" in
-    apply|install|emergency)
+_post=0
+case "$CMD" in apply) _post=1 ;; emergency) case " $* " in *" status "*) : ;; *) _post=1 ;; esac ;; esac
+case "$_post" in
+    1)
         if [ "$dry" -eq 1 ]; then
             say "==> dry-run: пост-проверка nft пропущена (фаервол намеренно не применялся)"
         elif command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1; then

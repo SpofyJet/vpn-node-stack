@@ -14,6 +14,28 @@ shield_manifest_record() {
     grep -qxF -- "$dst" "$SHIELD_MANIFEST" || echo "$dst" >> "$SHIELD_MANIFEST"
 }
 
+# shield_origin_record <dst> — состояние файла ДО первой записи shieldnode.
+# Баг 2026-09-23 (подтверждён: apply x2 -> rollback): при повторном apply
+# backup() сохраняет СОБСТВЕННУЮ прошлую версию, и rollback «восстанавливал»
+# её (nft-persist, 99-z5 security sysctl, юниты переживали откат/ребут).
+# Реестр: <path>\tcreated | <path>\t<копия>; путь в манифесте без записи =
+# установка до v1.1.1 (legacy-логика rollback).
+shield_origin_record() {
+    local dst="$1" reg="$SHIELD_STATE_DIR/file-origins.tsv" copy
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    mkdir -p "$SHIELD_STATE_DIR"
+    if [ -f "$reg" ] && awk -F'\t' -v p="$dst" '$1==p{f=1} END{exit !f}' "$reg"; then return 0; fi
+    if [ -f "$SHIELD_MANIFEST" ] && grep -qxF -- "$dst" "$SHIELD_MANIFEST"; then return 0; fi
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+        mkdir -p "$SHIELD_STATE_DIR/origins"; chmod 0700 "$SHIELD_STATE_DIR/origins"
+        copy="$SHIELD_STATE_DIR/origins/$(printf '%s' "$dst" | sha256sum | cut -c1-16)"
+        cp -a -- "$dst" "$copy" || die "origin copy failed: $dst"
+        printf '%s\t%s\n' "$dst" "$copy" >> "$reg"
+    else
+        printf '%s\tcreated\n' "$dst" >> "$reg"
+    fi
+}
+
 # shield_persist_stream <dst> [mode] — stdin → backup → atomic write → manifest
 shield_persist_stream() {
     local dst="$1" mode="${2:-0644}"
@@ -22,6 +44,7 @@ shield_persist_stream() {
         cat > /dev/null
         return 0
     fi
+    shield_origin_record "$dst"
     backup "$dst"
     atomic_write "$dst" "$mode"
     shield_manifest_record "$dst"
@@ -58,7 +81,13 @@ WantedBy=multi-user.target
 EOF
     if [ "${DRY_RUN:-0}" != "1" ]; then
         systemctl daemon-reload
-        systemctl enable shieldnode.service >/dev/null 2>&1 || log warn "persist" "systemctl enable shieldnode.service не удался"
+        # enable --now (а не только enable): иначе после install служба НЕ
+        # стартует и применённые правила переживут только до ребута — до
+        # вмешательства оператора firewall держался бы только в runtime.
+        # start безопасен: правила уже применены (idempotent-triple в nft.sh
+        # делает повторный apply атомарной заменой, не перерывом трафика).
+        systemctl enable --now shieldnode.service >/dev/null 2>&1 \
+            || log warn "persist" "systemctl enable --now shieldnode.service не удался"
     fi
 }
 
@@ -74,9 +103,13 @@ shield_guard_link() {
         return 0
     fi
     mkdir -p "$(dirname "$link")" 2>/dev/null || true
+    # 2026-09-23: symlink ведёт на main.sh — без exec-бита `guard` = Permission
+    # denied (инцидент 2026-09-22 при доставке мимо vpn-node-setup: tar/git без +x)
+    chmod +x "$target" 2>/dev/null || true
     if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
         return 0
     fi
+    shield_origin_record "$link"
     ln -sfn "$target" "$link" 2>/dev/null \
         && { shield_manifest_record "$link"; ok "persist" "$link -> main.sh (команда: guard)"; } \
         || log warn "persist" "symlink $link не создан"
@@ -135,6 +168,15 @@ shield_persist_security_sysctl() {
             accepted+=("$entry")
             continue
         fi
+        # 2026-09-23: исходное значение — в реестр ДО изменения (один раз на ключ;
+        # ключ уже под shieldnode до v1.1.1 — не исходный, legacy-снапшот)
+        local sreg="$SHIELD_STATE_DIR/sysctl-orig.tsv" cur
+        mkdir -p "$SHIELD_STATE_DIR"; touch "$sreg"
+        if ! awk -F'\t' -v k="$key" '$1==k{f=1} END{exit !f}' "$sreg" \
+            && ! { [ -f "$SHIELD_STATE_DIR/owner-keys.txt" ] && grep -qxF -- "$key" "$SHIELD_STATE_DIR/owner-keys.txt"; } \
+            && cur="$(sysctl -n "$key" 2>/dev/null)"; then
+            printf '%s\t%s\n' "$key" "$cur" >> "$sreg"
+        fi
         if sysctl -w "$key=$val" >/dev/null 2>&1; then
             accepted+=("$entry")
             log debug "sysctl" "runtime ok: $key=$val"
@@ -173,7 +215,10 @@ shield_config_ensure() {
 # TCP_NEW_RATE=300       # новых коннектов/мин с одного IP на защищённые TCP-порты
 # TCP_SYN_RATE=50        # SYN/с с одного IP
 # TCP_CONN_MAX=15000     # conntrack-лимит с одного IP (CGNAT-лояльно)
-# UDP_RATE=500           # UDP-пакетов/с с одного IP
+# UDP_RATE=20000         # UDP-пакетов/с с одного IP (Hysteria2: ~9.3k pps на
+# UDP_BURST=40000        #   100 Мбит/с; безопасный минимум после GRO-анализа —
+#                        #   легитимный QUIC коалесцируется и считается заниженно,
+#                        #   флуд с рандомных портов — по полному wire-pps)
 # PROTECTED_TCP_EXTRA=   # доп. порты к авто-детекту
 # PROTECTED_UDP_EXTRA=
 # TRUSTED_IPS=           # доп. whitelist: "IP панели Remnawave, мониторинг" — через пробел

@@ -2,7 +2,7 @@
 # shieldnode — main.sh: точка входа, режимы, lock, диспетчеризация (TZ §4, §28).
 set -euo pipefail
 
-SHIELD_VERSION="1.1.0"
+SHIELD_VERSION="1.1.2"
 # readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
 SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
@@ -14,7 +14,7 @@ export LOG_LEVEL=info
 
 usage() {
     cat <<'EOF'
-shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.0
+shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.2
 
 Использование: shieldnode [опции] <команда> [аргумент]
 
@@ -66,6 +66,9 @@ case "$cmd" in
 esac
 
 mkdir -p "$SHIELD_STATE_DIR" "$(dirname "$SHIELD_LOCK")" 2>/dev/null || true
+# 2026-09-23: log() пишет только в УЖЕ существующий writable файл, создавать его
+# было некому — /var/log/shieldnode.log на свежей ноде не появлялся никогда.
+if [ "$(id -u)" -eq 0 ] && [ ! -e "$SHIELD_LOG" ]; then install -m 0640 /dev/null "$SHIELD_LOG" 2>/dev/null || true; fi
 
 # shellcheck source=config.sh
 source "$SHIELD_DIR/config.sh"

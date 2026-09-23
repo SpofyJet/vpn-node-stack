@@ -3,9 +3,20 @@
 # Без произвольного пиннинга. RFS не реализуется. irqbalance не трогаем.
 set -euo pipefail
 
+# node_cpumask_hex <mask> — cpumask для rps_cpus/xps_cpus в формате ядра.
+# 2026-09-23: bitmap_parse принимает группы ПО 8 hex-цифр через запятую; группа
+# длиннее 32 бит = EOVERFLOW (проверено на ядре: '000000001' отвергнут). Маска
+# одним словом на нодах >32 CPU молча не записывалась, а лог писал «applied».
+# До 32 CPU вывод побайтно прежний.
+node_cpumask_hex() {
+    local m="$1" hi lo
+    hi=$(( (m >> 32) & 0xffffffff )); lo=$(( m & 0xffffffff ))
+    if [ "$hi" -eq 0 ]; then printf '%x' "$lo"; else printf '%x,%08x' "$hi" "$lo"; fi
+}
+
 node_irq_diag() {
     local ifname queues cpus
-    ifname="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+    ifname="$(node_default_iface)"
     [ -z "$ifname" ] && return 0
     queues="$(ls -d "/sys/class/net/$ifname/queues/rx-"* 2>/dev/null | wc -l)"
     cpus="$(node_cpu_count)"
@@ -18,16 +29,22 @@ node_irq_diag() {
 node_irq_apply() {
     [ "${DRY_RUN:-0}" = "1" ] && return 0
     local ifname queues cpus
-    ifname="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+    ifname="$(node_default_iface)"
     [ -z "$ifname" ] && return 0
-    queues="$(ls -d "/sys/class/net/$ifname/queues/rx-"* 2>/dev/null | wc -l)"
+    # 2026-09-23 (v1.1.3): без rx-* каталогов ls -> rc 2, под pipefail присваивание
+    # падало и set -e обрывал ВЕСЬ irq_apply (RSS/RPS/XPS) — считаем 0 очередей
+    queues="$( { ls -d "/sys/class/net/$ifname/queues/rx-"* 2>/dev/null || true; } | wc -l)"
     cpus="$(node_cpu_count)"
 
     if [ "$(node_conf_get ENABLE_RSS_BALANCE 0)" = "1" ]; then
         if [ "$queues" -gt 1 ] && command -v ethtool >/dev/null 2>&1; then
             local q wt=() i
-            for ((i=0; i<queues; i++)); do wt+=("$((cpus / queues))"); done
+            # 2026-09-23 (v1.1.2): при queues > cpus cpus/queues = 0 -> все веса 0, ethtool
+            # отвергал таблицу. Равные веса = равномерно при любом w>0 -> минимум 1.
+            local w=$((cpus / queues)); [ "$w" -ge 1 ] || w=1
+            for ((i=0; i<queues; i++)); do wt+=("$w"); done
             if ethtool -X "$ifname" weight "${wt[@]}" >/dev/null 2>&1; then
+                node_rt_record "$ifname" rss "indir" "default"   # 2026-09-23: rollback -> ethtool -X default
                 ok "irq" "RSS indirection равномерно: ${wt[*]}"
             else
                 warn "irq" "ethtool -X не поддерживается драйвером $ifname"
@@ -50,28 +67,44 @@ node_irq_apply() {
             for q in /sys/class/net/"$ifname"/queues/rx-*; do
                 qn="$(basename "$q")"
                 orig="$(cat "$q/rps_cpus" 2>/dev/null || echo 0)"
-                if printf '%x' "$mask" > "$q/rps_cpus" 2>/dev/null; then
+                if node_cpumask_hex "$mask" > "$q/rps_cpus" 2>/dev/null; then
                     node_rt_record "$ifname" rps "$qn" "$orig"
                 fi
             done
-            ok "irq" "RPS applied mask=$(printf '%x' "$mask") (persist после reboot не делаем; rollback — из реестра)"
+            ok "irq" "RPS applied mask=$(node_cpumask_hex "$mask") (persist после reboot не делаем; rollback — из реестра)"
         else
             warn "irq" "RPS: queues($queues) >= cpus($cpus) — по правилам §13 RPS не применяется"
         fi
     fi
 
     if [ "$(node_conf_get ENABLE_XPS 0)" = "1" ]; then
-        local q mask=0 i qn orig eff
+        # 2026-09-23 (v1.1.3): раньше КАЖДОЙ tx-очереди писалась одна и та же маска
+        # CPU 0..rxq-1: по Documentation/networking/scaling.rst xps_cpus очереди — это
+        # CPU, которым разрешено слать в неё; при одинаковых масках каждый CPU
+        # отображён на ВСЕ очереди (локальности нет), а CPU вне маски — ни на одну
+        # (fallback на хеш). Теперь как рекомендует scaling.rst: каждый CPU — ровно
+        # в одну очередь: tx-i <- {CPU c : c mod txq == i}; при txq > cpus — tx-i <- CPU
+        # (i mod cpus). Размер — по числу TX-очередей (было: по RX).
+        local q i qn orig eff txq c mask
         eff=$cpus; [ "$eff" -gt 64 ] && eff=64
-        for ((i=0; i<queues && i<eff; i++)); do mask=$((mask | 1 << i)); done
+        txq="$( { ls -d "/sys/class/net/$ifname/queues/tx-"* 2>/dev/null || true; } | wc -l)"
+        [ "$txq" -ge 1 ] || txq=1
         for q in /sys/class/net/"$ifname"/queues/tx-*; do
-            qn="$(basename "$q")"
+            [ -e "$q" ] || continue
+            qn="$(basename "$q")"; i="${qn#tx-}"
+            [[ "$i" =~ ^[0-9]+$ ]] || continue
+            mask=0
+            if [ "$eff" -ge "$txq" ]; then
+                for ((c=i; c<eff; c+=txq)); do mask=$((mask | 1 << c)); done
+            else
+                mask=$((1 << (i % eff)))
+            fi
             orig="$(cat "$q/xps_cpus" 2>/dev/null || echo 0)"
-            if printf '%x' "$mask" > "$q/xps_cpus" 2>/dev/null; then
+            if node_cpumask_hex "$mask" > "$q/xps_cpus" 2>/dev/null; then
                 node_rt_record "$ifname" xps "$qn" "$orig"
             fi
         done
-        ok "irq" "XPS applied mask=$(printf '%x' "$mask") (rollback — из реестра)"
+        ok "irq" "XPS: tx-i <- CPU {c : c mod $txq == i} (txq=$txq cpus=$eff; rollback — из реестра)"
     fi
 }
 
@@ -115,7 +148,7 @@ node_irq_affinity_apply() {
     [ "$(node_conf_get ENABLE_IRQ_AFFINITY 0)" = "1" ] || return 0
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "irq: NIC IRQ spread round-robin по CPU"; return 0; }
     local ifname cpus
-    ifname="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+    ifname="$(node_default_iface)"
     [ -z "$ifname" ] && return 0
     cpus="$(node_cpu_count)"
     if systemctl is-active --quiet irqbalance 2>/dev/null; then

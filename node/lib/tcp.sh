@@ -26,6 +26,26 @@ node_tcp_plan() {
     node_sysctl_add "$NODE_SYSCTL_BASE" net.core.rmem_max "$rmem"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.core.wmem_max "$wmem"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.ip_local_port_range "$port_range"
+    node_tcp_buf_plan "$rmem" "$wmem"
+}
+
+# node_tcp_buf_plan <rmem_max> <wmem_max> — opt-in (ENABLE_TCP_BUF_TUNE=1, v1.1.1).
+# net.core.{r,w}mem_max ограничивают только явный SO_RCVBUF/SO_SNDBUF; окно
+# АВТОТЮНИНГА TCP (Xray его не трогает) ограничено tcp_rmem[2]/tcp_wmem[2]
+# (дефолт ядра 6MiB/4MiB) — tier-значения выше до TCP-сокетов не доходили.
+# Потолок одного потока ≈ окно/RTT: wmem 4MiB @150мс ≈ 224 Мбит/с. Только
+# ПОВЫШАЕМ (tier ниже текущего — ключ не трогаем); суммарная память ограничена
+# tcp_mem (datapath). Откат — реестр sysctl-orig.tsv + удаление файла.
+node_tcp_buf_plan() {
+    [ "$(node_conf_get ENABLE_TCP_BUF_TUNE 0)" = "1" ] || return 0
+    local rmax="$1" wmax="$2" cur_r cur_w
+    [[ "$rmax" =~ ^[0-9]+$ && "$wmax" =~ ^[0-9]+$ ]] || { warn "tcp" "tcp_rmem/wmem: rmem/wmem_max не числа — пропуск"; return 0; }
+    cur_r="$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')"; cur_r="${cur_r:-6291456}"
+    cur_w="$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $3}')"; cur_w="${cur_w:-4194304}"
+    [ "$rmax" -gt "$cur_r" ] && node_sysctl_add_writable "$NODE_SYSCTL_DATAPATH" net.ipv4.tcp_rmem "4096 131072 $rmax"
+    [ "$wmax" -gt "$cur_w" ] && node_sysctl_add_writable "$NODE_SYSCTL_DATAPATH" net.ipv4.tcp_wmem "4096 16384 $wmax"
+    log info "tcp" "tcp_rmem/wmem tune (ENABLE_TCP_BUF_TUNE=1): max r=$rmax w=$wmax (было $cur_r/$cur_w)"
+    return 0
 }
 
 # node_tcp_perf_plan — «сильный» TCP-стек (opt-in, ENABLE_PERFORMANCE_SYSCTL=1).

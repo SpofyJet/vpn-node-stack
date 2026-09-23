@@ -7,10 +7,10 @@ set -euo pipefail
 node_network_mtu_diag() {
     [ "$(node_conf_get ENABLE_MTU_CHECK 1)" = "1" ] || return 0
     local ifname mtu gw
-    ifname="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+    ifname="$(node_default_iface)"
     [ -z "$ifname" ] && return 0
     mtu="$(cat "/sys/class/net/$ifname/mtu" 2>/dev/null || echo '?')"
-    gw="$(ip -o -4 route show to default | awk '{print $3; exit}')"
+    gw="$(node_default_gw)"
     log info "network" "iface=$ifname mtu=$mtu gw=${gw:-none}"
     if [[ "$mtu" =~ ^[0-9]+$ ]] && [ -n "$gw" ] && command -v ping >/dev/null 2>&1; then
         if ping -M do -s $((mtu - 28)) -c 1 -W 2 "$gw" >/dev/null 2>&1; then
@@ -29,13 +29,18 @@ node_network_plan() {
         if ip -o link show type tun 2>/dev/null | grep -q .; then ipfwd=1; else ipfwd=0; fi
     fi
     [ "$ipfwd" = "1" ] && node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.ip_forward 1
-    node_sysctl_add "$NODE_SYSCTL_DATAPATH" net.core.netdev_max_backlog 8192
+    # 2026-09-23 (v1.1.3): x2 только если softnet_stat показывает дропы backlog
+    declare -F node_softnet_read >/dev/null 2>&1 && node_softnet_read
+    local nmb=8192
+    declare -F node_softnet_value >/dev/null 2>&1 && nmb="$(node_softnet_value NETDEV_MAX_BACKLOG 8192 drop)"
+    [ "$nmb" != 8192 ] && log info "network" "softnet: dropped=${_NODE_SN_DROP} — netdev_max_backlog -> $nmb (AUTO_SOFTNET_TUNE)"
+    node_sysctl_add "$NODE_SYSCTL_DATAPATH" net.core.netdev_max_backlog "$nmb"
 }
 
 node_network_mss_clamp() {
     [ "$(node_conf_get ENABLE_MSS_CLAMP 0)" = "1" ] || return 0
     local ifname mtu mss unit conf
-    ifname="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+    ifname="$(node_default_iface)"
     [ -z "$ifname" ] && { warn "network" "MSS clamp: нет default iface"; return 0; }
     mtu="$(cat "/sys/class/net/$ifname/mtu" 2>/dev/null || echo 1500)"
     mss="$(node_conf_get MSS_CLAMP_MTU $((mtu - 40)))"

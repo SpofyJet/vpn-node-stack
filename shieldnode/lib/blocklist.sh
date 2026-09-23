@@ -304,14 +304,29 @@ update_list() { # update_list <name>
     #    Bogon-фильтр (RFC1918/CGNAT/loopback/multicast/reserved/test) — в листы
     #    такое не должно попадать, а если попало (compromised feed) — отсекаем.
     #    Нормализация spamhaus: "S24-1.2.3.0/24 ; Spamhaus DROP" -> "1.2.3.0/24".
-    sed -E 's/^S[0-9]+-([0-9])/\1/' "$tmp/all.raw" 2>/dev/null | \
-        grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' | \
-        awk '{ sub(/^[[:space:]]+/, ""); print }' | \
-        awk -F'[./]' -v minprefix="$minp4" '
+    #    2026-09-23 (v1.1.2): ОДИН проход awk вместо sed|grep|awk|awk (5 процессов
+    #    -> 1), правила те же: снятие «S24-», IPv4[/p] в начале строки жадно по <=3
+    #    цифры на октет (как grep -oE), bogon/диапазон префикса. Отличие: октет-
+    #    «хвост» (1.2.3.1234) раньше УСЕКАЛСЯ до 1.2.3.123 и блокировал чужой адрес —
+    #    теперь строка отбрасывается. Без {m,n} и без цепочек «[0-9]?»: mawk 1.3.4
+    #    (дефолт Debian/Ubuntu) в match() для них НЕ leftmost-longest (из
+    #    «1.0.108.130» берёт «1.0.108.13») — берём самый длинный прогон [0-9./]
+    #    (простой класс+ mawk матчит верно) и проверяем октеты через split().
+    awk -v minprefix="$minp4" '
         {
-            prefix = (NF >= 5) ? $5 : 32
+            if ($0 ~ /^S[0-9]+-[0-9]/) sub(/^S[0-9]+-/, "")
+            if (!match($0, /^[[:space:]]*[0-9.\/]+/)) next
+            t = substr($0, 1, RLENGTH); sub(/^[[:space:]]+/, "", t)
+            sl = index(t, "/"); ip = sl ? substr(t, 1, sl - 1) : t; rest = sl ? substr(t, sl + 1) : ""
+            n = split(ip, f, ".")
+            if (n < 4) next
+            bad = 0; for (i = 1; i <= 4; i++) if (f[i] == "" || length(f[i]) > 3) bad = 1
+            if (bad) next
+            s = f[1] "." f[2] "." f[3] "." f[4]; prefix = 32
+            # префикс — только сразу после 4-го октета (как «(/[0-9]+)?» у grep); +0 — число, не строка
+            if (n == 4 && match(rest, /^[0-9]+/)) { p = substr(rest, 1, RLENGTH); s = s "/" p; prefix = p + 0 }
             if (prefix < minprefix || prefix > 32) next
-            o1 = $1 + 0; o2 = $2 + 0; o3 = $3 + 0; o4 = $4 + 0
+            o1 = f[1] + 0; o2 = f[2] + 0; o3 = f[3] + 0; o4 = f[4] + 0
             if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) next
             if (o1 == 0)   next
             if (o1 == 10)  next
@@ -326,8 +341,8 @@ update_list() { # update_list <name>
             if (o1 == 198 && (o2 == 18 || o2 == 19)) next
             if (o1 == 198 && o2 == 51 && o3 == 100) next
             if (o1 == 203 && o2 == 0 && o3 == 113) next
-            print $0
-        }' | sort -u > "$tmp/parsed.list"
+            print s
+        }' "$tmp/all.raw" 2>/dev/null | sort -u > "$tmp/parsed.list"
     local v4_count
     v4_count=$(wc -l < "$tmp/parsed.list"); v4_count="${v4_count:-0}"
 
@@ -508,21 +523,65 @@ update_list() { # update_list <name>
 
 collapse_cidrs() { # collapse_cidrs <in> <out>
     python3 - "$1" "$2" <<'COLLAPSE_EOF'
+# 2026-09-23 (v1.1.2): IPv4 — слияние целочисленных интервалов + минимальное
+# CIDR-разложение (тот же единственный результат, что ipaddress.collapse_addresses,
+# в разы быстрее на 200k). Строки, которые быстрый разбор не узнаёт, решает
+# ipaddress (набор принимаемых строк прежний); есть IPv6 — прежний путь целиком.
 import sys, ipaddress
-nets = []
+def fast_v4(s):
+    ip, sl, p = s.partition('/')
+    o = ip.split('.')
+    if len(o) != 4: return None
+    v = 0
+    for x in o:
+        if not (x.isascii() and x.isdigit()) or len(x) > 3 or (len(x) > 1 and x[0] == '0'): return None
+        x = int(x)
+        if x > 255: return None
+        v = (v << 8) | x
+    if sl:
+        if not (p.isascii() and p.isdigit()) or len(p) > 2 or (len(p) > 1 and p[0] == '0'): return None
+        p = int(p)
+        if p > 32: return None
+    else:
+        p = 32
+    size = 1 << (32 - p)
+    v &= ~(size - 1) & 0xFFFFFFFF
+    return (v, v + size - 1)
+def legacy(lines, out):
+    nets = []
+    for line in lines:
+        try: nets.append(ipaddress.ip_network(line, strict=False))
+        except ValueError: pass
+    for n in ipaddress.collapse_addresses(nets): out.write(str(n) + '\n')
 try:
     with open(sys.argv[1]) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                nets.append(ipaddress.ip_network(line, strict=False))
-            except ValueError:
-                pass
+        lines = [l.strip() for l in fh if l.strip()]
+    iv, v6 = [], False
+    for line in lines:
+        r = fast_v4(line)
+        if r is None:
+            try: n = ipaddress.ip_network(line, strict=False)
+            except ValueError: continue
+            if n.version == 6: v6 = True; break
+            r = (int(n.network_address), int(n.broadcast_address))
+        iv.append(r)
     with open(sys.argv[2], 'w') as out:
-        for n in ipaddress.collapse_addresses(nets):
-            out.write(str(n) + '\n')
+        if v6:
+            legacy(lines, out)
+        else:
+            iv.sort(); merged = []
+            for s, e in iv:
+                if merged and s <= merged[-1][1] + 1:
+                    if e > merged[-1][1]: merged[-1][1] = e
+                else:
+                    merged.append([s, e])
+            w = out.write
+            for s, e in merged:
+                while s <= e:
+                    size = (s & -s) if s else (1 << 32)
+                    while size > e - s + 1: size >>= 1
+                    w('%d.%d.%d.%d/%d\n' % (s >> 24, (s >> 16) & 255, (s >> 8) & 255, s & 255, 33 - size.bit_length()))
+                    s += size
 except Exception:
     sys.exit(1)
 COLLAPSE_EOF
@@ -562,8 +621,12 @@ BODY_EOF
     #     updater читает его source'ом при каждом тике. Создаём/обновляем
     #     ТОЛЬКО если crowdsec включён и креды заданы (agent-режиму не нужны).
     if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 0)" = "1" ] && [ -n "$cs_user" ] && [ -n "$cs_pass" ]; then
-        { printf 'CROWDSEC_USER="%s"\n' "$cs_user"
-          printf 'CROWDSEC_PASSWORD="%s"\n' "$cs_pass"
+        # 2026-09-23: файл source'ится root'ом на каждом тике — пароль с $ ` " \
+        # раньше ломал auth или исполнялся как код. Безопасные символы — прежний
+        # формат "..." (существующие установки байт-в-байт те же), иначе %q.
+        _csq() { if [[ "$1" =~ ^[A-Za-z0-9._@%+=:,/-]*$ ]]; then printf '"%s"' "$1"; else printf '%q' "$1"; fi; }
+        { printf 'CROWDSEC_USER=%s\n' "$(_csq "$cs_user")"
+          printf 'CROWDSEC_PASSWORD=%s\n' "$(_csq "$cs_pass")"
         } | shield_persist_stream /etc/shieldnode/crowdsec.creds 0600
     fi
 
@@ -586,7 +649,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=$SHIELD_BLOCKLIST_STATE /run/shieldnode /var/log/shieldnode.log
+# 2026-09-23: '-' — несуществующий путь без префикса = 226/NAMESPACE (юнит не
+# стартовал: blocklists/ и лог не создавал никто, /run/shieldnode пуст после boot)
+ReadWritePaths=-$SHIELD_BLOCKLIST_STATE -/run/shieldnode -/var/log/shieldnode.log
 TimeoutStartSec=600
 EOF
     # path-триггер для custom: мгновенный apply при правке custom.txt
@@ -606,9 +671,21 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=$SHIELD_BLOCKLIST_STATE /run/shieldnode /var/log/shieldnode.log
+ReadWritePaths=-$SHIELD_BLOCKLIST_STATE -/run/shieldnode -/var/log/shieldnode.log
 TimeoutStartSec=600
 EOF
+    # 2026-09-23: каталоги/лог для sandbox-юнитов (ProtectSystem=strict сам их не
+    # создаст): при boot — systemd-tmpfiles-setup (/run — tmpfs), сейчас — mkdir
+    shield_persist_stream "${SHIELD_TMPFILES:-/etc/tmpfiles.d/shieldnode.conf}" 0644 <<EOF
+# shieldnode — runtime/state dirs + log for sandboxed units (managed by shieldnode)
+d /run/shieldnode 0755 root root -
+d $SHIELD_BLOCKLIST_STATE 0750 root root -
+f /var/log/shieldnode.log 0640 root root -
+EOF
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        mkdir -p "$SHIELD_BLOCKLIST_STATE" /run/shieldnode 2>/dev/null || true
+        [ -e /var/log/shieldnode.log ] || install -m 0640 /dev/null /var/log/shieldnode.log 2>/dev/null || true
+    fi
     shield_persist_stream /etc/systemd/system/shieldnode-blocklist-custom.path 0644 <<EOF
 [Unit]
 Description=watch $SHIELD_LISTS_DIR/custom.txt

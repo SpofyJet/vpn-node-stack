@@ -60,7 +60,8 @@ shield_crowdsec_agent_ensure() {
             warn "crowdsec" "mktemp для install-скрипта не удался — фид не будет работать"
             return 1
         }
-        if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$cs_install" \
+        # 2026-09-23 (v1.1.2): --retry — разовый сбой сети не отменяет установку агента
+        if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 -o "$cs_install" \
                 https://install.crowdsec.net/install.sh 2>/dev/null || [ ! -s "$cs_install" ]; then
             rm -f "$cs_install"
             warn "crowdsec" "не удалось скачать install-скрипт crowdsec (сеть/права?) — фид не будет работать"
@@ -72,7 +73,7 @@ shield_crowdsec_agent_ensure() {
             return 1
         fi
         rm -f "$cs_install"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec >/dev/null 2>&1 || {
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y crowdsec >/dev/null 2>&1 || {
             warn "crowdsec" "apt install crowdsec не удался — фид не будет работать"
             return 1
         }
@@ -95,10 +96,14 @@ shield_crowdsec_agent_ensure() {
     # whitelist (защита от community-бана своих IP — стек-белый список совпадает
     # с nft-whitelist; дубли по длительности не страшны, cscli игнорирует свежие)
     if [ "$(shield_conf_get CROWDSEC_WHITELIST_SYNC 1)" = "1" ]; then
-        local wip
+        local wip decisions
+        # 2026-09-23 (v1.1.2): список решений читаем ОДИН раз (был полный листинг на
+        # каждый IP; при community-блоклистах это МБ JSON) и ищем без пайпа: `| grep -q`
+        # под pipefail давал SIGPIPE (141) на большом выводе -> «не найден» -> дубль.
+        decisions="$(cscli decisions list -o json 2>/dev/null || true)"
         for wip in $(shield_crowdsec_whitelist_ips); do
-            # grep -F: точки в IP — regex-wildcards, без -F ложные совпадения
-            if ! cscli decisions list -o json 2>/dev/null | grep -qF "\"$wip\""; then
+            # точное вхождение "IP" в кавычках (как прежний grep -F: без regex-wildcards)
+            if [[ "$decisions" != *"\"$wip\""* ]]; then
                 cscli decisions add --ip "$wip" --type whitelist --duration 8760h >/dev/null 2>&1 || true
             fi
         done

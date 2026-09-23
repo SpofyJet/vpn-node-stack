@@ -102,7 +102,10 @@ shield_limits_resolve() {
     det_t="$(shield_detect_protected_ports)"
     det_u=""
     if command -v ss >/dev/null 2>&1; then
-        det_u="$(ss -ulnp 2>/dev/null | awk '/xray|remnanode/{print $5}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | tr '\n' ' ' | sed 's/ $//')"
+        # 2026-09-23: у `ss -ulnp` есть колонка State (UNCONN) — $5 был Peer
+        # ('0.0.0.0:*'), мусор уходил в protected_udp и nft -c отвергал ruleset
+        # при ЛЮБОМ UDP-inbound xray. Local = первое поле вида адрес:порт.
+        det_u="$(ss -ulnp 2>/dev/null | _ss_local_ports 'xray|remnanode' | sort -un | tr '\n' ' ' | sed 's/ $//' || true)"
     fi
     local extra_t extra_u
     extra_t="$(shield_conf_get PROTECTED_TCP_EXTRA "")"
@@ -191,7 +194,7 @@ shield_limits_resolve() {
     SH_F_ENABLE_ANTISPOOF="$(shield_conf_get ENABLE_ANTISPOOF 0)"
     SH_F_WAN_IFACE=""
     if command -v ip >/dev/null 2>&1; then
-        SH_F_WAN_IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')"
+        SH_F_WAN_IFACE="$(shield_default_iface)"
     fi
 
     # расширения: include внутри таблицы только если есть файлы (иначе include глоб не матчится)
@@ -209,16 +212,24 @@ shield_abuse_journal_append() {
     local ts; ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     {
         echo "### $ts"
-        local s
+        local s out
         for s in ssh_abusers ssh_abusers_v6 tcp_abusers tcp_abusers_v6 udp_abusers udp_abusers_v6 temporary_blocklist temporary_blocklist_v6; do
-            if nft list set inet shieldnode "$s" 2>/dev/null | grep -q 'elements'; then
+            # 2026-09-23 (v1.1.2): вывод читаем ОДИН раз. Было `nft list set | grep -q`
+            # под pipefail: на большом сете grep -q выходит на первом совпадении, nft
+            # получает SIGPIPE (rc 141) -> условие ложно, и именно КРУПНЫЕ сеты молча
+            # выпадали из журнала (+ двойной list каждого сета).
+            out="$(nft list set inet shieldnode "$s" 2>/dev/null)" || continue
+            if [[ "$out" == *elements* ]]; then
                 echo "## $s"
-                nft list set inet shieldnode "$s" 2>/dev/null | grep -A100 'elements = {' | sed -e 's/^elements = {//' -e 's/}.*$//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF'
+                printf '%s\n' "$out" | grep -A100 'elements = {' | sed -e 's/^elements = {//' -e 's/}.*$//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF'
             fi
         done
     } >> "$SHIELD_ABUSE_JOURNAL"
     # ротация журнала: держим последние 10000 строк (отдельно от ротации лога)
-    tail -n 10000 "$SHIELD_ABUSE_JOURNAL" > "$SHIELD_ABUSE_JOURNAL.tmp" 2>/dev/null && mv "$SHIELD_ABUSE_JOURNAL.tmp" "$SHIELD_ABUSE_JOURNAL" || true
+    # 2026-09-23 (v1.1.2): уникальный tmp — журнал пишут и apply (под lock), и
+    # cleanup-таймер (без lock): общий «.tmp» давал гонку truncate/mv
+    local jt; jt="$(mktemp "$SHIELD_ABUSE_JOURNAL.XXXXXX" 2>/dev/null)" || return 0
+    if tail -n 10000 "$SHIELD_ABUSE_JOURNAL" > "$jt" 2>/dev/null; then mv "$jt" "$SHIELD_ABUSE_JOURNAL"; else rm -f "$jt"; fi
     chmod 0640 "$SHIELD_ABUSE_JOURNAL" 2>/dev/null || true
 }
 
@@ -227,6 +238,7 @@ shield_cleanup_timer_install() {
     [ "$(shield_conf_get PERSIST_ENABLED 1)" = "1" ] || { log info "limits" "PERSIST_ENABLED=0 — cleanup timer пропущен"; return 0; }
     command -v systemctl >/dev/null 2>&1 || { log warn "limits" "нет systemctl — timer пропущен"; return 0; }
     local svc="$SHIELD_STATE_DIR/shieldnode-cleanup.sh"
+    shield_origin_record "$svc"
     printf '%s\n' \
         '#!/bin/bash' \
         "# cleanup: abuse journal append (ТЗ §24); сгенерировано shieldnode" \

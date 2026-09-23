@@ -21,7 +21,7 @@ node_detect() {
         echo "## nic"
         local ifname=""
         if command -v ip >/dev/null 2>&1; then
-            ifname="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')"
+            ifname="$(node_default_iface)"
         fi
         echo "default_iface: ${ifname:-none}"
         if [ -n "$ifname" ]; then

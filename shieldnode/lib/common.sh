@@ -6,7 +6,12 @@ C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'; C_NC=$'\033[0m'
 
 scrub() {
     # Маскирование секретов перед записью в лог (ТЗ §5): токены/пароли/UUID.
-    sed -E 's/(token|password|passwd|secret|uuid|bearer)([=: ][^ ]{0,4})[^ ]*/\1\2****/I'
+    # 2026-09-23: порт фикса node — значение маскируется ЦЕЛИКОМ (раньше в лог
+    # уходили 4 символа префикса секрета), флаг g (все секреты строки, не только
+    # первый), JSON/YAML-разделители, «голые» UUID.
+    local q="'"
+    sed -E -e "s/(token|password|passwd|secret|uuid|bearer)([\"$q]?[=: ]+[\"$q]?)[^ \"$q,;}]+/\1\2****/Ig" \
+           -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/****-uuid/Ig'
 }
 
 log() {
@@ -69,14 +74,24 @@ atomic_write() {
 }
 
 # nft_counters — вывод "<name> <packets> <bytes>" по всем counter'ам таблицы.
-# Реальный `nft list counters` печатает многострочные блоки (НЕ однострочники
-# с запятой):  counter c_drops_x {
-#                  packets 123 bytes 456
-#              }
+# ВАЖНО: скоупедная форма `nft list counters inet <table>` — СИНТАКСИЧЕСКАЯ
+# ОШИБКА на nft < 1.0.8 (Debian 12: nft 1.0.6): "Error: syntax error,
+# unexpected string" (проверено на живом ядре 2026-09-22 — из-за этого guard
+# показывал пустые счётчики на работающем firewall). Единственная рабочая
+# форма — глобальная `nft list counters` (все таблицы), фильтруем по секции
+# "table inet shieldnode" (awk'ом — nft не даёт фильтра по таблице).
+# Реальный вывод многострочный (НЕ однострочники с запятой):
+#   table inet shieldnode {
+#       counter c_drops_x {
+#           packets 123 bytes 456
+#       }
+#   }
 nft_counters() {
-    nft list counters inet shieldnode 2>/dev/null | awk '
-        /^[[:space:]]*counter [a-zA-Z0-9_]+[[:space:]]*\{/ { name = $2; next }
-        /^[[:space:]]*packets [0-9]+ bytes [0-9]+/ {
+    nft list counters 2>/dev/null | awk '
+        /^table inet shieldnode[[:space:]]*\{/ { in_table = 1; next }
+        /^table / { in_table = 0; next }
+        in_table && /^[[:space:]]*counter [a-zA-Z0-9_]+[[:space:]]*\{/ { name = $2; next }
+        in_table && /^[[:space:]]*packets [0-9]+ bytes [0-9]+/ {
             if (name != "") { print name, $2, $4; name = "" }
         }' || true
 }
@@ -108,6 +123,24 @@ nft_set_elem_count() {
         }
         END { print cnt + 0 }' || true
 }
+
+# --- разбор вывода ip/ss БЕЗ номеров колонок (v1.1.2, 2026-09-23) ---
+# ip route: значение берём по КЛЮЧЕВОМУ слову грамматики iproute2 (dev/via), а
+# не $5/$3 — номер колонки сдвигается: «default nhid N via ...» (nexthop-объекты),
+# «default dev venet0 scope link» (без шлюза: OpenVZ/wg/ppp), multipath
+# («default proto static ... nexthop via X dev Y»). ip -j не используем: в node нет
+# JSON-парсера (python3/jq — не зависимости node), в shieldnode python3 опционален.
+# ss: JSON-вывода у ss в upstream iproute2 НЕТ (ss(8)); Local = первое поле вида
+# адрес:порт — независимо от наличия колонок Netid/State (зависят от фильтров).
+# awk читает вход ДО КОНЦА (без exit) — продюсер не получает SIGPIPE под pipefail.
+# Тела _route_kw/_ss_local_ports ИДЕНТИЧНЫ в node и shieldnode (test-shared-helpers).
+_route_kw() { # stdin: `ip -o route`; $1 = dev|via — значение из первого маршрута, где оно есть
+    awk -v kw="$1" '!done { for (i = 1; i < NF; i++) if ($i == kw) { print $(i + 1); done = 1; break } }'
+}
+_ss_local_ports() { # stdin: вывод ss; $1 = ERE по строке (процесс) — порт Local каждой строки
+    awk -v re="$1" '$0 ~ re { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { n = split($i, a, ":"); print a[n]; break } }'
+}
+shield_default_iface() { ip -o -4 route show to default 2>/dev/null | _route_kw dev; }
 
 # foreign_owner_keys — ключи sysctl, принадлежащие node (реестр владения ТЗ §15/§21).
 # shieldnode НИКОГДА не пишет net.netfilter.* — там только node.

@@ -129,6 +129,7 @@ node_xanmod_install() {
     log info "kernel" "установка $pkg (ветка $branch, CPU level $level)…"
     backup /etc/default/grub
     # репозиторий + ключ (backup + atomic + манифест — единые правила проекта)
+    declare -F node_origin_record >/dev/null 2>&1 && node_origin_record "$XANMOD_REPO_LIST"   # 2026-09-23: реестр для rollback
     backup "$XANMOD_REPO_LIST"
     printf 'deb http://deb.xanmod.org releases main\n' | atomic_write "$XANMOD_REPO_LIST"
     node_manifest_record "$XANMOD_REPO_LIST"
@@ -138,6 +139,7 @@ node_xanmod_install() {
         # при фейле — rm + die, пустой keyring не оставляем.
         local ktmp; ktmp="$(mktemp)"
         if wget -qO- https://dl.xanmod.org/gpg.key 2>/dev/null | gpg --dearmor > "$ktmp" 2>/dev/null && [ -s "$ktmp" ]; then
+            declare -F node_origin_record >/dev/null 2>&1 && node_origin_record "$XANMOD_GPG"
             atomic_write "$XANMOD_GPG" < "$ktmp"
             node_manifest_record "$XANMOD_GPG"
             rm -f "$ktmp"
@@ -148,10 +150,14 @@ node_xanmod_install() {
     else
         log warn "kernel" "wget отсутствует — добавьте ключ вручную: https://dl.xanmod.org/gpg.key"
     fi
-    # сетевой сбой здесь НЕ должен убивать весь apply: система уже оптимизована,
-    # контракт ещё не записан — warn + продолжаем (XanMod можно доустановить повторным apply)
-    apt-get update -qq || { log warn "kernel" "apt update failed (deb.xanmod.org недоступен?) — XanMod пропущен, повторите apply после исправления сети"; return 0; }
-    apt-get install -y --no-install-recommends "$pkg" || { log warn "kernel" "apt install $pkg failed — повторите apply"; return 0; }
+    # Сетевой сбой здесь НЕ убивает весь apply (счётчик шага: apply доработает,
+    # но итоговая сводка назовёт xanmod_install среди упавших — return 1, не 0:
+    # иначе сбой молча исчезал из консольного вывода, оставаясь только warn'ом
+    # в логе. С ноды в РФ deb.xanmod.org периодически недоступен — реальный
+    # сценарий, а не теория). Повторный apply доустанавливает.
+    # 2026-09-23 (v1.1.2): Acquire::Retries — разовый сетевой сбой зеркала не валит шаг
+    apt-get -o Acquire::Retries=3 update -qq || { log warn "kernel" "apt update failed (deb.xanmod.org недоступен?) — XanMod пропущен, повторите apply после исправления сети"; return 1; }
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends "$pkg" || { log warn "kernel" "apt install $pkg failed — повторите apply"; return 1; }
     # pin: держим ядро при autoremove (через node_persist — backup + манифест,
     # а не printf > напрямую мимо единой точки записи)
     if declare -F node_persist >/dev/null 2>&1; then
@@ -179,7 +185,19 @@ node_kernel_reboot_offer() {
         case "$ans" in
             y|Y|д|Д)
                 log warn "kernel" "reboot по явному выбору оператора"
-                systemctl reboot 2>/dev/null || reboot
+                if systemctl reboot 2>/dev/null || reboot 2>/dev/null; then
+                    # systemctl reboot АСИНХРОНЕН: возвращается мгновенно, а
+                    # shutdown идёт секунды. Без стоп-мира apply продолжался
+                    # бы в self-test/contract ПОСРЕДИ останова сервисов →
+                    # ложные FAIL (sshd/xray уже лежат) и попытка rollback во
+                    # время shutdown (баг 2026-09-22, подтверждён мок-тестом:
+                    # AFTER-XANMOD шаги выполнялись в окне shutdown). Спим до
+                    # реальной перезагрузки; система убьёт процесс сама.
+                    log warn "kernel" "reboot инициирован — apply намеренно прерван; после загрузки повтори apply (доприменит всё под новым ядром)"
+                    while :; do sleep 30; done
+                else
+                    log error "kernel" "reboot не удался — перезагрузи вручную: sudo reboot"
+                fi
                 ;;
             *)
                 log info "kernel" "reboot отложен оператором; напоминание: status (маркер /run/node/reboot-required)"

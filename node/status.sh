@@ -83,4 +83,6 @@ node_status() {
     fi
     source "$NODE_DIR/lib/xray.sh"
     echo "xray/remnanode sockets: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
+    echo "----------------------------------------------------------------------"
+    declare -F node_perf_report >/dev/null 2>&1 && node_perf_report "$NODE_STATE_DIR/perf-baseline.txt"
 }

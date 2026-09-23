@@ -3,7 +3,7 @@
 # Modes: apply (default) | status | rollback [id] | detect | uninstall
 set -euo pipefail
 
-NODE_VERSION="1.1.0"
+NODE_VERSION="1.1.3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NODE_DIR="$SCRIPT_DIR"
 export NODE_STATE_DIR="/var/lib/node"
@@ -19,7 +19,7 @@ export DRY_RUN
 
 usage() {
     cat <<'EOF'
-node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.1.0
+node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.1.3
 
 Использование: node [опции] <команда> [аргумент]
 
@@ -76,6 +76,10 @@ if [ "$(id -u)" -eq 0 ]; then
         apply|rollback|uninstall|rt-reapply) acquire_lock ;;
     esac
     mkdir -p "$NODE_STATE_DIR" "$NODE_DIAG_DIR" "$NODE_PROFILE_DIR" "$(dirname "$NODE_LOCK")" 2>/dev/null || true
+    # 2026-09-23: log() пишет только в УЖЕ существующий writable файл, а создавать
+    # его было некому — на свежей ноде /var/log/node.log не появлялся никогда, все
+    # «смотри лог» вели в пустоту. Создаём (0640, секреты скрабятся в log()).
+    [ -e "$NODE_LOG" ] || install -m 0640 /dev/null "$NODE_LOG" 2>/dev/null || true
 else
     case "$MODE" in
         detect|status) : ;;  # только чтение — root не обязателен
@@ -86,7 +90,9 @@ else
     esac
     if [ "$MODE" = "detect" ] || { [ "$DRY_RUN" = "1" ] && [ "$MODE" != "status" ]; }; then
         # state/снапшоты писать некуда (нет прав на /var/lib/node) — в /tmp
-        export NODE_STATE_DIR="$(mktemp -d /tmp/node-${MODE}.XXXXXX)"
+        # SC2155: export+$(...) маскировал сбой mktemp (NODE_STATE_DIR="" -> /diagnostics)
+        NODE_STATE_DIR="$(mktemp -d "/tmp/node-${MODE}.XXXXXX")" || die "mktemp для rootless state не удался"
+        export NODE_STATE_DIR
         export NODE_DIAG_DIR="$NODE_STATE_DIR/diagnostics"
         mkdir -p "$NODE_DIAG_DIR"
     fi

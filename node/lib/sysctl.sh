@@ -28,6 +28,18 @@ node_sysctl_plan_init() {
 # node_sysctl_add <file> <key> <value>
 node_sysctl_add() {
     local file="$1" key="$2" value="$3"
+    # 2026-09-23: значение из конфига не валидировалось — мусор (TCP_SOMAXCONN=abc)
+    # попадал в файл, sysctl -p падал и die оставлял систему «частично применённой».
+    # Все ключи node — числа (в т.ч. через пробел); токены (bbr, fq) — только
+    # у ключей, которые их принимают.
+    local ok_val=0
+    [[ "$value" =~ ^[0-9]+([[:space:]]+[0-9]+)*$ ]] && ok_val=1
+    case "$key" in net.ipv4.tcp_congestion_control|net.core.default_qdisc)
+        [[ "$value" =~ ^[a-z][a-z0-9_]*$ ]] && ok_val=1 ;; esac
+    if [ "$ok_val" != 1 ]; then
+        warn "sysctl" "невалидное значение $key='$value' (конфиг?) — ключ пропущен, текущее значение ядра оставлено"
+        return 0
+    fi
     validate_key_ownership "$key" || { warn "sysctl" "skip foreign-owned key: $key"; return 0; }
     printf '%s\t%s\t%s\n' "$key" "$value" "$file" >> "$NODE_PLAN_FILE"
 }
@@ -38,6 +50,19 @@ node_sysctl_add_probed() {
     local file="$1" key="$2" value="$3"
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sysctl -n "$key" >/dev/null 2>&1 || { log warn "sysctl" "ключ $2 отсутствует в ядре $(uname -r) — пропуск"; return 0; }
+    fi
+    node_sysctl_add "$file" "$key" "$value"
+}
+
+# node_sysctl_add_writable <file> <key> <value> — как _probed, плюс проверка, что
+# ключ ЗАПИСЫВАЕМ: пишем текущее значение обратно (no-op). Ловит RO /proc/sys
+# (LXC/OpenVZ) до записи файла — иначе sysctl -p уронил бы весь apply.
+node_sysctl_add_writable() {
+    local file="$1" key="$2" value="$3" cur
+    if [ "${DRY_RUN:-0}" != "1" ] && [ "${MODE:-}" != "status" ]; then   # status — read-only
+        cur="$(sysctl -n "$key" 2>/dev/null)" || { log warn "sysctl" "ключ $key отсутствует — пропуск"; return 0; }
+        sysctl -w "$key=$(printf '%s' "$cur" | tr '\t' ' ')" >/dev/null 2>&1 \
+            || { log warn "sysctl" "ключ $key не записываемый (контейнер?) — пропуск"; return 0; }
     fi
     node_sysctl_add "$file" "$key" "$value"
 }
@@ -71,8 +96,28 @@ node_sysctl_write() {
 # (баг 2026-09: манифест всегда пуст) перекрывало делегат, т.к. этот файл
 # source'ится внутри node_apply ПОСЛЕ apply.sh, — rollback/uninstall ломались.
 
+# node_sysctl_orig_record — исходные (до node) runtime-значения ключей плана.
+# Баг 2026-09-23: rollback брал baseline из ПОСЛЕДНЕГО снапшота detect, а он
+# после повторного apply содержит уже значения node (и первый снапшот не знает
+# большинства ключей) — runtime после отката оставался «оптимизированным».
+# Реестр пишется ОДИН раз на ключ; ключи, уже бывшие под node до v1.1.1
+# (есть в owner-keys.txt), не пишем — их текущее значение не исходное (legacy).
+node_sysctl_orig_record() {
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    local reg="$NODE_STATE_DIR/sysctl-orig.tsv" owner="$NODE_STATE_DIR/owner-keys.txt" k v _f
+    mkdir -p "$NODE_STATE_DIR"; touch "$reg"
+    while IFS=$'\t' read -r k v _f; do
+        [ -n "$k" ] || continue
+        if awk -F'\t' -v k="$k" '$1==k{f=1} END{exit !f}' "$reg"; then continue; fi
+        if [ -f "$owner" ] && grep -qxF -- "$k" "$owner"; then continue; fi
+        v="$(sysctl -n "$k" 2>/dev/null)" || continue
+        printf '%s\t%s\n' "$k" "$(printf '%s' "$v" | tr '\t' ' ')" >> "$reg"
+    done < "$NODE_PLAN_FILE"
+}
+
 node_sysctl_apply() {
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "sysctl -p (skipped)"; return 0; }
+    node_sysctl_orig_record
     local f
     for f in "${NODE_SYSCTL_FILES[@]}"; do
         [ -f "$f" ] || continue

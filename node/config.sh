@@ -35,6 +35,7 @@ node_load_config() {
     { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$NODE_DEFAULTS" 2>/dev/null || true; } | tr -d '\r' >> "$CONFIG_CACHE"
     chmod 0600 "$CONFIG_CACHE"
     export CONFIG_CACHE
+    [ -n "${NODE_PROC_MEMINFO:-}" ] || _NODE_MEMTOTAL_MB="$(_node_memtotal_read)"
     if [ "$(node_conf_get ENABLE_NODE 1)" != "1" ]; then
         log warn "config" "ENABLE_NODE != 1 — nothing to do"
         exit 0
@@ -42,8 +43,13 @@ node_load_config() {
 }
 
 # MemTotal в MB; NODE_PROC_MEMINFO — тестовый override фикстуры meminfo
+# 2026-09-23 (v1.1.2): MemTotal за прогон не меняется — читаем /proc/meminfo ОДИН
+# раз (кэш заполняет node_load_config в родительском шелле: вызовы идут через
+# $(...) и сами кэш бы не сохранили). Фикстура тестов (NODE_PROC_MEMINFO) — без кэша.
+_node_memtotal_read() { awk '/MemTotal/{print int($2/1024)}' "${NODE_PROC_MEMINFO:-/proc/meminfo}" 2>/dev/null || echo 1024; }
 node_memtotal_mb() {
-    awk '/MemTotal/{print int($2/1024)}' "${NODE_PROC_MEMINFO:-/proc/meminfo}" 2>/dev/null || echo 1024
+    if [ -z "${NODE_PROC_MEMINFO:-}" ] && [ -n "${_NODE_MEMTOTAL_MB:-}" ]; then echo "$_NODE_MEMTOTAL_MB"; return 0; fi
+    _node_memtotal_read
 }
 
 # RAM tier: T1<=2GB T2<=4GB T3<=8GB T4>8GB (auto-выбор консервативных веток)
