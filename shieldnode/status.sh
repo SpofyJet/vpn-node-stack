@@ -2,6 +2,180 @@
 # shieldnode — status.sh: ожидаемое vs фактическое (read-only, ТЗ §27).
 set -euo pipefail
 
+# --- health: конфиг vs факт (v1.1.3, 2026-09-23) ---
+# Раньше status только ПЕРЕЧИСЛЯЛ факты (цепочки, счётчики, счётчики сетов); теперь
+# ещё и СВЕРЯЕТ их: accept (established/lo/whitelist) до первого drop, ENABLE_* <->
+# сеты и drop-правила, SSH- и внешние xray-порты под защитой, PROTECTED_*_EXTRA в
+# сетах, наполненность/свежесть/алерты блоклистов, таймер и boot-служба, emergency.
+# Только чтение. Политика не меняется. Код возврата status — прежний.
+# Таблица ниже ЗЕРКАЛИТ гейтинг lib/nft.sh (test-health сверяет её с генератором):
+#   имя-в-updater : флаг : дефолт : v4-сет
+SHIELD_HEALTH_LISTS="scanner:ENABLE_SCANNER_LIST:1:scanner_blocklist_v4
+threat:ENABLE_THREAT_LIST:1:threat_blocklist_v4
+tor:BLOCK_TOR:0:tor_exit_blocklist_v4
+custom:ENABLE_CUSTOM_LIST:1:custom_blocklist_v4
+crowdsec:ENABLE_CROWDSEC_LIST:0:crowdsec_blocklist_v4
+spamhaus:ENABLE_SPAMHAUS_LIST:1:spamhaus_blocklist_v4
+cins:ENABLE_CINS_LIST:1:cins_blocklist_v4"
+
+_hc() { # <PASS|WARN|FAIL|INFO> <текст>
+    case "$1" in PASS) _H_PASS=$((_H_PASS + 1)) ;; WARN) _H_WARN=$((_H_WARN + 1)) ;; FAIL) _H_FAIL=$((_H_FAIL + 1)) ;; esac
+    printf '  [%s] %s\n' "$1" "$2"
+}
+_h_sum() { echo "  health: FAIL=$_H_FAIL WARN=$_H_WARN PASS=$_H_PASS"; echo; }
+# порт внутри списка элементов set'а (учитывает интервалы a-b: flags interval + auto-merge)
+_h_port_in() {
+    local p="$1" e
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    for e in $2; do
+        case "$e" in
+            *-*) [[ "${e%-*}" =~ ^[0-9]+$ && "${e#*-}" =~ ^[0-9]+$ ]] && [ "$p" -ge "${e%-*}" ] && [ "$p" -le "${e#*-}" ] && return 0 ;;
+            *)   [ "$p" = "$e" ] && return 0 ;;
+        esac
+    done
+    return 1
+}
+_h_set_elems() { # <set> -> элементы через пробел (многострочный вывод nft)
+    nft -n list set inet shieldnode "$1" 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")}
+        f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
+}
+# порты xray/remnanode, слушающие НЕ только loopback (API 127.0.0.1:... снаружи недоступен)
+_h_listen() { # <t|u>
+    { ss -"$1"lnp 2>/dev/null || true; } | awk '/xray|remnanode/ { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
+        a = $i; n = split(a, x, ":"); p = x[n]; sub(/:[0-9]+$/, "", a)
+        if (a !~ /^(127\.|\[::1\]|::1$)/) print p; break } }' | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+shield_health() {
+    _H_PASS=0; _H_WARN=0; _H_FAIL=0
+    echo "--- health (конфиг vs факт, read-only) ---"
+    if ! command -v nft >/dev/null 2>&1; then _hc WARN "nft не найден — проверки фаервола пропущены"; _h_sum; return 0; fi
+    if ! nft list table inet shieldnode >/dev/null 2>&1; then
+        if [ "$(id -u)" -ne 0 ]; then _hc WARN "таблица не читается без root (нужен CAP_NET_ADMIN) — запусти status через sudo"
+        else _hc FAIL "table inet shieldnode ОТСУТСТВУЕТ — фаервол не активен (apply или emergency on)"; fi
+        _h_sum; return 0
+    fi
+    _hc PASS "table inet shieldnode присутствует"
+    if [ -f /run/shieldnode/emergency ]; then
+        _hc WARN "EMERGENCY ON с $(head -1 /run/shieldnode/emergency 2>/dev/null) — активен только аварийный путь; проверки нормальной политики пропущены (выход: emergency off)"
+        _h_sum; return 0
+    fi
+    local pre ch n
+    pre="$(nft -n list chain inet shieldnode prerouting 2>/dev/null || true)"
+    for ch in prerouting input; do
+        if nft list chain inet shieldnode "$ch" >/dev/null 2>&1; then _hc PASS "chain $ch есть"; else _hc FAIL "chain $ch отсутствует"; fi
+    done
+    n="$(awk '/ drop( |$)/ {c++} END {print c + 0}' <<<"$pre")"
+    if [ "$n" -gt 0 ]; then _hc PASS "prerouting: $n drop-правил"; else _hc FAIL "prerouting без drop-правил — политика пуста"; fi
+
+    # порядок: accept'ы до первого drop
+    local d est lo wl
+    d="$(awk '!f && / drop( |$)/ {print NR; f = 1}' <<<"$pre")"; d="${d:-999999}"
+    est="$(awk '!f && /ct state established,related accept/ {print NR; f = 1}' <<<"$pre")"
+    lo="$(awk '!f && /iifname "lo" accept/ {print NR; f = 1}' <<<"$pre")"
+    wl="$(awk '!f && /@whitelist_v4 accept/ {print NR; f = 1}' <<<"$pre")"
+    if [ "$(shield_conf_get ENABLE_ESTABLISHED 1)" = "1" ]; then
+        if [ -n "$est" ] && [ "$est" -lt "$d" ]; then _hc PASS "established/related accept — до первого drop"; else _hc FAIL "established/related accept отсутствует или ПОСЛЕ drop — рвутся уже установленные сессии"; fi
+    fi
+    if [ "$(shield_conf_get ENABLE_LOOPBACK 1)" = "1" ]; then
+        if [ -n "$lo" ] && [ "$lo" -lt "$d" ]; then _hc PASS "loopback accept — до первого drop"; else _hc FAIL "loopback accept отсутствует или ПОСЛЕ drop"; fi
+    fi
+    if [ -n "$wl" ] && [ "$wl" -lt "$d" ]; then _hc PASS "whitelist accept — до первого drop"; else _hc FAIL "whitelist accept отсутствует или ПОСЛЕ drop — TRUSTED_IPS/админ могут попасть под бан"; fi
+
+    # SSH: реальные порты (SSH_PORT пуст = авто-детект) в защитных правилах
+    local p sp
+    if [ "$(shield_conf_get ENABLE_SSH_PROTECTION 1)" = "1" ]; then
+        sp="$(shield_conf_get SSH_PORT "")"
+        [ -n "$sp" ] || sp="$(shield_detect_ssh_ports 2>/dev/null || true)"
+        [ -n "$sp" ] || _hc WARN "SSH-порты не определены (sshd не найден, SSH_PORT пуст)"
+        for p in $sp; do
+            if grep -q "tcp dport $p ct state new" <<<"$pre"; then _hc PASS "SSH $p: rate/conn-limit активны ($( [ -n "$(shield_conf_get SSH_PORT "")" ] && echo 'SSH_PORT' || echo 'авто-детект'))"
+            else _hc FAIL "SSH $p: защитных правил нет (порт сменился после apply?) — повтори apply"; fi
+        done
+    fi
+    if [ "$(shield_conf_get ENABLE_ABUSE_LIMITING 1)" = "1" ]; then
+        if grep -q "tcp dport @protected_tcp" <<<"$pre" && grep -q "udp dport @protected_udp" <<<"$pre"; then _hc PASS "abuse-лимиты tcp/udp ссылаются на protected_tcp/protected_udp"
+        else _hc FAIL "ENABLE_ABUSE_LIMITING=1, но правил по @protected_tcp/@protected_udp нет — повтори apply"; fi
+    fi
+
+    # защищаемые порты: факт в сетах, EXTRA, внешние порты xray/remnanode
+    local pt pu lt lu bad=0
+    pt="$(_h_set_elems protected_tcp)"; pu="$(_h_set_elems protected_udp)"
+    _hc INFO "protected_tcp = { ${pt:-пусто} }  protected_udp = { ${pu:-пусто} }"
+    for p in $(shield_conf_get PROTECTED_TCP_EXTRA ""); do
+        if _h_port_in "$p" "$pt"; then _hc PASS "PROTECTED_TCP_EXTRA $p — в protected_tcp"; else _hc FAIL "PROTECTED_TCP_EXTRA $p — НЕТ в protected_tcp (повтори apply)"; fi
+    done
+    for p in $(shield_conf_get PROTECTED_UDP_EXTRA ""); do
+        if _h_port_in "$p" "$pu"; then _hc PASS "PROTECTED_UDP_EXTRA $p — в protected_udp"; else _hc FAIL "PROTECTED_UDP_EXTRA $p — НЕТ в protected_udp (повтори apply)"; fi
+    done
+    if command -v ss >/dev/null 2>&1; then
+        lt="$(_h_listen t)"; lu="$(_h_listen u)"
+        for p in $lt; do _h_port_in "$p" "$pt" || { _hc WARN "xray/remnanode слушает $p/tcp снаружи, но порта нет в protected_tcp — без abuse-лимитов; повтори apply"; bad=1; }; done
+        for p in $lu; do _h_port_in "$p" "$pu" || { _hc WARN "xray/remnanode слушает $p/udp снаружи, но порта нет в protected_udp — без abuse-лимитов; повтори apply"; bad=1; }; done
+        if [ -z "$lt$lu" ]; then _hc INFO "внешних слушающих сокетов xray/remnanode не найдено (не запущен? нет root для ss -p?)"
+        elif [ "$bad" = 0 ]; then _hc PASS "все внешние порты xray/remnanode под защитой (tcp: ${lt:--}; udp: ${lu:--})"; fi
+    fi
+
+    # блоклисты: ENABLE_* <-> сет+drop-правило; наполненность; свежесть; алерты
+    local bl_on st now name flag def set want has_set has_rule cnt lg age_h iv alert
+    bl_on="$(shield_conf_get ENABLE_BLOCKLISTS 1)"
+    st="${SHIELD_BLOCKLIST_STATE:-/var/lib/shieldnode/blocklists}"; now="$(date +%s)"
+    while IFS=: read -r name flag def set; do
+        [ -n "$name" ] || continue
+        want=0; has_set=0; has_rule=0
+        [ "$bl_on" = "1" ] && [ "$(shield_conf_get "$flag" "$def")" = "1" ] && want=1
+        nft -n list set inet shieldnode "$set" >/dev/null 2>&1 && has_set=1
+        grep -qE "saddr @$set .*drop" <<<"$pre" && has_rule=1
+        if [ "$want" = 0 ]; then
+            if [ "$has_set" = 1 ] || [ "$has_rule" = 1 ]; then _hc WARN "$name: выключен ($flag/ENABLE_BLOCKLISTS), но set/правило ещё в фаерволе (half-present) — повтори apply"
+            else _hc PASS "$name: выключен и отсутствует (консистентно)"; fi
+            continue
+        fi
+        if [ "$has_set" = 0 ] || [ "$has_rule" = 0 ]; then _hc FAIL "$name: включён, но set/drop-правила нет — повтори apply"; continue; fi
+        cnt="$(nft_set_elem_count "$set")"; age_h=""
+        if [ -r "$st" ]; then
+            lg="$st/last-good-$name.txt"
+            [ -f "$lg" ] && age_h=$(( (now - $(stat -c %Y "$lg" 2>/dev/null || echo "$now")) / 3600 ))
+            alert=""; [ -f "$st/.alert-$name" ] && alert="$(cat "$st/.alert-$name" 2>/dev/null)"
+        else alert=""; fi
+        if [ "${cnt:-0}" -eq 0 ]; then
+            local last="нет данных"; [ -n "$age_h" ] && last="${age_h}ч назад"
+            _hc WARN "$name: set ПУСТ — updater ещё не отработал или фид недоступен (последний успех: $last)"
+        else
+            _hc PASS "$name: ${cnt} записей в наборе (после схлопывания CIDR; MIN проверяет updater на сыром фиде)"
+        fi
+        [ -n "$alert" ] && _hc WARN "$name: фид падает подряд — алерт с $alert (см. /var/log/shieldnode.log)"
+        if [ "$name" != "custom" ] && [ -r "$st" ]; then
+            iv="$(shield_conf_get BLOCKLIST_UPDATE_INTERVAL 360)"; [ "$name" = "crowdsec" ] && iv="$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)"
+            [[ "$iv" =~ ^[0-9]+$ ]] || iv=360
+            if [ -z "$age_h" ]; then _hc WARN "$name: успешных обновлений ещё не было (last-good нет)"
+            elif [ $((age_h * 60)) -gt $((iv * 2 + 60)) ]; then _hc WARN "$name: последнее успешное обновление ${age_h}ч назад (> 2 интервалов по ${iv} мин) — проверь таймер/сеть"; fi
+        fi
+    done <<<"$SHIELD_HEALTH_LISTS"
+    [ -r "$st" ] || _hc INFO "нет доступа к $st — свежесть блоклистов не проверена (запусти через sudo)"
+
+    # таймер и boot-служба
+    if command -v systemctl >/dev/null 2>&1; then
+        if [ "$bl_on" = "1" ]; then
+            if systemctl is-active --quiet shieldnode-blocklist.timer 2>/dev/null; then _hc PASS "shieldnode-blocklist.timer активен"
+            else _hc WARN "shieldnode-blocklist.timer НЕ активен — блоклисты не обновляются"; fi
+        fi
+        if systemctl is-enabled --quiet shieldnode.service 2>/dev/null; then _hc PASS "shieldnode.service enabled — фаервол поднимется после reboot"
+        else _hc WARN "shieldnode.service не enabled — после reboot фаервола не будет"; fi
+    fi
+
+    # «делает ли работу»: последний apply, дропы, abuse-сеты, журнал
+    local upd drops j
+    upd="$(awk -F= '/^\[shieldnode\]/ {f = 1; next} /^\[/ {f = 0} f && $1 == "updated" {print $2}' /etc/node-profile.d/stack.conf 2>/dev/null || true)"
+    _hc INFO "последний apply: ${upd:-неизвестно}"
+    drops="$(nft_counters | awk '$1 ~ /^c_drops_/ {s += $2} END {print s + 0}')"
+    if [ "${drops:-0}" -gt 0 ]; then _hc INFO "дропов с последнего apply: $drops пакетов (фаервол работает)"
+    else _hc INFO "дропов с последнего apply: 0 — нода простаивает или атак не было (не ошибка)"; fi
+    j="$(awk '/^### / {t = $2} END {print t}' "$SHIELD_STATE_DIR/abuse.journal" 2>/dev/null || true)"
+    _hc INFO "abuse-сеты сейчас: ssh=$(nft_set_elem_count ssh_abusers) tcp=$(nft_set_elem_count tcp_abusers) udp=$(nft_set_elem_count udp_abusers) temp=$(nft_set_elem_count temporary_blocklist); журнал: ${j:-записей нет}"
+    _h_sum
+}
+
 shield_status() {
     echo "=== shieldnode v$SHIELD_VERSION status ==="
     echo
@@ -13,6 +187,8 @@ shield_status() {
         echo "off"
     fi
     echo
+
+    shield_health
 
     echo "--- config (effective: config.conf + defaults; пусто = авто) ---"
     local k

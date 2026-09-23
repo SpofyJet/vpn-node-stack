@@ -16,6 +16,10 @@ node_status() {
     source "$NODE_DIR/lib/services.sh";  node_harden_ipv6   # ipv6-ключи видны в сверке
 
     echo "node v$NODE_VERSION status — $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    # 2026-09-23 (v1.1.4): ожидание reboot после XanMod — первым делом, заметно (stdout)
+    if node_xanmod_reboot_pending; then
+        node_reboot_notice "kernel: XanMod установлен ($(cut -f2 "$(node_xanmod_pending_file)" 2>/dev/null)), ОЖИДАЕТ REBOOT — активно $(uname -r). Выполни: sudo reboot" 1
+    fi
     echo "======================================================================"
     printf '%-46s %-14s %-14s %s\n' "parameter" "expected" "actual" "ok"
     echo "----------------------------------------------------------------------"
@@ -78,7 +82,7 @@ node_status() {
     else
         echo "rt boot re-apply: не нужен (runtime-твики выключены)"
     fi
-    if [ -f /run/node/reboot-required ] && ! node_kernel_is_xanmod; then
+    if { [ -f /run/node/reboot-required ] || node_xanmod_reboot_pending; } && ! node_kernel_is_xanmod; then
         echo "reboot: ТРЕБУЕТСЯ (новое ядро установлено $(cat /run/node/reboot-required 2>/dev/null), активно $(uname -r))"
     fi
     source "$NODE_DIR/lib/xray.sh"

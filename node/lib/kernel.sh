@@ -158,6 +158,9 @@ node_xanmod_install() {
     # 2026-09-23 (v1.1.2): Acquire::Retries — разовый сетевой сбой зеркала не валит шаг
     apt-get -o Acquire::Retries=3 update -qq || { log warn "kernel" "apt update failed (deb.xanmod.org недоступен?) — XanMod пропущен, повторите apply после исправления сети"; return 1; }
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends "$pkg" || { log warn "kernel" "apt install $pkg failed — повторите apply"; return 1; }
+    # 2026-09-23 (v1.1.4): маркер ожидания reboot в state (переживает reboot, в отличие от /run)
+    mkdir -p "${NODE_STATE_DIR:-/var/lib/node}"
+    printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$pkg" "$(uname -r)" > "$(node_xanmod_pending_file)"
     # pin: держим ядро при autoremove (через node_persist — backup + манифест,
     # а не printf > напрямую мимо единой точки записи)
     if declare -F node_persist >/dev/null 2>&1; then
@@ -167,7 +170,31 @@ node_xanmod_install() {
         node_manifest_record /etc/apt/preferences.d/xanmod-kernel
     fi
     command -v update-grub >/dev/null 2>&1 && update-grub || true
+    # баннер — после шумного update-grub, прямо перед y/N-промптом
+    node_reboot_notice "XanMod установлен ($pkg). ТРЕБУЕТСЯ REBOOT для активации нового ядра: sudo reboot (сейчас активно $(uname -r))"
     node_kernel_reboot_offer
+}
+
+# --- заметное напоминание о reboot после XanMod (v1.1.4, 2026-09-23) ---
+# Раньше напоминания были обычными строками `log warn`, неотличимыми от сотен
+# соседних; маркер жил только в /run (tmpfs) — после reboot, в котором GRUB
+# поднял СТАРОЕ ядро, следа не оставалось вовсе. Авто-reboot по-прежнему нет.
+node_xanmod_pending_file() { echo "${NODE_STATE_DIR:-/var/lib/node}/pending-reboot-xanmod"; }
+
+# node_reboot_notice <текст> [fd=2] — рамка + «>>> текст <<<». Жирный жёлтый —
+# ТОЛЬКО если fd это терминал и не задан NO_COLOR (в лог/пайп/CI — без ANSI-мусора).
+node_reboot_notice() {
+    local msg="$1" fd="${2:-2}" c="" r="" line="======================================================================"
+    if [ -t "$fd" ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then c=$'\033[1;33m'; r=$'\033[0m'; fi
+    printf '%s%s%s\n%s>>> %s <<<%s\n%s%s%s\n' "$c" "$line" "$r" "$c" "$msg" "$r" "$c" "$line" "$r" >&"$fd"
+}
+
+# ожидает reboot: маркер есть, пакет XanMod реально установлен, активно НЕ XanMod-ядро
+# (ловит и «перезагрузились, а GRUB загрузил старое ядро»)
+node_xanmod_reboot_pending() {
+    [ -f "$(node_xanmod_pending_file)" ] || return 1
+    node_kernel_is_xanmod && return 1
+    dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{f = 1} END{exit !f}'
 }
 
 # node_kernel_reboot_offer — интерактивное предложение reboot после установки
@@ -221,5 +248,6 @@ node_xanmod_remove() {
         command -v update-grub >/dev/null 2>&1 && update-grub || true
         log info "kernel" "grub restored from $g"
     fi
+    rm -f "$(node_xanmod_pending_file)" 2>/dev/null || true   # 2026-09-23 (v1.1.4): XanMod снят — ждать нечего
     log warn "kernel" "XanMod удалён. Для полного отката: sudo reboot (загрузится стоковое ядро)."
 }

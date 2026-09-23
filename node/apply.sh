@@ -131,8 +131,13 @@ node_apply() {
     # CI) промпт ребута не показывался — единственным следом оставался warn в
     # логе и нода молча сидела на старом ядре (баг 2026-09-22: «почему не
     # попросило перезагрузить для XanMod»). Баннер не пропустишь: он в конце.
-    if [ -f /run/node/reboot-required ] && ! node_kernel_is_xanmod; then
-        log warn "apply" "ТРЕБУЕТСЯ REBOOT: ядро XanMod установлено (маркер $(cat /run/node/reboot-required)), активно $(uname -r). Выполни: sudo reboot, затем повтори apply (доприменит BBRv3 под новым ядром)."
+    # 2026-09-23 (v1.1.4): + маркер в state (ловит «reboot, но GRUB поднял старое ядро»),
+    # + цветной баннер ПОСЛЕДНИМ выводом apply; снятие маркера, когда XanMod уже активен.
+    if { [ -f /run/node/reboot-required ] || node_xanmod_reboot_pending; } && ! node_kernel_is_xanmod; then
+        log warn "apply" "ТРЕБУЕТСЯ REBOOT: ядро XanMod установлено (маркер $(cat /run/node/reboot-required 2>/dev/null || cut -f1 "$(node_xanmod_pending_file)" 2>/dev/null)), активно $(uname -r). Выполни: sudo reboot, затем повтори apply (доприменит BBRv3 под новым ядром)."
+        node_reboot_notice "XanMod установлен, но активно старое ядро $(uname -r). REBOOT ОБЯЗАТЕЛЕН: sudo reboot — иначе новое ядро не используется"
+    elif node_kernel_is_xanmod && [ -f "$(node_xanmod_pending_file)" ]; then
+        rm -f "$(node_xanmod_pending_file)" && log info "kernel" "XanMod активно ($(uname -r)) — маркер ожидания reboot снят"
     fi
 }
 
