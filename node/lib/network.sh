@@ -13,10 +13,26 @@ node_network_mtu_diag() {
     gw="$(node_default_gw)"
     log info "network" "iface=$ifname mtu=$mtu gw=${gw:-none}"
     if [[ "$mtu" =~ ^[0-9]+$ ]] && [ -n "$gw" ] && command -v ping >/dev/null 2>&1; then
-        if ping -M do -s $((mtu - 28)) -c 1 -W 2 "$gw" >/dev/null 2>&1; then
-            ok "network" "PMTU probe ${mtu}B to gw: OK"
+        # 2026-09-24 (v1.1.6): сначала обычный ping gw (-W 1, RTT до gw < 1мс): молчащий gw
+        # раньше стоил 2с на DF-пробу + 2с на ping — ~5с каждого apply на облачных VPS
+        if ping -c 1 -W 1 "$gw" >/dev/null 2>&1; then
+            if ping -M "do" -s $((mtu - 28)) -c 1 -W 2 "$gw" >/dev/null 2>&1; then
+                ok "network" "PMTU probe ${mtu}B to gw: OK"
+            else
+                warn "network" "PMTU probe ${mtu}B to gw: FAIL (пакет с DF не прошёл) — проверь MTU вручную; автоматически не понижаем"
+            fi
         else
-            warn "network" "PMTU probe ${mtu}B to gw: FAIL (пакет с DF не прошёл) — проверь MTU вручную; автоматически не понижаем"
+            # 2026-09-24 (v1.1.5): gw не отвечает на ICMP вовсе (виртуальный on-link gw у
+            # облачных провайдеров) — это не PMTU-проблема; раньше здесь был ложный FAIL.
+            # Пробуем внешний хост (MTU_PROBE_TARGET, по умолчанию 1.1.1.1).
+            local tgt; tgt="$(node_conf_get MTU_PROBE_TARGET 1.1.1.1)"
+            if ! ping -c 1 -W 2 "$tgt" >/dev/null 2>&1; then
+                log info "network" "PMTU probe: ни gw $gw, ни $tgt не отвечают на ICMP — проверка невозможна"
+            elif ping -M "do" -s $((mtu - 28)) -c 1 -W 2 "$tgt" >/dev/null 2>&1; then
+                ok "network" "PMTU probe ${mtu}B to $tgt: OK (gw $gw не отвечает на ICMP)"
+            else
+                warn "network" "PMTU probe ${mtu}B to $tgt: FAIL (пакет с DF не прошёл; gw $gw не отвечает на ICMP) — проверь MTU вручную; автоматически не понижаем"
+            fi
         fi
     fi
 }
@@ -44,17 +60,23 @@ node_network_mss_clamp() {
     [ -z "$ifname" ] && { warn "network" "MSS clamp: нет default iface"; return 0; }
     mtu="$(cat "/sys/class/net/$ifname/mtu" 2>/dev/null || echo 1500)"
     mss="$(node_conf_get MSS_CLAMP_MTU $((mtu - 40)))"
+    # 2026-09-24 (v1.1.5): backlog #5 — IPv6-заголовок на 20 байт больше (40 vs 20):
+    # для того же MTU v6-MSS = v4-MSS - 20 (mtu-60). Раньше v6 клампился v4-значением.
+    # Поднимать MSS ядро само не даёт (nft_exthdr: только понижение) — проверено tcpdump.
+    local mss6=$((mss - 20))
     conf="/etc/nftables.d/node-mss-clamp.conf"
     unit="/etc/systemd/system/node-mss-clamp.service"
     {
         echo "table inet node_mss_clamp {"
         echo "  chain forward {"
         echo "    type filter hook forward priority -150; policy accept;"
-        echo "    oifname \"$ifname\" tcp flags syn tcp option maxseg size set $mss"
+        echo "    oifname \"$ifname\" meta nfproto ipv4 tcp flags syn tcp option maxseg size set $mss"
+        echo "    oifname \"$ifname\" meta nfproto ipv6 tcp flags syn tcp option maxseg size set $mss6"
         echo "  }"
         echo "  chain output {"
         echo "    type filter hook output priority -150; policy accept;"
-        echo "    oifname \"$ifname\" tcp flags syn tcp option maxseg size set $mss"
+        echo "    oifname \"$ifname\" meta nfproto ipv4 tcp flags syn tcp option maxseg size set $mss"
+        echo "    oifname \"$ifname\" meta nfproto ipv6 tcp flags syn tcp option maxseg size set $mss6"
         echo "  }"
         echo "}"
     } | node_persist "$conf"
@@ -80,7 +102,7 @@ node_network_mss_clamp() {
         systemctl enable --now node-mss-clamp.service >/dev/null 2>&1 || \
             warn "network" "node-mss-clamp.service не поднялся (nft установлен?)"
     fi
-    ok "network" "MSS clamp on: iface=$ifname mss=$mss"
+    ok "network" "MSS clamp on: iface=$ifname mss=$mss mss6=$mss6"
 }
 
 # INTEGRATION_DOCKER=1 — единственная точка контакта с docker (opt-in)

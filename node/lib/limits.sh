@@ -10,7 +10,7 @@ node_limits_plan() {
 
 # Детект systemd-unit'ов, в которых живёт xray/remnanode (read-only)
 node_limits_detect_units() {
-    local units=() u comm
+    local units=() u
     while read -r u; do
         [ -z "$u" ] && continue
         if systemctl cat "$u" 2>/dev/null | grep -qiE 'xray|remnanode'; then

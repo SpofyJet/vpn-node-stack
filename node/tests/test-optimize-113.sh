@@ -102,16 +102,20 @@ export NODE_PROC_ROOT="$OUT/proc" DRY_RUN=1
 cfg ''
 sn "000f4240 00000000 00000000" "000f4240 00000000 00000000"; plan
 t "softnet чисто: budget 600 / backlog 8192 (как в 1.1.2)" '[ "$(val net.core.netdev_budget)" = 600 ] && [ "$(val net.core.netdev_max_backlog)" = 8192 ]'
+t "softnet чисто: usecs 4000 (v1.1.7, было 8000)" '[ "$(val net.core.netdev_budget_usecs)" = 4000 ]'
 sn "000f4240 00000000 000001f4"; plan     # 500 / 1_000_000 = 0.05%
 t "squeeze 0.05% (ниже порога 0.1%): budget не меняется" '[ "$(val net.core.netdev_budget)" = 600 ]'
 sn "000f4240 00000000 00002710"; plan     # 10000 / 1_000_000 = 1%
 t "squeeze 1%: netdev_budget 600 -> 1200" '[ "$(val net.core.netdev_budget)" = 1200 ]'
+t "squeeze 1%: usecs пропорционально 1200 -> 8000 (v1.1.7)" '[ "$(val net.core.netdev_budget_usecs)" = 8000 ]'
 sn "000f4240 00000005 00000000" "000f4240 00000000 00000000"; plan
 t "dropped > 0: netdev_max_backlog 8192 -> 16384" '[ "$(val net.core.netdev_max_backlog)" = 16384 ]'
 sn "ffffffff 00000000 00000000"; node_softnet_read
 t "hex-разбор без strtonum (mawk): ffffffff = 4294967295" '[ "$_NODE_SN_PROC" = 4294967295 ]'
 cfg 'NETDEV_BUDGET=900\n'; sn "000f4240 00000000 00002710"; plan
 t "явный NETDEV_BUDGET оператора не трогается даже при squeeze" '[ "$(val net.core.netdev_budget)" = 900 ]'
+cfg 'NETDEV_BUDGET_USECS=2000\n'; sn "000f4240 00000000 00000000"; plan
+t "явный NETDEV_BUDGET_USECS оператора соблюдается" '[ "$(val net.core.netdev_budget_usecs)" = 2000 ]'
 cfg 'AUTO_SOFTNET_TUNE=0\n'; sn "000f4240 00000009 00002710"; plan
 t "AUTO_SOFTNET_TUNE=0: прежние фиксированные значения" '[ "$(val net.core.netdev_budget)" = 600 ] && [ "$(val net.core.netdev_max_backlog)" = 8192 ]'
 cfg ''

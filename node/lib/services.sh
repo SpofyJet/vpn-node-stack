@@ -141,10 +141,7 @@ node_services_apply() {
         node_svc_mask packagekit.service
     fi
 
-    # irqbalance: конфликтует с нашей IRQ-affinity (перетирает smp_affinity ~каждые 10с)
-    if [ "$(node_conf_get HARDEN_IRQBALANCE 1)" = "1" ]; then
-        node_svc_disable irqbalance.service
-    fi
+    node_svc_irqbalance_apply
 
     # rpcbind: portmapper NFS, лишний listener :111; только если NFS/CIFS маунтов нет
     if [ "$(node_conf_get HARDEN_RPCBIND 1)" = "1" ]; then
@@ -159,11 +156,15 @@ node_services_apply() {
     if [ "$(node_conf_get HARDEN_KDUMP 1)" = "1" ]; then
         node_svc_disable kdump-tools.service kdump.service
         if [ -d /etc/default/grub.d ] || mkdir -p /etc/default/grub.d 2>/dev/null; then
+            # 2026-09-24 (v1.1.6): update-grub (перегенерация grub.cfg + os-prober) — только
+            # если сниппет реально изменился; раньше — на КАЖДОМ apply
+            local kd=/etc/default/grub.d/99-node-no-kdump.cfg kd_before
+            kd_before="$(cat "$kd" 2>/dev/null || true)"
             {
                 echo "# node: снятие crashkernel-резерва kdump (HARDEN_KDUMP=1); эффект после reboot"
                 echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT crashkernel=0M"'
-            } | node_persist /etc/default/grub.d/99-node-no-kdump.cfg
-            if [ "${DRY_RUN:-0}" != "1" ]; then
+            } | node_persist "$kd"
+            if [ "${DRY_RUN:-0}" != "1" ] && [ "$(cat "$kd" 2>/dev/null || true)" != "$kd_before" ]; then
                 command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1 || true
             fi
         fi
@@ -180,13 +181,38 @@ node_services_apply() {
     fi
 }
 
+# node_svc_irqbalance_apply — irqbalance конфликтует с нашей IRQ-affinity (перетирает
+# smp_affinity ~каждые 10с). 2026-09-24 (v1.1.7): отключаем ТОЛЬКО при ENABLE_IRQ_AFFINITY=1.
+# Без ручной affinity irqbalance — единственное, что разводит IRQ многоочередного NIC по
+# ядрам; безусловное отключение оставляло все прерывания на CPU0 (softirq-узкое место).
+# Отключённый прежней версией irqbalance возвращается в исходное состояние.
+node_svc_irqbalance_apply() {
+    if [ "$(node_conf_get HARDEN_IRQBALANCE 1)" = "1" ] && [ "$(node_conf_get ENABLE_IRQ_AFFINITY 0)" = "1" ]; then
+        node_svc_disable irqbalance.service
+    else
+        node_svc_restore irqbalance.service
+    fi
+}
+
 # node_services_rollback — восстановить состояние юнитов из снапшота
 node_services_rollback() {
     [ -f "$NODE_SVC_STATE" ] || return 0
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "services rollback (skipped)"; return 0; }
-    local u en ac cur
+    local u en ac
     while IFS=$'\t' read -r u en ac; do
         [ -n "$u" ] || continue
+        _node_svc_restore_line "$u" "$en" "$ac"
+    done < "$NODE_SVC_STATE"
+    rm -f "$NODE_SVC_STATE"
+    # boot-конфигурация могла измениться (kdump drop-in) — синхронизируем grub
+    command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1 || true
+    ok "services" "состояния сервисов восстановлены"
+}
+
+# _node_svc_restore_line <unit> <enabled-до-node> <active-до-node> — вернуть один юнит
+# (вынесено из node_services_rollback в v1.1.7 для node_svc_restore)
+_node_svc_restore_line() {
+    local u="$1" en="$2" ac="$3" cur
         # снимаем маску ТОЛЬКО если замаскировали мы (до нас юнит не был masked)
         cur="$(systemctl is-enabled "$u" 2>/dev/null || echo '?')"
         if [ "$cur" = "masked" ] && [ "$en" != "masked" ]; then
@@ -211,9 +237,20 @@ node_services_rollback() {
             systemctl stop "$u" >/dev/null 2>&1 \
                 && log info "services" "stopped $u (мы его запускали)" || true
         fi
-    done < "$NODE_SVC_STATE"
-    rm -f "$NODE_SVC_STATE"
-    # boot-конфигурация могла измениться (kdump drop-in) — синхронизируем grub
-    command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1 || true
-    ok "services" "состояния сервисов восстановлены"
+    return 0
+}
+
+# node_svc_restore <unit> — 2026-09-24 (v1.1.7): вернуть юнит, который node отключал прежней
+# версией/настройкой, но больше не должен (исходное состояние из снапшота), и снять с учёта.
+node_svc_restore() {
+    [ -f "$NODE_SVC_STATE" ] || return 0
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    local line rest
+    line="$(awk -F'\t' -v u="$1" '$1 == u { print; exit }' "$NODE_SVC_STATE")"
+    [ -n "$line" ] || return 0
+    local u en ac; IFS=$'\t' read -r u en ac <<< "$line"
+    _node_svc_restore_line "$u" "$en" "$ac"
+    rest="$(mktemp "$NODE_SVC_STATE.XXXXXX")"
+    awk -F'\t' -v u="$1" '$1 != u' "$NODE_SVC_STATE" > "$rest" && mv -f "$rest" "$NODE_SVC_STATE"
+    log info "services" "$u: возвращён в исходное состояние ($en/$ac) — node его больше не отключает"
 }

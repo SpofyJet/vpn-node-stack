@@ -20,24 +20,31 @@
 #   bash <(curl -sL ...) status       # статус (root не нужен)
 #   bash <(curl -sL ...) rollback     # откат (node → shieldnode)
 #
-# Переопределение источника (тесты/зеркала):
+# Какой код исполняется (2026-09-24, v1.1.3):
+#   apply           — качает снапшот и ЗАМЕНЯЕТ установленное дерево (обновление), затем apply;
+#   apply --dry-run — качает во ВРЕМЕННЫЙ каталог, показывает план новой версии, ничего не пишет;
+#   status|detect|guard|emergency|rollback|uninstall — УСТАНОВЛЕННАЯ копия, без сети
+#                     (тот же код, что применял; emergency работает и при лежащей сети).
+#                     Если стек не установлен — временная загрузка, после выхода убирается.
+#
+# Переопределение источника (тесты/зеркала/закрепление версии):
+#   VPN_STACK_REF=v1.1.6 bash <(curl -sL ...)     # тег/ветка/коммит вместо main
 #   VPN_STACK_REPO=Owner/name bash <(curl -sL ...)
 #   VPN_STACK_TARBALL_URL=https://mirror.example.com/repo.tar.gz bash <(curl -sL ...)
 set -euo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 REPO="${VPN_STACK_REPO:-SpofyJet/vpn-node-stack}"
 RAW_BASE="${VPN_STACK_RAW_BASE:-https://raw.githubusercontent.com/$REPO/main}"
-TARBALL_URL="${VPN_STACK_TARBALL_URL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/main}"
-WORK_DIR="${VPN_STACK_WORK_DIR:-/opt/vpn-node-stack}"
-# 2026-09-23: read-only команды без root (status/detect/guard — «root не нужен»)
-# падали на mkdir /opt/vpn-node-stack. Не-root без явного VPN_STACK_WORK_DIR —
-# личный временный каталог (установленную копию в /opt не трогаем).
-if [ "$(id -u)" -ne 0 ] && [ -z "${VPN_STACK_WORK_DIR:-}" ]; then
-    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vpn-node-stack.XXXXXX")"
+# 2026-09-24 (v1.1.3): VPN_STACK_REF — воспроизводимая установка (тег/ветка/коммит).
+# Без него URL прежний (refs/heads/main).
+if [ -n "${VPN_STACK_REF:-}" ]; then
+    case "$VPN_STACK_REF" in *[!A-Za-z0-9._/-]*|*..*) printf 'ОШИБКА: недопустимый VPN_STACK_REF\n' >&2; exit 1 ;; esac
+    TARBALL_URL="${VPN_STACK_TARBALL_URL:-https://codeload.github.com/$REPO/tar.gz/$VPN_STACK_REF}"
+else
+    TARBALL_URL="${VPN_STACK_TARBALL_URL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/main}"
 fi
-NODE_DIR="$WORK_DIR/node"
-SHIELD_DIR="$WORK_DIR/shieldnode"
+WORK_DIR="${VPN_STACK_WORK_DIR:-/opt/vpn-node-stack}"
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
@@ -93,48 +100,76 @@ if [ "$(id -u)" -ne 0 ]; then
     esac
 fi
 
-mkdir -p "$WORK_DIR"
-cd "$WORK_DIR"
+# ---------- откуда брать код ----------
+# 2026-09-24 (v1.1.3): раньше ЛЮБАЯ команда качала свежий main и заменяла установленное
+# дерево: --dry-run писал на диск, status/rollback/uninstall молча обновляли код (boot-
+# юниты node исполняют код из этого дерева — после «status» работала другая версия, чем
+# применённая), emergency без сети не включался. Теперь дерево заменяет только apply.
+installed=0
+[ -f "$WORK_DIR/node/install.sh" ] && [ -f "$WORK_DIR/shieldnode/install.sh" ] && installed=1
+replace_tree=0; need_download=0
+if [ "$CMD" = "apply" ]; then
+    need_download=1
+    [ "$dry" = 1 ] || replace_tree=1
+elif [ "$installed" = 0 ]; then
+    need_download=1
+fi
 
-# ---------- скачивание снапшота ----------
-DL="$(mktemp -d "$WORK_DIR/.dl.XXXXXX")"
-trap 'rm -rf "$DL"' EXIT
-
+RUN_DIR="$WORK_DIR"
+DL=""
+trap 'if [ -n "$DL" ]; then rm -rf "$DL"; fi' EXIT
 say "==> vpn-node-setup v$VERSION"
-say "==> репозиторий: $REPO"
-curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$DL/repo.tar.gz" "$TARBALL_URL" \
-    || die "не удалось скачать снапшот $TARBALL_URL (проверь сеть, имя репозитория и его видимость — приватный repo вернёт 404)"
+if [ "$need_download" = 1 ]; then
+    if [ "$replace_tree" = 1 ]; then
+        mkdir -p "$WORK_DIR"
+        DL="$(mktemp -d "$WORK_DIR/.dl.XXXXXX")"          # та же ФС — mv атомарен
+    else
+        DL="$(mktemp -d "${TMPDIR:-/tmp}/vpn-node-stack.XXXXXX")"   # установку не трогаем
+    fi
+    say "==> репозиторий: $REPO${VPN_STACK_REF:+ @ $VPN_STACK_REF}"
+    curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$DL/repo.tar.gz" "$TARBALL_URL" \
+        || die "не удалось скачать снапшот $TARBALL_URL (проверь сеть, имя репозитория и его видимость — приватный repo вернёт 404)"
 
-# ---------- безопасность архива (до распаковки) ----------
-# Две стадии ДО какого-либо удаления:
-#  1) листинг в файл — битый/оборванный архив отлавливается по коду tar,
-#     а не по ложному «нет совпадений» от grep (и нет гонки SIGPIPE grep -q);
-#  2) проверка путей по готовому листингу.
-LIST="$DL/list.txt"
-if ! tar -tzf "$DL/repo.tar.gz" > "$LIST" 2>/dev/null; then
-    die "снапшот $DL/repo.tar.gz повреждён (скачался не полностью?) — $NODE_DIR и $SHIELD_DIR НЕ тронуты"
-fi
-if grep -qE '(^\.\./|(^|/)\.\.(/|$)|^/)' "$LIST"; then
-    die "снапшот содержит опасные пути (.. или абсолютные) — распаковка отменена"
-fi
+    # ---------- безопасность архива (до распаковки) ----------
+    # Две стадии ДО какого-либо удаления:
+    #  1) листинг в файл — битый/оборванный архив отлавливается по коду tar,
+    #     а не по ложному «нет совпадений» от grep (и нет гонки SIGPIPE grep -q);
+    #  2) проверка путей по готовому листингу.
+    LIST="$DL/list.txt"
+    if ! tar -tzf "$DL/repo.tar.gz" > "$LIST" 2>/dev/null; then
+        die "снапшот $DL/repo.tar.gz повреждён (скачался не полностью?) — установленная копия НЕ тронута"
+    fi
+    if grep -qE '(^\.\./|(^|/)\.\.(/|$)|^/)' "$LIST"; then
+        die "снапшот содержит опасные пути (.. или абсолютные) — распаковка отменена"
+    fi
 
-# ---------- чистая замена (атомарнее: сначала распаковка, потом удаление) ----------
-# Распаковываем во временный подкаталог и проверяем install.sh ДО того,
-# как трогаем старые папки: сбой распаковки оставляет ноду в рабочем виде.
-mkdir -p "$DL/extract"
-tar -xzf "$DL/repo.tar.gz" --strip-components=1 -C "$DL/extract" \
-    || die "распаковка снапшота не удалась — старые $NODE_DIR и $SHIELD_DIR на месте"
-[ -f "$DL/extract/node/install.sh" ]       || die "в снапшоте нет node/install.sh — репозиторий не тот?"
-[ -f "$DL/extract/shieldnode/install.sh" ] || die "в снапшоте нет shieldnode/install.sh — репозиторий не тот?"
-# git-архивы не хранят exec-биты: без этого симлинк guard → main.sh даст
-# "Permission denied" на ноде (инцидент 2026-09-22). Восстанавливаем явно.
-chmod +x "$DL/extract/node/install.sh"       "$DL/extract/node/main.sh"
-chmod +x "$DL/extract/shieldnode/install.sh" "$DL/extract/shieldnode/main.sh"
-rm -rf "$NODE_DIR" "$SHIELD_DIR"
-mv "$DL/extract/node"       "$NODE_DIR"
-mv "$DL/extract/shieldnode" "$SHIELD_DIR"
-rm -rf "$DL"; trap - EXIT
-say "==> распаковано в $WORK_DIR (exec-биты восстановлены)"
+    # Распаковываем во временный подкаталог и проверяем install.sh ДО того,
+    # как трогаем старые папки: сбой распаковки оставляет ноду в рабочем виде.
+    mkdir -p "$DL/extract"
+    tar -xzf "$DL/repo.tar.gz" --strip-components=1 -C "$DL/extract" \
+        || die "распаковка снапшота не удалась — установленная копия на месте"
+    [ -f "$DL/extract/node/install.sh" ]       || die "в снапшоте нет node/install.sh — репозиторий не тот?"
+    [ -f "$DL/extract/shieldnode/install.sh" ] || die "в снапшоте нет shieldnode/install.sh — репозиторий не тот?"
+    # git-архивы не хранят exec-биты: без этого симлинк guard → main.sh даст
+    # "Permission denied" на ноде (инцидент 2026-09-22). Восстанавливаем явно.
+    chmod +x "$DL/extract/node/install.sh"       "$DL/extract/node/main.sh"
+    chmod +x "$DL/extract/shieldnode/install.sh" "$DL/extract/shieldnode/main.sh"
+    if [ "$replace_tree" = 1 ]; then
+        rm -rf "$WORK_DIR/node" "$WORK_DIR/shieldnode"
+        mv "$DL/extract/node"       "$WORK_DIR/node"
+        mv "$DL/extract/shieldnode" "$WORK_DIR/shieldnode"
+        rm -rf "$DL"; DL=""
+        say "==> распаковано в $WORK_DIR (exec-биты восстановлены)"
+    else
+        RUN_DIR="$DL/extract"
+        say "==> временная копия (установка не тронута): $RUN_DIR"
+    fi
+else
+    say "==> установленная копия: $WORK_DIR (без загрузки)"
+fi
+NODE_DIR="$RUN_DIR/node"
+SHIELD_DIR="$RUN_DIR/shieldnode"
+cd "$RUN_DIR"
 
 # ---------- запуск ----------
 # apply:  фаервол ПЕРВЫМ. Принцип «нет фаервола — вообще не начинаем»:

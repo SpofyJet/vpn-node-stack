@@ -61,7 +61,10 @@ shield_health() {
         _h_sum; return 0
     fi
     local pre ch n
-    pre="$(nft -n list chain inet shieldnode prerouting 2>/dev/null || true)"
+    # 2026-09-23 (v1.1.4): без -n — nft 1.0.9 с -n печатает и ct state числами
+    # (0x2,0x4), символьные шаблоны ниже не совпадали: ложные FAIL на живой ноде.
+    # Порты и адреса числовые и без -n (имена сервисов — только с -S, DNS — с -N).
+    pre="$(nft list chain inet shieldnode prerouting 2>/dev/null || true)"
     for ch in prerouting input; do
         if nft list chain inet shieldnode "$ch" >/dev/null 2>&1; then _hc PASS "chain $ch есть"; else _hc FAIL "chain $ch отсутствует"; fi
     done
@@ -210,7 +213,9 @@ shield_status() {
     echo "--- firewall (fact) ---"
     if command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1; then
         echo "table inet shieldnode: present"
-        nft list chains inet shieldnode 2>/dev/null | sed 's/^/  /'
+        # 2026-09-23 (v1.1.4): `nft list chains inet shieldnode` — синтаксическая ошибка
+        # (list chains принимает только family) → под set -e/pipefail status умирал здесь
+        { nft list table inet shieldnode 2>/dev/null || true; } | awk '$1 == "chain" {print "  chain " $2}'
         echo
         echo "sets (elements):"
         local s

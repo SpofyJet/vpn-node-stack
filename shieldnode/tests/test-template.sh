@@ -198,7 +198,9 @@ echo
 t "counters: 27 именованных счётчиков объявлены (23 базовых + spamhaus/cins/amp/icmp)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 27"
 t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
-t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -q 'icmp type echo-request limit rate over 10/second' '$RS'"
+# 2026-09-24 (v1.1.4): backlog #4 — лимит стал per-source (meter по saddr); литерал глобальной
+# формы заменён шаблоном для обеих форм + проверка порядка, обещанного названием проверки
+t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -qE 'icmp type echo-request (meter icmp_echo4 \{ ip saddr )?limit rate over 10/second' '$RS' && awk '/packet-too-big/{p=NR} /echo-request.*limit rate/{if(!l)l=NR} END{exit !(p && l && p<l)}' '$RS'"
 t "counters: КАЖДОЕ drop-правило несёт counter name" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' '$RS') = \$(grep -c 'counter name c_drops_' '$RS')"
 t "counters: scanner/threat/tor/custom v4+v6 имеют свои счётчики" bash -c "grep -q 'c_drops_scanner_v4' '$RS' && grep -q 'c_drops_threat_v6' '$RS' && grep -q 'c_drops_custom_v4' '$RS'"
 t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof (v4+v6)" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS' && grep -q 'c_drops_antispoof_v6' '$RS'"

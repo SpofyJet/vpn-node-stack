@@ -7,6 +7,10 @@ NODE_DEFAULTS="$NODE_DIR/node.defaults.conf"
 
 : "${CONFIG_CACHE:=""}" # path to merged key=value file
 
+# ключ задан оператором ЯВНО (в node.conf, не defaults) — авто-решение не трогает его
+# (2026-09-24, v1.1.7: перенесён из lib/datapath.sh — нужен и irq.sh)
+node_conf_user_set() { [ -f "${NODE_CONFIG:-/etc/node/node.conf}" ] && grep -qE "^$1=" "${NODE_CONFIG:-/etc/node/node.conf}"; }
+
 node_conf_get() {
     # $1=key $2=default. Empty value in config => default (auto semantics).
     # Inline-комментарии после значения отрезаем ("KEY=1 # why" -> "1").
@@ -21,8 +25,14 @@ node_conf_get() {
     if [ -z "$val" ]; then echo "$def"; else echo "$val"; fi
 }
 
+# 2026-09-24 (v1.1.6): временные файлы прогона (кэш конфига, файл плана sysctl) —
+# удаляются на выходе. Раньше не удалялись нигде: каждый status/apply/detect
+# оставлял 1-2 файла в /tmp (живая нода: ~760 за сутки).
+_node_tmp_cleanup() { rm -f "${CONFIG_CACHE:-}" "${NODE_PLAN_FILE:-}" 2>/dev/null || true; }
+
 node_load_config() {
     CONFIG_CACHE="$(mktemp)"
+    trap _node_tmp_cleanup EXIT
     # Порядок важен: awk в node_conf_get берёт ПЕРВОЕ совпадение.
     # Сначала user-конфиг (переопределения), затем defaults (заполнение пустот).
     if [ -f "$NODE_CONFIG" ]; then

@@ -3,6 +3,16 @@
 # Запуск: bash tests/test-services.sh
 set -euo pipefail
 
+# 2026-09-24 (v1.1.5): под root сценарий 9 (node_rt_rollback) писал в НАСТОЯЩИЙ
+# /sys/kernel/mm/transparent_hugepage/enabled (THP -> always; ядро пересчитывает
+# vm.min_free_kbytes) и делал remount настоящего / — найдено на живой ноде.
+# Изоляция: свой mount ns, tmpfs поверх /sys/kernel/mm и /sys/class/net.
+if [ "$(id -u)" -eq 0 ] && [ "${NODE_TEST_IN_NS:-0}" != "1" ] && unshare -m true 2>/dev/null; then
+    NODE_TEST_IN_NS=1 exec unshare -m bash "$0" "$@"
+fi
+if [ "${NODE_TEST_IN_NS:-0}" = "1" ]; then
+    mount -t tmpfs t /sys/kernel/mm; mount -t tmpfs t /sys/class/net
+fi
 NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export NODE_DIR
 export NODE_STATE_DIR="$(mktemp -d /tmp/node-svc-test.XXXXXX)"
@@ -91,6 +101,19 @@ t "откат: re-enabled" bash -c "grep -qx enabled '$NODE_STATE_DIR/mock-units
 t "откат: started (был active)" bash -c "grep -qx active '$NODE_STATE_DIR/mock-units/irqbalance.service'"
 t "снапшот очищен после отката" bash -c "! test -f '$NODE_SVC_STATE'"
 
+# --- сценарий 1b (v1.1.7): irqbalance отключается только при ENABLE_IRQ_AFFINITY=1 ---
+mkunit irqbalance.service enabled active; rm -f "$NODE_SVC_STATE"
+node_svc_irqbalance_apply
+t "дефолт (без IRQ-affinity): irqbalance НЕ отключён" bash -c "grep -qx enabled '$NODE_STATE_DIR/mock-units/irqbalance.service' && grep -qx active '$NODE_STATE_DIR/mock-units/irqbalance.service'"
+printf 'ENABLE_IRQ_AFFINITY=1\n' | cat - "$CONFIG_CACHE" > "$CONFIG_CACHE.1"; cp "$CONFIG_CACHE" "$CONFIG_CACHE.0"; mv "$CONFIG_CACHE.1" "$CONFIG_CACHE"
+node_svc_irqbalance_apply
+t "ENABLE_IRQ_AFFINITY=1: irqbalance отключён" bash -c "grep -qx disabled '$NODE_STATE_DIR/mock-units/irqbalance.service'"
+mv "$CONFIG_CACHE.0" "$CONFIG_CACHE"; printf 'rpcbind.service\tenabled\tactive\n' >> "$NODE_SVC_STATE"
+node_svc_irqbalance_apply
+t "affinity выключена: отключённый ранее irqbalance возвращён (enabled/active)" bash -c "grep -qx enabled '$NODE_STATE_DIR/mock-units/irqbalance.service' && grep -qx active '$NODE_STATE_DIR/mock-units/irqbalance.service'"
+t "снапшот: irqbalance снят с учёта, чужие записи остались" bash -c "! grep -q irqbalance '$NODE_SVC_STATE' && grep -q rpcbind '$NODE_SVC_STATE'"
+rm -f "$NODE_SVC_STATE"
+
 # --- сценарий 2: mask → rollback делает unmask ---
 mkunit rpcbind.service enabled active
 node_svc_mask rpcbind.service
@@ -116,17 +139,19 @@ node_services_rollback
 t "static: откат без enable (static нельзя включать)" bash -c "! grep -q 'enable apt-daily' '$CALLS' || true"
 t "static: снапшот очищен" bash -c "! test -f '$NODE_SVC_STATE'"
 
-# --- сценарий 6: ipv6-план (HARDEN_IPV6=1) добавляет 3 ключа ---
+# --- сценарий 6: ipv6-план ---
+# 2026-09-24 (v1.1.7, решение оператора): дефолт HARDEN_IPV6=1 (IPv6 выключен); включить — явный =0
 source "$NODE_DIR/lib/sysctl.sh"
 node_sysctl_plan_init
 DRY_RUN=1 node_harden_ipv6   # DRY_RUN: probed-пропуск без чтения sysctl
 n_ipv6="$(grep -c 'disable_ipv6' "$NODE_PLAN_FILE" || true)"
-t "HARDEN_IPV6=1: 3 ipv6-ключа в плане" bash -c "[ '$n_ipv6' -eq 3 ]"
-# HARDEN_IPV6=0 → план пуст
-sed -i 's/^HARDEN_IPV6=1$/HARDEN_IPV6=0/' "$CONFIG_CACHE"
+t "дефолт (HARDEN_IPV6=1): 3 ipv6-ключа в плане" bash -c "[ '$n_ipv6' -eq 3 ]"
+# явный =0: строка пользователя идёт в кэш ПЕРВОЙ (first-match)
+sed -i '1i HARDEN_IPV6=0' "$CONFIG_CACHE"
 node_sysctl_plan_init
-node_harden_ipv6
-t "HARDEN_IPV6=0: план без ipv6" bash -c "! grep -q 'disable_ipv6' '$NODE_PLAN_FILE'"
+DRY_RUN=1 node_harden_ipv6
+t "явный HARDEN_IPV6=0: IPv6 не выключается — план без disable_ipv6" bash -c "! grep -q 'disable_ipv6' '$NODE_PLAN_FILE'"
+sed -i '1d' "$CONFIG_CACHE"
 
 # --- сценарий 7: маска-если-выжил (static/dbus resurrection, урок v5.10.3) ---
 mkunit dbus-daemon.service static active
@@ -154,7 +179,11 @@ cat > "$NODE_RT_TWEAKS" <<EOF
 eth0	sysfs	class/net/eth0/gro_flush_timeout	10
 /	mount	/	rw,relatime
 EOF
+# 2026-09-24 (v1.1.5): remount корня — только заглушкой (раньше: настоящий mount -o remount /)
+findmnt() { return 0; }; mount() { echo "mount $*" >> "$NODE_STATE_DIR/mount.calls"; }
 t "rt-откат терпит sysfs/mount (непишемые пути в sandbox)" node_rt_rollback
+t "rt-откат: remount корня ушёл в заглушку, не в систему" grep -q 'remount,rw,relatime /' "$NODE_STATE_DIR/mount.calls"
+unset -f findmnt mount
 
 # --- сценарий 10: fstab-трансформация (fixture, DRY_RUN) ---
 source "$NODE_DIR/persist.sh"   # node_persist fallback (sysctl.sh его больше не несёт)

@@ -14,6 +14,15 @@ SHIELD_BLOCKLIST_STATE=/var/lib/shieldnode/blocklists
 SHIELD_LISTS_DIR=/etc/shieldnode/lists
 SHIELD_BLOCKLIST_OVERRIDE=/etc/shieldnode/blocklist.conf
 
+# shield_blocklist_kick — 2026-09-24 (v1.1.4): первый тик updater'а после apply.
+# Зовётся из main.sh ПОСЛЕДНИМ шагом: lock (fd 9, acquire_lock) снимаем, иначе
+# updater (основной lock неблокирующе) пропускает тик.
+shield_blocklist_kick() {
+    [ "${SHIELD_BL_KICK:-0}" = "1" ] || return 0
+    flock -u 9 2>/dev/null || true
+    systemctl start --no-block shieldnode-blocklist.service 2>/dev/null || true
+}
+
 # shield_blocklist_install — эмитим updater + oneshot-службу + timer; сидим списки.
 shield_blocklist_install() {
     command -v curl >/dev/null 2>&1 || { log warn "blocklist" "нет curl — updater эмитим, но fetch будет неработоспособен"; }
@@ -28,7 +37,7 @@ shield_blocklist_install() {
     [ "$interval" -ge 5 ] || { log warn "blocklist" "интервал $interval мин слишком мал — выставлено 5"; interval=5; }
     [ "$threshold" -ge 1 ] || threshold=3
 
-    local svc_scanner svc_threat svc_tor svc_custom
+    local svc_scanner svc_threat svc_tor
     svc_scanner="$(shield_conf_get BLOCKLIST_SCANNER_URLS "")"
     svc_threat="$(shield_conf_get BLOCKLIST_THREAT_URLS "")"
     svc_tor="$(shield_conf_get BLOCKLIST_TOR_URLS "")"
@@ -161,7 +170,9 @@ mkdir -p "$STATE_DIR" "$(dirname "$BL_LOCK_FILE")" 2>/dev/null || true
 # Если lock-файл недоступен (нет прав/каталога) — info и работаем без него.
 if [ -n "${MAIN_LOCK_FILE:-}" ]; then
     mkdir -p "$(dirname "$MAIN_LOCK_FILE")" 2>/dev/null || true
-    if exec 8>"$MAIN_LOCK_FILE" 2>/dev/null; then
+    # 2026-09-23 (v1.1.4): 2>/dev/null — только на время exec (в группе); у голого
+    # `exec 8>f 2>/dev/null` перенаправление stderr постоянное — ошибки терялись
+    if { exec 8>"$MAIN_LOCK_FILE"; } 2>/dev/null; then
         flock -n 8 2>/dev/null || { bl_log info "main lock занят (apply/rollback) — пропуск тика"; exit 0; }
     else
         bl_log info "main lock $MAIN_LOCK_FILE недоступен — тик без основного lock'а"
@@ -260,8 +271,18 @@ update_list() { # update_list <name>
                     bl_log warn "$name: CROWDSEC_USER/CROWDSEC_PASSWORD не заданы — fetch пропущен"
                     continue
                 fi
+                # 2026-09-24 (v1.1.4): креды — curl-конфигом через stdin (-K -), НЕ в argv
+                # (`-u user:pass` виден в /proc/<pid>/cmdline всем локальным пользователям).
+                # Синтаксис конфига curl: значение в "", экранируем \ и ". Перевод строки
+                # сломал бы конфиг — такие креды отвергаем.
+                local cs_auth="$CROWDSEC_USER:$CROWDSEC_PASSWORD"
+                case "$cs_auth" in *$'\n'*|*$'\r'*)
+                    bl_log warn "$name: CROWDSEC_USER/CROWDSEC_PASSWORD содержат перевод строки — fetch пропущен"
+                    continue ;;
+                esac
+                cs_auth="${cs_auth//\\/\\\\}"; cs_auth="${cs_auth//\"/\\\"}"
                 curl -fsSL --compressed --connect-timeout 10 --max-time 120 \
-                     -u "$CROWDSEC_USER:$CROWDSEC_PASSWORD" -o "$f" "$u" 2>/dev/null || curl_rc=$? ;;
+                     -K - -o "$f" "$u" 2>/dev/null <<< "user = \"$cs_auth\"" || curl_rc=$? ;;
             *)
                 curl -fsSL --connect-timeout 10 --max-time 60 -o "$f" "$u" 2>/dev/null || curl_rc=$? ;;
         esac
@@ -419,63 +440,32 @@ update_list() { # update_list <name>
         fi
     fi
 
-    # 9) swap содержимого сета. Предпочтительно АТОМАРНЫЙ: новое содержимое
-    #    заливается в <set>__next (не прибит к правилам — трафик его не видит),
-    #    затем ОДНА транзакция: delete rule → delete set → rename next→live →
-    #    insert rule на прежнюю позицию. Окно «частично заполненного сета» = 0.
-    #    Fallback (старый nft / нет handle'ов / mixed-version таблица): legacy
-    #    flush+refill одним batch — семантика прежних версий.
-    local rc=0 v6_failed=0
-    local short="$name"
-    case "$set_v4" in tor_exit_*) short="tor" ;; esac
-
-    swap_one() { # swap_one <live_set> <af:4|6> <loadfile> ; 0=ok, 1=fallback-needed
-        local set="$1" af="$2" load="$3"
-        local tmp_set="${set}__next" afword="ip" stype="ipv4_addr" sz _v
-        if [ "$af" = "6" ]; then afword="ip6"; stype="ipv6_addr"; fi
-        _v="BL_SIZE_${name}"; sz="${!_v:-262144}"
-        # 1) tmp-set с теми же свойствами + заливка (окна для трафика нет)
-        {
-            echo "add set inet shieldnode $tmp_set { type $stype; flags interval; auto-merge; size ${sz:-262144}; }"
-            awk -v setname="$tmp_set" '
-                NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet shieldnode %s { ", setname }
-                { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
-                END { print " }" }' "$load"
-        } > "$tmp/swap-fill.$af"
-        if ! nft -c -f "$tmp/swap-fill.$af" >/dev/null 2>"$tmp/swap.$af.err" || ! nft -f "$tmp/swap-fill.$af" 2>>"$tmp/swap.$af.err"; then
-            bl_log error "$name: tmp-set $tmp_set fill failed: $(head -c 300 "$tmp/swap.$af.err")"
-            nft delete set inet shieldnode "$tmp_set" 2>/dev/null || true
+    # 8b) 2026-09-24 (v1.1.4): ёмкость сета (<X>_BLOCKLIST_SIZE, записи после агрегации).
+    #    Больше — nft отверг бы загрузку с малопонятным ENOBUFS/ENFILE; даём внятный warn,
+    #    сет не трогаем (last-known-good). v6 сверх ёмкости — пропускаем только v6.
+    local cap_var="BL_SIZE_${name}" cap load4 load6
+    cap="${!cap_var:-0}"
+    if [[ "$cap" =~ ^[0-9]+$ ]] && [ "$cap" -gt 0 ]; then
+        load4=$(wc -l < "$tmp/load.list"); load4="${load4:-0}"
+        if [ "$load4" -gt "$cap" ]; then
+            bl_log warn "$name: $load4 записей v4 после агрегации > ёмкости сета $cap — set не тронут (увеличь ${name^^}_BLOCKLIST_SIZE)"
+            bump_fail "$name" "$fail_counter"
+            rm -rf "$tmp"
             return 1
         fi
-        # 2) handle drop-правила и позиция следующего правила
-        local listing rule_handle="" pos_handle=""
-        listing="$(nft -a list chain inet shieldnode prerouting 2>/dev/null)" || { nft delete set inet shieldnode "$tmp_set" 2>/dev/null; return 1; }
-        rule_handle="$(printf '%s\n' "$listing" | awk -v pat="$afword saddr @${set} counter" '$0 ~ pat { if (match($0, /# handle [0-9]+/)) { print substr($0, RSTART+9, RLENGTH-9); exit } }')"
-        if [ -z "$rule_handle" ]; then
-            nft delete set inet shieldnode "$tmp_set" 2>/dev/null || true
-            return 1   # правила нет (mixed-version) — legacy refill корректен
+        load6=$(wc -l < "$tmp/load6.list"); load6="${load6:-0}"
+        if [ "$load6" -gt "$cap" ]; then
+            bl_log warn "$name: $load6 записей v6 > ёмкости сета $cap — v6 пропущен"
+            : > "$tmp/load6.list"
         fi
-        pos_handle="$(printf '%s\n' "$listing" | awk -v rh="$rule_handle" '
-            found && match($0, /# handle [0-9]+/) { print substr($0, RSTART+9, RLENGTH-9); exit }
-            $0 ~ ("# handle " rh "$") { found=1 }')"
-        # 3) swap одной транзакцией
-        {
-            echo "delete rule inet shieldnode prerouting handle $rule_handle"
-            echo "delete set inet shieldnode $set"
-            echo "rename set inet shieldnode $tmp_set $set"
-            if [ -n "$pos_handle" ]; then
-                echo "insert rule inet shieldnode prerouting position $pos_handle $afword saddr @$set counter name c_drops_${short}_v${af} drop"
-            else
-                echo "add rule inet shieldnode prerouting $afword saddr @$set counter name c_drops_${short}_v${af} drop"
-            fi
-        } > "$tmp/swap.$af"
-        if nft -c -f "$tmp/swap.$af" >/dev/null 2>"$tmp/swap.$af.err" && nft -f "$tmp/swap.$af" 2>>"$tmp/swap.$af.err"; then
-            return 0
-        fi
-        nft delete set inet shieldnode "$tmp_set" 2>/dev/null || true
-        bl_log warn "$name: atomic swap v$af недоступен ($(head -c 200 "$tmp/swap.$af.err")) — legacy flush+refill"
-        return 1
-    }
+    fi
+
+    # 9) замена содержимого сета: flush + add element ОДНИМ `nft -f` — это одна
+    #    netlink-транзакция, трафик видит либо старое, либо новое содержимое.
+    # 2026-09-23 (v1.1.4): путь «заливка <set>__next + rename set» удалён —
+    #    `rename set` в nft нет (1.0.9: "unexpected set, expecting chain"),
+    #    каждый тик заливал полный __next впустую (+~15с на 200k) и писал warn.
+    local rc=0 v6_failed=0
 
     legacy_refill() { # legacy_refill <set> <loadfile> ; 0=ok
         local set="$1" load="$2"
@@ -484,17 +474,20 @@ update_list() { # update_list <name>
             awk -v setname="$set" '
                 NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet shieldnode %s { ", setname }
                 { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
-                END { print " }" }' "$load"
+                END { if (NR > 0) print " }" }' "$load"
+            # 2026-09-24 (v1.1.4): пустой список — только flush (раньше висячая « }» =
+            # синтакс-ошибка nft, служба падала на каждом тике с пустым custom.txt)
         } > "$tmp/legacy.nft"
         nft -c -f "$tmp/legacy.nft" >/dev/null 2>"$tmp/legacy.err" && nft -f "$tmp/legacy.nft" 2>>"$tmp/legacy.err"
     }
 
     if nft list set $TABLE "$set_v4" >/dev/null 2>&1; then
-        if swap_one "$set_v4" 4 "$tmp/load.list" || legacy_refill "$set_v4" "$tmp/load.list"; then
+        if legacy_refill "$set_v4" "$tmp/load.list"; then
             echo 0 > "$fail_counter"
             rm -f "$STATE_DIR/.alert-$name"
         else
-            bl_log error "$name: nft swap v4 failed"
+            # 2026-09-24 (v1.1.4): причина из stderr nft (после удаления rename-пути не логировалась)
+            bl_log error "$name: nft swap v4 failed: $(tr '\n' ' ' < "$tmp/legacy.err" 2>/dev/null | head -c 300)"
             bump_fail "$name" "$fail_counter"
             rc=1
         fi
@@ -504,9 +497,9 @@ update_list() { # update_list <name>
     fi
 
     if nft list set $TABLE "$set_v6" >/dev/null 2>&1 && [ -s "$tmp/load6.list" ]; then
-        if ! swap_one "$set_v6" 6 "$tmp/load6.list" && ! legacy_refill "$set_v6" "$tmp/load6.list"; then
+        if ! legacy_refill "$set_v6" "$tmp/load6.list"; then
             v6_failed=1
-            bl_log warn "$name: v6 swap failed — v4 не затронут"
+            bl_log warn "$name: v6 swap failed — v4 не затронут: $(tr '\n' ' ' < "$tmp/legacy.err" 2>/dev/null | head -c 300)"
         fi
     fi
 
@@ -735,8 +728,11 @@ EOF
         systemctl enable --now shieldnode-blocklist-custom.path >/dev/null 2>&1 || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist-custom.path не удался"
         # первый запуск неблокирующий: apply уже загрузил пустые сеты, updater
-        # их наполнит в фоне (fetch может идти секунды/минуты на больших листах)
-        systemctl start --no-block shieldnode-blocklist.service 2>/dev/null || true
+        # их наполнит в фоне (fetch может идти секунды/минуты на больших листах).
+        # 2026-09-24 (v1.1.4): НЕ отсюда — здесь apply ещё держит основной lock, и
+        # updater пропускал тик (сеты пустые до таймера, 360 мин). Старт — в
+        # shield_blocklist_kick из main.sh, после снятия lock'а.
+        SHIELD_BL_KICK=1
     fi
     ok "blocklist" "updater+timer installed: $SHIELD_BLOCKLIST_SCRIPT (interval=${interval}m, threshold=$threshold)"
 }

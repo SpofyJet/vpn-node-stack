@@ -76,11 +76,14 @@ shield_detect_protected_ports() {
         xports="$(ss -tulnp 2>/dev/null | _ss_local_ports 'xray|remnanode' | sort -un | tr '\n' ' ' | sed 's/ $//')"
         [ -n "$xports" ] && ports="$ports $xports"
     fi
-    ports="$(echo "$ports" | tr ' ' '\n' | awk 'NF' | sort -un | tr '\n' ' ' | sed 's/ $//')"
-    if [ -z "$ports" ] && [ -s "$SHIELD_PROTECTED_STATE" ]; then
-        ports="$(cat "$SHIELD_PROTECTED_STATE")"
-        log warn "detect" "protected ports auto-detect empty — keep-last-good: $ports"
+    # 2026-09-24 (v1.1.5): keep-last-good по ЧАСТИ xray — SSH-порты в списке есть всегда,
+    # и прежняя проверка «весь список пуст» не срабатывала: apply во время рестарта
+    # xray/remnanode молча выводил VPN-порты из protected_tcp до следующего apply
+    if [ -z "${xports:-}" ] && [ -s "$SHIELD_PROTECTED_STATE" ]; then
+        ports="$ports $(cat "$SHIELD_PROTECTED_STATE")"
+        log warn "detect" "xray/remnanode не слушает TCP — keep-last-good: $(cat "$SHIELD_PROTECTED_STATE")"
     fi
+    ports="$(echo "$ports" | tr ' ' '\n' | awk 'NF' | sort -un | tr '\n' ' ' | sed 's/ $//')"
     [ -n "$ports" ] && echo "$ports" > "$SHIELD_PROTECTED_STATE"
     echo "$ports"
 }

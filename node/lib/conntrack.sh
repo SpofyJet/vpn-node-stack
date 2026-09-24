@@ -8,7 +8,7 @@ node_conntrack_plan() {
     # по MB-порогам (не по node_ram_tier — гранулярность тоньше):
     #   ≤1.2GB → 262144  (~200 юзеров), ≤2.5GB → 786432 (~1500 юзеров),
     #   ≤8.5GB → 1048576 (~3000 юзеров), >8.5GB → 2097152 (~6000 юзеров)
-    # Запись conntrack ≈ 316-320 байт; hashsize = max/4 (netfilter.org).
+    # Запись conntrack ≈ 316-320 байт; hashsize = max (1:1, см. ниже).
     local mb
     mb="$(node_memtotal_mb)"
     if   [ "$mb" -le 1200 ]; then max=262144
@@ -28,7 +28,11 @@ node_conntrack_plan() {
         warn "conntrack" "CONNTRACK_MAX=$max превышает RAM-бюджет (таблица >25% RAM ≈ $ram_cap записей) — clamp до $ram_cap"
         max="$ram_cap"
     fi
-    hashsize=$((max / 4))
+    # 2026-09-24 (v1.1.7): hashsize max/4 -> max. nf_conntrack-sysctl.rst: дефолт ядра
+    # nf_conntrack_max = nf_conntrack_buckets (1:1) — средняя длина цепочки ~1 при полной
+    # таблице; max/4 (совет времён 2.6) давал 4 сравнения на КАЖДЫЙ пакет каждого потока.
+    # Цена — 8 байт на bucket: 786432 -> 6 МиБ против ~240 МиБ самих записей.
+    hashsize="$max"
     loose="$(node_conf_get CONNTRACK_TCP_LOOSE 1)"
 
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_max "$max"
@@ -37,8 +41,9 @@ node_conntrack_plan() {
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_close_wait 30
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_fin_wait 30
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_last_ack 30
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_udp_timeout 180
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_udp_timeout_stream 600
+    # 2026-09-24 (v1.1.7): udp_timeout 180 / udp_timeout_stream 600 убраны — дефолты ядра 30/120
+    # (nf_conntrack-sysctl.rst). Длиннее — только дольше держим мёртвые UDP/QUIC-записи
+    # (idle QUIC ~30с) и unreplied-мусор сканов; истёкший поток shieldnode снова примет как new.
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_generic_timeout 300
     node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_loose "$loose"
     # NOTE: nf_conntrack_helper НЕ пишем в sysctl-файл: этот sysctl зависит от
@@ -71,7 +76,7 @@ node_conntrack_persist() {
     local modprobe_f="/etc/modprobe.d/node-conntrack.conf"
     local modules_f="/etc/modules-load.d/node-conntrack.conf"
     {
-        echo "# node — conntrack hashsize (max/4), managed by node"
+        echo "# node — conntrack hashsize (= nf_conntrack_max), managed by node"
         echo "options nf_conntrack hashsize=${NODE_CONNTRACK_HASHSIZE}"
     } | node_persist "$modprobe_f"
     {

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 node_udp_plan() {
-    local tier rmem wmem udp_mem
+    local tier udp_mem
     tier="$(node_ram_tier)"
     # udp_mem — в СТРАНИЦАХ по 4KB, не в KB! Значения портированы из старого
     # продакшен-стека (vpn-node-setup.sh, v5.1.0 tier-aware; раньше здесь были
@@ -19,6 +19,5 @@ node_udp_plan() {
     # UDP шарит rmem/wmem_max с TCP (net.core.*) — здесь только udp_mem + min
     udp_mem="$(node_conf_get UDP_MEM "$udp_mem")"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_mem "$udp_mem"
-    node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_rmem_min 8192
-    node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_wmem_min 8192
+    # 2026-09-24 (v1.1.7): udp_rmem_min/udp_wmem_min=8192 убраны — без доказанной пользы (дефолт 4096)
 }

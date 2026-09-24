@@ -107,6 +107,15 @@ shield_limits_resolve() {
         # при ЛЮБОМ UDP-inbound xray. Local = первое поле вида адрес:порт.
         det_u="$(ss -ulnp 2>/dev/null | _ss_local_ports 'xray|remnanode' | sort -un | tr '\n' ' ' | sed 's/ $//' || true)"
     fi
+    # 2026-09-24 (v1.1.5): keep-last-good и для UDP (раньше не было вовсе — apply во время
+    # рестарта xray оставлял protected_udp пустым до следующего apply)
+    local ustate="$SHIELD_STATE_DIR/protected-ports-udp.txt"
+    if [ -n "$det_u" ]; then
+        echo "$det_u" > "$ustate" 2>/dev/null || true
+    elif [ -s "$ustate" ]; then
+        det_u="$(cat "$ustate")"
+        log warn "limits" "xray/remnanode не слушает UDP — keep-last-good: $det_u"
+    fi
     local extra_t extra_u
     extra_t="$(shield_conf_get PROTECTED_TCP_EXTRA "")"
     extra_u="$(shield_conf_get PROTECTED_UDP_EXTRA "")"
@@ -220,8 +229,22 @@ shield_abuse_journal_append() {
             # выпадали из журнала (+ двойной list каждого сета).
             out="$(nft list set inet shieldnode "$s" 2>/dev/null)" || continue
             if [[ "$out" == *elements* ]]; then
-                echo "## $s"
-                printf '%s\n' "$out" | grep -A100 'elements = {' | sed -e 's/^elements = {//' -e 's/}.*$//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF'
+                # 2026-09-24 (v1.1.5): nft печатает элементы С ОТСТУПОМ и с метаданными
+                # («\t\telements = { A timeout 1h expires 40m, B ... }»); прежний sed по
+                # `^elements = {` не срабатывал — в журнал шли сырые строки, а grep -A100
+                # молча обрезал сет до ~100 элементов. Теперь: первое слово каждого
+                # элемента; явный предел 100 адресов на сет с честным итогом в заголовке
+                # (журнал пишется каждым apply/cleanup-тиком и ограничен 10000 строк).
+                local addrs total
+                addrs="$(printf '%s\n' "$out" | awk '
+                    /elements = \{/ { f = 1; sub(/.*elements = \{/, "") }
+                    f { e = $0; if (e ~ /\}/) { sub(/\}.*/, "", e); f = 0 }
+                        n = split(e, a, ","); for (i = 1; i <= n; i++) { split(a[i], w, " "); if (w[1] != "") print w[1] } }')"
+                total="$(printf '%s\n' "$addrs" | awk 'NF { n++ } END { print n + 0 }')"
+                if [ "$total" -gt 0 ]; then
+                    if [ "$total" -gt 100 ]; then echo "## $s (первые 100 из $total)"; else echo "## $s"; fi
+                    printf '%s\n' "$addrs" | awk 'NF && ++n <= 100'
+                fi
             fi
         done
     } >> "$SHIELD_ABUSE_JOURNAL"

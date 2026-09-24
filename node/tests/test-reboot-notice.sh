@@ -31,7 +31,7 @@ EOF
 cat > "$OUT/bin/apt-get" <<'EOF'
 #!/bin/sh
 echo "APT-GET $*" >&2; echo "$*" >> "$APTLOG"
-case "$*" in *install*) exit "${FAKE_APT_RC:-0}" ;; esac; exit 0
+case "$*" in *install*) exit "${FAKE_APT_RC:-0}" ;; *update*) exit "${FAKE_APT_UPDATE_RC:-0}" ;; esac; exit 0
 EOF
 printf '#!/bin/sh\necho "-----BEGIN PGP-----"\n' > "$OUT/bin/wget"
 printf '#!/bin/sh\ncat >/dev/null; echo KEY\n' > "$OUT/bin/gpg"
@@ -88,6 +88,15 @@ else
     t "порядок: apt install -> update-grub -> баннер (не утонет в выводе grub)" '[ "${a:-0}" -lt "${g:-0}" ] && [ "${g:-0}" -lt "${b:-0}" ]'
     t "/run/node/reboot-required тоже выставлен (прежнее поведение)" '[ -f /run/node/reboot-required ]'
     t "НИКАКОГО авто-reboot"                                     '[ ! -e "$OUT/reboot.called" ]'
+    # 2026-09-24 (v1.1.6): ключ XanMod — в /etc/apt/keyrings + signed-by (доверие ТОЛЬКО этому репо);
+    # в /etc/apt/trusted.gpg.d он был доверен для ЛЮБОГО репозитория
+    # suite — кодовое имя дистрибутива (прежний `releases` XanMod убрал: 404)
+    t "ключ XanMod: /etc/apt/keyrings, репо с signed-by и suite=VERSION_CODENAME, в trusted.gpg.d ничего" \
+      '[ -s /etc/apt/keyrings/xanmod-archive-keyring.gpg ] && grep -q "^deb \[signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg\] http://deb.xanmod.org $(. /etc/os-release; echo $VERSION_CODENAME) main" /etc/apt/sources.list.d/xanmod-kernel.list && ! ls /etc/apt/trusted.gpg.d/xanmod* >/dev/null 2>&1'
+    # 2026-09-24 (v1.1.6): сбой apt update (нет suite/сеть) — свой репо и ключ убраны,
+    # apt хоста не остаётся с битым источником
+    rm -f "$MK" /run/node/reboot-required; rc=0; FAKE_APT_UPDATE_RC=100 node_xanmod_install > "$OUT/upd.txt" 2>&1 || rc=$?
+    t "сбой apt update: rc 1, репо и ключ XanMod убраны" '[ "$rc" = 1 ] && [ ! -e /etc/apt/sources.list.d/xanmod-kernel.list ] && [ ! -e /etc/apt/keyrings/xanmod-archive-keyring.gpg ]'
     # сбой apt install
     rm -f "$MK" /run/node/reboot-required; rc=0; FAKE_APT_RC=100 node_xanmod_install > "$OUT/fail.txt" 2>&1 || rc=$?
     t "сбой apt install: rc 1, НЕТ маркера и НЕТ баннера"        '[ "$rc" = 1 ] && [ ! -e "$MK" ] && ! grep -q "^>>> XanMod" "$OUT/fail.txt"'

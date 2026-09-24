@@ -42,22 +42,18 @@ elif [ "$tier_mb" -le 4096 ]; then exp_rd=2097152
 else exp_rd=8388608; fi
 
 t "plan: netdev_budget=600" bash -c "grep -q 'net.core.netdev_budget	600' '$PLAN'"
-t "plan: netdev_budget_usecs=8000" bash -c "grep -q 'net.core.netdev_budget_usecs	8000' '$PLAN'"
+t "plan: netdev_budget_usecs=4000 (v1.1.7: пропорционально budget, было 8000)" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
 t "plan: tcp_max_tw_buckets=524288" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	524288' '$PLAN'"
 t "plan: tcp_mem по формуле 25% RAM" bash -c "grep -q \"net.ipv4.tcp_mem	$exp_tcp_mem\" '$PLAN'"
-t "plan: rmem_default tier-aware" bash -c "grep -q \"net.core.rmem_default	$exp_rd\" '$PLAN'"
-t "plan: wmem_default = rmem_default" bash -c "grep -q \"net.core.wmem_default	$exp_rd\" '$PLAN'"
+# 2026-09-24 (v1.1.7): ревизия тюнинга — rmem/wmem_default по умолчанию НЕ пишутся (дефолт ядра)
+t "plan: rmem_default/wmem_default по умолчанию не трогаются" bash -c "! grep -qE 'net.core.[rw]mem_default' '$PLAN'"
 t "plan: dirty_background_bytes=64MB" bash -c "grep -q 'vm.dirty_background_bytes	67108864' '$PLAN'"
 t "plan: dirty_bytes=256MB" bash -c "grep -q 'vm.dirty_bytes	268435456' '$PLAN'"
 t "plan: dirty_ratio ОТСУТСТВУЮТ (bytes перекрывают ratio)" bash -c "! grep -qE 'vm.dirty_background_ratio|vm.dirty_ratio	' '$PLAN'"
-t "plan: rmem_default идёт в BASE-файл" bash -c "grep -q \"net.core.rmem_default	$exp_rd	$NODE_SYSCTL_BASE\" '$PLAN'"
 t "plan: dirty_bytes идут в MEM-файл (84)" bash -c "grep -q \"vm.dirty_bytes	268435456	$NODE_SYSCTL_MEM\" '$PLAN'"
-t "plan: plb probed (DRY_RUN добавляет)" bash -c "grep -q 'net.ipv4.tcp_plb_enabled	1' '$PLAN'"
-if [ "$tier_mb" -le 4096 ]; then
-    t "plan: overcommit_memory=1 на tier<=4GB" bash -c "grep -q 'vm.overcommit_memory	1' '$PLAN'"
-else
-    t "plan: overcommit_memory НЕ ставится на крупных нодах" bash -c "! grep -q 'vm.overcommit_memory' '$PLAN'"
-fi
+# 2026-09-24 (v1.1.7): ревизия тюнинга — tcp_plb_enabled (нужен PLB-capable CC, IPv4 no-op) и overcommit_memory убраны
+t "plan: tcp_plb_enabled отсутствует" bash -c "! grep -q 'tcp_plb_enabled' '$PLAN'"
+t "plan: overcommit_memory не ставится (любой tier)" bash -c "! grep -q 'vm.overcommit_memory' '$PLAN'"
 t "plan: busy_poll НЕТ по умолчанию" bash -c "! grep -q 'busy_poll' '$PLAN'"
 
 # --- ENABLE_DATAPATH=0 гасит всё ---
@@ -76,6 +72,7 @@ sed -i 's/^ENABLE_BUSY_POLL=.*/ENABLE_BUSY_POLL=0/' "$CONFIG_CACHE"
 sed -i -e 's/^NETDEV_BUDGET=.*/NETDEV_BUDGET=900/'        -e 's/^TCP_MAX_TW_BUCKETS=.*/TCP_MAX_TW_BUCKETS=1048576/'        -e 's/^TCP_MEM_PCT=.*/TCP_MEM_PCT=30/' "$CONFIG_CACHE"
 replan
 t "оверрайд: NETDEV_BUDGET=900" bash -c "grep -q 'net.core.netdev_budget	900' '$PLAN'"
+t "оверрайд: usecs следует за budget 900 -> 6000" bash -c "grep -q 'net.core.netdev_budget_usecs	6000' '$PLAN'"
 t "оверрайд: TW_BUCKETS=1048576" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	1048576' '$PLAN'"
 m30=$(( pages * 30 / 100 ))
 exp30="$((m30*3/4)) $((m30*7/8)) $m30"
@@ -105,15 +102,15 @@ node_persist() { local dst="$1"   # persist sysctl.sh DRY_RUN-aware — подм
 node_fq_tune_apply
 t "fq: юнит эмитирован" test -f "$OUT/etc/systemd/system/node-fq-tune.service"
 t "fq: скрипт эмитирован и валиден" bash -n "$OUT/usr/local/sbin/node-fq-tune.sh"
-t "fq: значения по умолчанию в скрипте" bash -c "grep -q '^LIM=100000' '$OUT/usr/local/sbin/node-fq-tune.sh' && grep -q '^FL=1000' '$OUT/usr/local/sbin/node-fq-tune.sh' && grep -q '^BKT=32768' '$OUT/usr/local/sbin/node-fq-tune.sh'"
+t "fq: значения по умолчанию в скрипте" bash -c "grep -q '^LIM=100000' '$OUT/usr/local/sbin/node-fq-tune.sh' && grep -qx 'FL=100' '$OUT/usr/local/sbin/node-fq-tune.sh' && grep -q '^BKT=32768' '$OUT/usr/local/sbin/node-fq-tune.sh'"
 t "fq: парсер root и child fq-инстансов" bash -c "grep -q 'parent' '$OUT/usr/local/sbin/node-fq-tune.sh' && grep -q 'root' '$OUT/usr/local/sbin/node-fq-tune.sh'"
 t "fq: юнит ссылается на production-путь скрипта" grep -q "ExecStart=/usr/local/sbin/node-fq-tune.sh" "$OUT/etc/systemd/system/node-fq-tune.service"
 
 # --- fq tune против фейкового tc (live-путь логики скрипта) ---
 : > /tmp/node-dp-test/tc.log
 FAKE_TC_LOG=/tmp/node-dp-test/tc.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin/node-fq-tune.sh"
-t "fq: root-инстанс изменён (limit/buckets)" bash -c "grep -q 'dev eth0 root fq limit 100000 flow_limit 1000 buckets 32768' /tmp/node-dp-test/tc.log"
-t "fq: mq-child изменён через parent/handle" bash -c "grep -q 'dev eth0 parent 1:1 handle 10: fq limit 100000 flow_limit 1000 buckets 32768' /tmp/node-dp-test/tc.log"
+t "fq: root-инстанс изменён (limit/buckets)" bash -c "grep -q 'dev eth0 root fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc.log"
+t "fq: mq-child изменён через parent/handle" bash -c "grep -q 'dev eth0 parent 1:1 handle 10: fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc.log"
 
 # --- fq tune: ENABLE_FQ_TUNE=0 гасит эмиссию ---
 sed -i 's/^ENABLE_FQ_TUNE=.*/ENABLE_FQ_TUNE=0/' "$CONFIG_CACHE"

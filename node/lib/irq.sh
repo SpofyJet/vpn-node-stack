@@ -1,6 +1,6 @@
 #!/bin/bash
 # node — lib/irq.sh: §13 RSS/RPS/XPS — диагностика обязательна, изменения opt-in.
-# Без произвольного пиннинга. RFS не реализуется. irqbalance не трогаем.
+# Без произвольного пиннинга. RFS не реализуется. RPS — по умолчанию при queues < cpus (v1.1.7).
 set -euo pipefail
 
 # node_cpumask_hex <mask> — cpumask для rps_cpus/xps_cpus в формате ядра.
@@ -14,11 +14,38 @@ node_cpumask_hex() {
     if [ "$hi" -eq 0 ]; then printf '%x' "$lo"; else printf '%x,%08x' "$hi" "$lo"; fi
 }
 
+# node_rps_mask <ifname> <rx-очередей> <cpus> — 2026-09-24 (v1.1.7): битмаска rps_cpus (десятичная).
+# По Documentation/networking/scaling.rst: CPU того же NUMA-узла, что и NIC
+# (/sys/class/net/<if>/device/numa_node; -1/нет файла — все CPU), и без CPU 0..queues-1,
+# обычно обслуживающих прерывания очередей («at high interrupt rate, it might be wise to
+# exclude the interrupting CPU»). Если после исключения пусто — берём NUMA-локальные целиком.
+# CAP=64: одно hex-слово на группу — node_cpumask_hex покрывает только CPU 0..63.
+node_rps_mask() {
+    local ifname="$1" queues="$2" cpus="$3" sr="${NODE_SYS_ROOT:-/sys}" eff numa list part a b c local_m=0 mask
+    eff=$cpus; [ "$eff" -gt 64 ] && eff=64
+    numa="$(cat "$sr/class/net/$ifname/device/numa_node" 2>/dev/null || echo -1)"
+    list=""
+    [[ "$numa" =~ ^[0-9]+$ ]] && list="$(cat "$sr/devices/system/node/node$numa/cpulist" 2>/dev/null || true)"
+    if [ -n "$list" ]; then
+        for part in ${list//,/ }; do
+            a="${part%-*}"; b="${part#*-}"
+            [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || continue
+            for ((c=a; c<=b && c<eff; c++)); do local_m=$((local_m | 1 << c)); done
+        done
+    fi
+    [ "$local_m" -ne 0 ] || for ((c=0; c<eff; c++)); do local_m=$((local_m | 1 << c)); done
+    mask=$local_m
+    for ((c=0; c<queues && c<eff; c++)); do mask=$((mask & ~(1 << c))); done
+    [ "$mask" -ne 0 ] || mask=$local_m
+    echo "$mask"
+}
+
 node_irq_diag() {
     local ifname queues cpus
     ifname="$(node_default_iface)"
     [ -z "$ifname" ] && return 0
-    queues="$(ls -d "/sys/class/net/$ifname/queues/rx-"* 2>/dev/null | wc -l)"
+    # 2026-09-24 (v1.1.6): `{ ls || true; }` — без rx-* ls rc=2 под pipefail ронял присваивание
+    queues="$( { ls -d "/sys/class/net/$ifname/queues/rx-"* 2>/dev/null || true; } | wc -l)"
     cpus="$(node_cpu_count)"
     log info "irq" "iface=$ifname hw_queues=$queues cpus=$cpus rps_maps=$(cat /sys/class/net/$ifname/queues/rx-*/rps_cpus 2>/dev/null | tr '\n' ' ')"
     if [ "$(node_conf_get ENABLE_RSS_BALANCE 0)" = "1" ] && systemctl is-active --quiet irqbalance 2>/dev/null; then
@@ -33,7 +60,7 @@ node_irq_apply() {
     [ -z "$ifname" ] && return 0
     # 2026-09-23 (v1.1.3): без rx-* каталогов ls -> rc 2, под pipefail присваивание
     # падало и set -e обрывал ВЕСЬ irq_apply (RSS/RPS/XPS) — считаем 0 очередей
-    queues="$( { ls -d "/sys/class/net/$ifname/queues/rx-"* 2>/dev/null || true; } | wc -l)"
+    queues="$( { ls -d "${NODE_SYS_ROOT:-/sys}/class/net/$ifname/queues/rx-"* 2>/dev/null || true; } | wc -l)"
     cpus="$(node_cpu_count)"
 
     if [ "$(node_conf_get ENABLE_RSS_BALANCE 0)" = "1" ]; then
@@ -52,28 +79,27 @@ node_irq_apply() {
         fi
     fi
 
-    if [ "$(node_conf_get ENABLE_RPS 0)" = "1" ]; then
-        if [ "$queues" -lt "$cpus" ]; then
-            local mask q i qn orig eff
-            # rps_cpus = все CPU кроме обслуживающих очереди 0..queues-1.
-            # CAP=64: одно hex-слово rps_cpus покрывает только CPU 0..63
-            # (на >64 ядрах нужен multi-word формат — node его не генерирует,
-            # это территория irqbalance/NUMA-пиннинга; лучше честный cap с
-            # предупреждением, чем молчаливо неверный битмап).
-            eff=$cpus; [ "$eff" -gt 64 ] && eff=64
+    # 2026-09-24 (v1.1.7): RPS по умолчанию (ENABLE_RPS=1) — только когда RX-очередей меньше,
+    # чем CPU (типичный virtio-net VPS: 1 очередь на 2-8 vCPU — весь стек UDP/TCP на одном ядре).
+    # При queues >= cpus RSS уже раскладывает по ядрам и RPS избыточен (scaling.rst) — пропуск.
+    # Маска — node_rps_mask (NUMA-локальные CPU, без обслуживающих очереди).
+    if [ "$(node_conf_get ENABLE_RPS 1)" = "1" ]; then
+        if [ "$queues" -ge 1 ] && [ "$queues" -lt "$cpus" ]; then
+            local mask q qn orig sr="${NODE_SYS_ROOT:-/sys}"
             [ "$cpus" -gt 64 ] && warn "irq" "CPUs=$cpus > 64 — rps_cpus/xps_cpus ограничены первыми 64 ядрами (multi-word cpumask node не генерирует; используй irqbalance)"
-            mask=0
-            for ((i=queues; i<eff; i++)); do mask=$((mask | 1 << i)); done
-            for q in /sys/class/net/"$ifname"/queues/rx-*; do
+            mask="$(node_rps_mask "$ifname" "$queues" "$cpus")"
+            for q in "$sr"/class/net/"$ifname"/queues/rx-*; do
                 qn="$(basename "$q")"
                 orig="$(cat "$q/rps_cpus" 2>/dev/null || echo 0)"
                 if node_cpumask_hex "$mask" > "$q/rps_cpus" 2>/dev/null; then
                     node_rt_record "$ifname" rps "$qn" "$orig"
                 fi
             done
-            ok "irq" "RPS applied mask=$(node_cpumask_hex "$mask") (persist после reboot не делаем; rollback — из реестра)"
+            ok "irq" "RPS applied mask=$(node_cpumask_hex "$mask") (queues=$queues < cpus=$cpus; rollback — из реестра)"
+        elif node_conf_user_set ENABLE_RPS; then
+            warn "irq" "RPS: queues($queues) >= cpus($cpus) — RSS уже раскладывает по ядрам, RPS не применяется"
         else
-            warn "irq" "RPS: queues($queues) >= cpus($cpus) — по правилам §13 RPS не применяется"
+            log info "irq" "RPS: queues($queues) >= cpus($cpus) — не нужен (RSS), пропуск"
         fi
     fi
 

@@ -45,8 +45,36 @@ shield_persist_stream() {
         return 0
     fi
     shield_origin_record "$dst"
-    backup "$dst"
-    atomic_write "$dst" "$mode"
+    # 2026-09-24 (v1.1.5): содержимое не изменилось — не переписываем и НЕ бэкапим.
+    # Раньше каждый apply/rt-reapply делал .pre-shieldnode-* с идентичной копией: при
+    # BACKUP_KEEP=5 пять повторных apply вытесняли все значимые старые версии.
+    local _new
+    mkdir -p -- "$(dirname "$dst")" 2>/dev/null || true
+    _new="$(mktemp "$(dirname "$dst")/.shieldnode-new.XXXXXX")" || die "mktemp failed for $dst"
+    cat > "$_new"
+    if [ -f "$dst" ] && [ ! -L "$dst" ] && cmp -s "$_new" "$dst"; then
+        rm -f "$_new"
+        chmod "$mode" "$dst" 2>/dev/null || true
+        shield_manifest_record "$dst"
+        log info "persist" "$dst (без изменений)"
+        return 0
+    fi
+    # 2026-09-24 (v1.1.4): logrotate (и apt) читают ВСЕ файлы своих .d-каталогов — бэкап рядом с
+    # СВОИМ (created) файлом logrotate принимал за второй конфиг: «duplicate log entry»,
+    # rc=1. Исходное состояние такого файла — «отсутствует» (реестр происхождения;
+    # rollback его удаляет), рядом-бэкапы не нужны — не кладём и убираем прежние.
+    # Чужие (существовавшие до нас) файлы бэкапятся как раньше.
+    case "$dst" in
+        /etc/logrotate.d/*|/etc/apt/apt.conf.d/*)
+            if awk -F'\t' -v p="$dst" '$1==p && $2=="created"{f=1} END{exit !f}' "$SHIELD_STATE_DIR/file-origins.tsv" 2>/dev/null; then
+                rm -f -- "$dst".pre-shieldnode-* 2>/dev/null || true
+            else
+                backup "$dst"
+            fi ;;
+        *) backup "$dst" ;;
+    esac
+    atomic_write "$dst" "$mode" < "$_new"
+    rm -f "$_new"
     shield_manifest_record "$dst"
     ok "persist" "$dst"
 }

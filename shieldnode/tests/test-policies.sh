@@ -7,20 +7,30 @@ if [ "$(id -u)" -ne 0 ]; then echo "SKIP: нужен root"; exit 77; fi
 command -v nft >/dev/null 2>&1 || { echo "SKIP: нет nft"; exit 77; }
 command -v ip  >/dev/null 2>&1 || { echo "SKIP: нет ip"; exit 77; }
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: нет python3 (нужен listener)"; exit 77; }
+# 2026-09-24 (v1.1.4): «хостовая» сторона veth (и 10.77.0.1/24) создавалась в НАСТОЯЩЕМ
+# netns хоста — на живой ноде это udev net-add (node rt-reapply) и чужой адрес на хосте.
+# Теперь весь тест — в своём netns (`unshare -mn`, tmpfs над /run для ip netns).
+if [ "${SHIELD_TEST_IN_NS:-0}" != "1" ] && unshare -mn true 2>/dev/null; then
+    SHIELD_TEST_IN_NS=1 exec unshare -mn bash "$0" "$@"
+fi
+if [ "${SHIELD_TEST_IN_NS:-0}" = "1" ]; then mount -t tmpfs t /run; ip link set lo up; fi
 
 SHIELD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NS=shieldtest$$
+# 2026-09-23 (v1.1.4): имя veth ≤15 символов (IFNAMSIZ) — "veth-shieldtest<pid>b"
+# не создавался никогда, и тест всегда уходил в ложный SKIP "нет прав на veth"
+VA="sv$$a" VB="sv$$b"
 cleanup() { ip netns del "$NS" 2>/dev/null || true; rm -f /tmp/shieldtest-ruleset.nft; }
 trap cleanup EXIT
 
 ip netns add "$NS"
 ip -n "$NS" link set lo up
-ip link add "veth-${NS}a" type veth peer name "veth-${NS}b" || { echo "SKIP: нет прав на veth"; exit 77; }
-ip link set "veth-${NS}b" netns "$NS"
-ip addr add 10.77.0.1/24 dev "veth-${NS}a"
-ip -n "$NS" addr add 10.77.0.2/24 dev "veth-${NS}b"
-ip link set "veth-${NS}a" up
-ip -n "$NS" link set "veth-${NS}b" up
+ip link add "$VA" type veth peer name "$VB" || { echo "SKIP: нет прав на veth"; exit 77; }
+ip link set "$VB" netns "$NS"
+ip addr add 10.77.0.1/24 dev "$VA"
+ip -n "$NS" addr add 10.77.0.2/24 dev "$VB"
+ip link set "$VA" up
+ip -n "$NS" link set "$VB" up
 
 # ruleset с заниженным TCP_NEW_RATE=20/min для триггера за разумное время
 export SHIELD_VERSION=1.0.0
@@ -41,6 +51,11 @@ export SH_R_SSH_ABUSERS_TIMEOUT=3600 SH_R_SSH_ABUSERS_SIZE=65536
 export SH_R_TCP_ABUSERS_TIMEOUT=900 SH_R_TCP_ABUSERS_SIZE=131072
 export SH_R_UDP_ABUSERS_TIMEOUT=900 SH_R_UDP_ABUSERS_SIZE=65536
 export SH_R_TEMP_BLOCKLIST_TIMEOUT=3600 SH_R_TEMP_BLOCKLIST_SIZE=32768
+# 2026-09-23 (v1.1.4): переменные, которые рендерер требует с v1.1.x (иначе unbound)
+export SH_F_ENABLE_BLOCKLISTS=0
+export SH_R_SCANNER_BLOCKLIST_SIZE=262144 SH_R_THREAT_BLOCKLIST_SIZE=131072 SH_R_TOR_BLOCKLIST_SIZE=16384
+export SH_R_CUSTOM_BLOCKLIST_SIZE=65536 SH_R_SPAMHAUS_BLOCKLIST_SIZE=8192 SH_R_CINS_BLOCKLIST_SIZE=65536
+export SH_R_CROWDSEC_BLOCKLIST_SIZE=262144
 
 bash -c "source '$SHIELD_DIR/lib/nft.sh'; shield_nft_build_ruleset" > /tmp/shieldtest-ruleset.nft
 
@@ -71,6 +86,9 @@ t "абьюзер 10.77.0.1 попал в tcp_abusers" bash -c "ip netns exec $N
 t "после бана connect с того же src НЕ проходит" bash -c '! timeout 3 bash -c "exec 3<>/dev/tcp/10.77.0.2/80" 2>/dev/null'
 
 # temporary_blocklist: ручной бан + снятие
+# 2026-09-23 (v1.1.4): снимаем бан из шага выше — иначе src остаётся в tcp_abusers
+# (15m) и проверка «снятие бана» не может пройти независимо от temporary_blocklist
+ip netns exec "$NS" nft delete element inet shieldnode tcp_abusers "{ 10.77.0.1 }"
 ip netns exec "$NS" nft add element inet shieldnode temporary_blocklist "{ 10.77.0.1 }"
 t "temporary_blocklist банит (дроп)" bash -c '! timeout 3 bash -c "exec 3<>/dev/tcp/10.77.0.2/80" 2>/dev/null'
 ip netns exec "$NS" nft delete element inet shieldnode temporary_blocklist "{ 10.77.0.1 }"

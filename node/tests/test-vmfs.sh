@@ -15,6 +15,8 @@ LOG_LEVEL=info
 
 rm -rf /tmp/node-vmfs-test
 mkdir -p "$NODE_STATE_DIR" "$NODE_DIAG_DIR" "$NODE_PROFILE_DIR"
+# базовое (до node) min_free_kbytes — фикстура реестра, чтобы план не зависел от хоста
+printf 'vm.min_free_kbytes\t11264\n' > "$NODE_STATE_DIR/sysctl-orig.tsv"
 
 source "$NODE_DIR/lib/common.sh"
 source "$NODE_DIR/config.sh"
@@ -55,8 +57,16 @@ replan
 
 t "T1: swappiness=20"            bash -c "grep -q 'vm.swappiness	20' '$PLAN'"
 t "T1: min_free_kbytes=32768"    bash -c "grep -q 'vm.min_free_kbytes	32768' '$PLAN'"
-t "T1: vfs_cache_pressure=150"   bash -c "grep -q 'vm.vfs_cache_pressure	150' '$PLAN'"
-t "T1: overcommit_memory=1"      bash -c "grep -q 'vm.overcommit_memory	1' '$PLAN'"
+# 2026-09-24 (v1.1.7): ревизия тюнинга — vfs_cache_pressure/overcommit на T1 убраны
+# 2026-09-24 (v1.1.7): min_free_kbytes только повышается — ядро (THP) уже держит 45056 > tier
+printf 'vm.min_free_kbytes\t45056\n' > "$NODE_STATE_DIR/sysctl-orig.tsv"; replan
+t "T1, база ядра 45056 > tier: min_free_kbytes НЕ пишется (не понижаем)" bash -c "! grep -q 'vm.min_free_kbytes' '$PLAN'"
+cp "$CONFIG_CACHE" "$CONFIG_CACHE.orig"; printf 'VM_MIN_FREE_KBYTES=24576\n' > /tmp/node-vmfs-test/node.conf
+cat /tmp/node-vmfs-test/node.conf "$CONFIG_CACHE.orig" > "$CONFIG_CACHE"; NODE_CONFIG=/tmp/node-vmfs-test/node.conf replan
+t "явный VM_MIN_FREE_KBYTES оператора соблюдается (даже ниже базы)" bash -c "grep -q 'vm.min_free_kbytes	24576' '$PLAN'"
+mv "$CONFIG_CACHE.orig" "$CONFIG_CACHE"; printf 'vm.min_free_kbytes\t11264\n' > "$NODE_STATE_DIR/sysctl-orig.tsv"; replan
+t "T1: vfs_cache_pressure не пишется" bash -c "! grep -q 'vm.vfs_cache_pressure' '$PLAN'"
+t "T1: overcommit_memory не пишется"  bash -c "! grep -q 'vm.overcommit_memory' '$PLAN'"
 
 # ============ TIER 4 (16GB) ============
 export NODE_PROC_MEMINFO="$MEMINFO_T4"
@@ -71,10 +81,36 @@ t "T4: overcommit_memory НЕ пишется"  bash -c "! grep -q 'vm.overcommit
 t "vm: dirty_background_bytes=64MB" bash -c "grep -q 'vm.dirty_background_bytes	67108864' '$PLAN'"
 t "vm: dirty_bytes=256MB"           bash -c "grep -q 'vm.dirty_bytes	268435456' '$PLAN'"
 t "vm: dirty_ratio ОТСУТСТВУЮТ"     bash -c "! grep -qE 'vm.dirty_background_ratio|vm.dirty_ratio	' '$PLAN'"
-t "vm: watermark_boost_factor=0"    bash -c "grep -q 'vm.watermark_boost_factor	0' '$PLAN'"
-t "vm: page-cluster=0"              bash -c "grep -q 'vm.page-cluster	0' '$PLAN'"
+# 2026-09-24 (v1.1.7): ревизия тюнинга — watermark_boost_factor/page-cluster/max_map_count убраны
+t "vm: watermark_boost_factor/page-cluster/max_map_count не пишутся" bash -c "! grep -qE 'vm.watermark_boost_factor|vm.page-cluster|vm.max_map_count' '$PLAN'"
 t "vm: блок идёт в MEM-файл (84)"   bash -c "grep -q \"vm.dirty_bytes	268435456	$NODE_SYSCTL_MEM\" '$PLAN'"
-t "fs: file-max=2097152"            bash -c "grep -q 'fs.file-max	2097152' '$PLAN'"
+# 2026-09-24 (v1.1.6): было «fs: file-max=2097152» безусловно — закрепляло ПОНИЖЕНИЕ
+# (дефолт ядер 5.x+ ~2^63). Теперь только повышение: проверяем обе ветки на фикстуре.
+# 2026-09-24 (v1.1.7): убранные из дефолта ключи по-прежнему задаются ЯВНО в node.conf
+knob_plan() {
+    ( T=/tmp/node-vmfs-test/knob; mkdir -p "$T"
+      printf 'VM_OVERCOMMIT=2\nNET_RMEM_DEFAULT=1048576\n' > "$T/node.conf"
+      export NODE_CONFIG="$T/node.conf" CONFIG_CACHE="$T/cache"
+      { cat "$T/node.conf"; grep -E '^[A-Za-z_]+=' "$NODE_DIR/node.defaults.conf"; } > "$CONFIG_CACHE"
+      NODE_PLAN_FILE=""; node_sysctl_plan_init
+      NODE_PROC_MEMINFO="$MEMINFO_T4" node_datapath_plan >/dev/null 2>&1
+      cat "$NODE_PLAN_FILE"; rm -f "$NODE_PLAN_FILE" )
+}
+KP="$(knob_plan)"
+t "явные VM_OVERCOMMIT/NET_RMEM_DEFAULT в node.conf — применяются" \
+  bash -c "grep -q 'vm.overcommit_memory	2' <<<'$KP' && grep -q 'net.core.rmem_default	1048576' <<<'$KP'"
+
+fm_plan() { # fm_plan <базовое fs.file-max> -> строка fs.file-max из плана (или пусто)
+    ( export NODE_PROC_ROOT=/tmp/node-vmfs-test/fmroot; mkdir -p "$NODE_PROC_ROOT/sys/fs"
+      echo "$1" > "$NODE_PROC_ROOT/sys/fs/file-max"
+      NODE_PLAN_FILE=""; node_sysctl_plan_init   # свой файл плана — основной $PLAN не трогаем
+      NODE_PROC_MEMINFO="$MEMINFO_T4" node_datapath_plan >/dev/null 2>&1
+      grep 'fs.file-max' "$NODE_PLAN_FILE" || true; rm -f "$NODE_PLAN_FILE" )
+}
+t "fs: file-max не понижается (базовое 9223372036854775807 -> ключа нет в плане)" \
+  bash -c "[ -z '$(fm_plan 9223372036854775807)' ]"
+t "fs: file-max повышается на старых ядрах (базовое 400000 -> 2097152)" \
+  bash -c "[[ '$(fm_plan 400000)' == fs.file-max*2097152* ]]"
 t "fs: inotify.max_user_watches=524288"   bash -c "grep -q 'fs.inotify.max_user_watches	524288' '$PLAN'"
 t "fs: inotify.max_user_instances=8192"   bash -c "grep -q 'fs.inotify.max_user_instances	8192' '$PLAN'"
 t "fs: inotify.max_queued_events=65536"   bash -c "grep -q 'fs.inotify.max_queued_events	65536' '$PLAN'"

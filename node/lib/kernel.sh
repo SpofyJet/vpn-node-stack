@@ -1,11 +1,15 @@
 #!/bin/bash
 # node — lib/kernel.sh: BBR + (опц.) XanMod-ядро. Требование: авто-BBR когда ядро
-# умеет; замена ядра — только явным ENABLE_XANMOD=1 (одна строчка в конфиге).
+# умеет; XanMod — ENABLE_XANMOD=1 (с 2026-09-24, v1.1.6 — ПО УМОЛЧАНИЮ, решение оператора).
 # Никогда не ребутаем сами; откат ядра — restore grub-файла + purge (документирован).
 set -euo pipefail
 
 XANMOD_REPO_LIST=/etc/apt/sources.list.d/xanmod-kernel.list
-XANMOD_GPG=/etc/apt/trusted.gpg.d/xanmod-kpg.gpg
+# 2026-09-24 (v1.1.6): ключ — в /etc/apt/keyrings + signed-by в строке репо (доверие только
+# репозиторию XanMod, как в официальной инструкции). В /etc/apt/trusted.gpg.d ключ был
+# доверен для ЛЮБОГО репозитория; прежний путь убираем при установке/удалении.
+XANMOD_GPG=/etc/apt/keyrings/xanmod-archive-keyring.gpg
+XANMOD_GPG_LEGACY=/etc/apt/trusted.gpg.d/xanmod-kpg.gpg
 
 node_kernel_is_xanmod() { uname -r | grep -qi xanmod; }
 
@@ -21,10 +25,14 @@ node_kernel_version_ge() {
     [ "$cur_maj" -eq "$want_maj" ] && [ "$cur_min" -ge "$want_min" ]
 }
 
-# node_bbr_generation — "3" если ядро >= 6.15 (BBRv3 в мейнлайне), иначе "1".
-# XanMod также шлёт BBRv3, но здесь речь только о stock-ядре.
+# node_bbr_generation — "3" если модуль tcp_bbr ядра — BBRv3, иначе "1".
+# 2026-09-24 (v1.1.7): раньше «ядро >= 6.15 -> BBRv3 в мейнлайне» — ЛОЖНО: мейнлайн
+# (torvalds/master, 7.3-rc) содержит BBRv1 (tcp_bbr.c без inflight_lo и без версии).
+# BBRv3 — патчсет Google, который несут XanMod и др.; признак — `modinfo -F version
+# tcp_bbr` = 3 (XanMod 6.18: builtin, version 3; стоковое 6.8: поля нет).
 node_bbr_generation() {
-    node_kernel_version_ge 6 15 && echo 3 || echo 1
+    local v; v="$(modinfo -F version tcp_bbr 2>/dev/null | head -1 || true)"
+    if [ "$v" = 3 ] || node_kernel_is_xanmod; then echo 3; else echo 1; fi
 }
 
 # node_bbr_available — 0 если модуль tcp_bbr загружен/загружаем и доступен.
@@ -58,16 +66,13 @@ node_bbr_plan() {
             } | node_persist /etc/modules-load.d/tcp_bbr.conf
         fi
         if [ "$(node_bbr_generation)" = "3" ]; then
-            log info "kernel" "BBRv3 доступен (мейнлайн >=6.15) — план: congestion_control=bbr, qdisc=fq"
+            log info "kernel" "BBRv3 доступен (tcp_bbr version 3) — план: congestion_control=bbr, qdisc=fq"
         else
-            log info "kernel" "BBR v1 доступен — план: congestion_control=bbr, qdisc=fq (BBRv3: ядро >=6.15 или ENABLE_XANMOD=1 + reboot)"
+            log info "kernel" "BBR v1 доступен — план: congestion_control=bbr, qdisc=fq (BBRv3: XanMod, ENABLE_XANMOD=1 + reboot)"
         fi
     else
-        if node_kernel_version_ge 6 15; then
-            log warn "kernel" "ядро >=6.15, но модуль tcp_bbr недоступен — проверь конфигурацию ядра (CONFIG_TCP_CONG_BBR)"
-        else
-            log warn "kernel" "BBR недоступен в текущем ядре ($(uname -r)). XanMod: ENABLE_XANMOD=1 в /etc/node/node.conf, затем reboot и повторный apply (BBRv3 с ядра 6.15 — XanMod не нужен)."
-        fi
+        # 2026-09-24 (v1.1.7): без ветки «ядро >= 6.15» (ложная посылка о BBRv3 в мейнлайне)
+        log warn "kernel" "BBR недоступен в текущем ядре ($(uname -r)). XanMod: ENABLE_XANMOD=1 в /etc/node/node.conf, затем reboot и повторный apply."
     fi
 }
 
@@ -110,9 +115,30 @@ node_xanmod_pkg() {
 # Безопасность: backup grub-файла, pin-файл apt, БЕЗ авто-ребута; после ребута
 # повторный `node apply` доведёт BBR (модуль в комплекте ядра).
 node_xanmod_install() {
-    [ "$(node_conf_get ENABLE_XANMOD 0)" = "1" ] || return 0
+    [ "$(node_conf_get ENABLE_XANMOD 1)" = "1" ] || return 0
     node_kernel_is_xanmod && { log info "kernel" "ядро уже XanMod ($(uname -r))"; return 0; }
-    node_xanmod_supported || die "XanMod поддерживается только на Debian/Ubuntu x86_64 (тут: $(uname -m), $(grep -oP '^ID=\K.*' /etc/os-release 2>/dev/null || echo '?'))"
+    # 2026-09-24 (v1.1.6): ENABLE_XANMOD=1 стал дефолтом. Дефолт (ключа нет в node.conf) —
+    # «мягкий»: где XanMod не нужен/невозможен — info/warn и пропуск, apply не падает
+    # (иначе каждый apply на ARM, jammy (нет suite — 404) или при сбое сети кончался бы
+    # ошибкой). Явный ENABLE_XANMOD=1 в node.conf — строгий режим, как прежде.
+    # явный = ключ задан в node.conf: в CONFIG_CACHE строки пользователя идут ПЕРВЫМИ,
+    # defaults дописаны следом (ключ там всегда) — два вхождения и первое = 1
+    local explicit=0 uv=""
+    uv="$(awk -F= '$1 == "ENABLE_XANMOD" { n++; if (n == 1) v = $2 } END { if (n > 1) print v }' "${CONFIG_CACHE:-/dev/null}" 2>/dev/null || true)"
+    [[ "$uv" =~ ^[[:space:]]*[\"\']?1 ]] && explicit=1
+    if ! node_xanmod_supported; then
+        [ "$explicit" = 1 ] && die "XanMod поддерживается только на Debian/Ubuntu x86_64 (тут: $(uname -m), $(grep -oP '^ID=\K.*' /etc/os-release 2>/dev/null || echo '?'))"
+        log info "kernel" "XanMod (дефолт): платформа не поддерживается ($(uname -m)) — пропуск"
+        return 0
+    fi
+    # 2026-09-24 (v1.1.7): пропуск по факту BBRv3 в текущем ядре (tcp_bbr version 3), а не по
+    # версии ядра — мейнлайн BBRv3 не содержит (прежний пропуск «>= 6.15» был ложным)
+    if [ "$explicit" = 0 ] && [ "$(node_bbr_generation)" = 3 ]; then
+        log info "kernel" "XanMod (дефолт): текущее ядро $(uname -r) уже с BBRv3 — замена ядра не нужна"
+        return 0
+    fi
+    # отказ на шаге: явный режим — rc 1 (шаг apply «упал», как прежде); дефолт — warn, rc 0
+    _xm_fail() { log warn "kernel" "$1"; [ "$explicit" = 1 ] && return 1; return 0; }
 
     local branch
     branch="$(node_conf_get XANMOD_BRANCH lts)"
@@ -128,27 +154,47 @@ node_xanmod_install() {
     require_root
     log info "kernel" "установка $pkg (ветка $branch, CPU level $level)…"
     backup /etc/default/grub
-    # репозиторий + ключ (backup + atomic + манифест — единые правила проекта)
-    declare -F node_origin_record >/dev/null 2>&1 && node_origin_record "$XANMOD_REPO_LIST"   # 2026-09-23: реестр для rollback
-    backup "$XANMOD_REPO_LIST"
-    printf 'deb http://deb.xanmod.org releases main\n' | atomic_write "$XANMOD_REPO_LIST"
-    node_manifest_record "$XANMOD_REPO_LIST"
-    if command -v wget >/dev/null 2>&1; then
-        # gpg --dearmor при обрыве сети выдавал ПУСТОЙ keyring (apt потом
-        # отвергал репозиторий с невнятной ошибкой). Через temp + проверка -s;
-        # при фейле — rm + die, пустой keyring не оставляем.
-        local ktmp; ktmp="$(mktemp)"
-        if wget -qO- https://dl.xanmod.org/gpg.key 2>/dev/null | gpg --dearmor > "$ktmp" 2>/dev/null && [ -s "$ktmp" ]; then
-            declare -F node_origin_record >/dev/null 2>&1 && node_origin_record "$XANMOD_GPG"
-            atomic_write "$XANMOD_GPG" < "$ktmp"
-            node_manifest_record "$XANMOD_GPG"
-            rm -f "$ktmp"
-        else
-            rm -f "$ktmp" "$XANMOD_GPG"
-            die "kernel: gpg key import failed (сеть/gpg?) — XanMod не устанавливаем, пустой keyring удалён"
-        fi
+    # 2026-09-24 (v1.1.6): источник XanMod уже настроен другим инструментом/вручную — не
+    # дублируем (дубль источника = предупреждения apt) и НЕ перезаписываем чужой ключ
+    local foreign="" own_repo=0 codename=""
+    foreign="$( { grep -rlsE '^[^#]*deb(\[[^]]*\])?[[:space:]].*deb\.xanmod\.org' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true; } \
+        | grep -vxF "$XANMOD_REPO_LIST" | awk 'NR == 1')"
+    if [ -n "$foreign" ]; then
+        log info "kernel" "источник XanMod уже настроен ($foreign) — используем его, свой не добавляем"
     else
-        log warn "kernel" "wget отсутствует — добавьте ключ вручную: https://dl.xanmod.org/gpg.key"
+        own_repo=1
+        # репозиторий + ключ (backup + atomic + манифест — единые правила проекта)
+        declare -F node_origin_record >/dev/null 2>&1 && node_origin_record "$XANMOD_REPO_LIST"   # 2026-09-23: реестр для rollback
+        backup "$XANMOD_REPO_LIST"
+        # 2026-09-24 (v1.1.6): suite = кодовое имя дистрибутива. Прежний `releases` XanMod убрал
+        # (HTTP 404 «does not have a Release file» — ENABLE_XANMOD=1 не работал вовсе);
+        # живые: noble/bookworm/trixie, jammy — 404 (проверено 2026-09-24).
+        codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
+        if ! [[ "$codename" =~ ^[a-z]+$ ]]; then
+            [ "$explicit" = 1 ] && die "XanMod: не удалось определить VERSION_CODENAME из /etc/os-release"
+            log warn "kernel" "XanMod (дефолт): VERSION_CODENAME не определён — пропуск"; return 0
+        fi
+        printf 'deb [signed-by=%s] http://deb.xanmod.org %s main\n' "$XANMOD_GPG" "$codename" | atomic_write "$XANMOD_REPO_LIST"
+        node_manifest_record "$XANMOD_REPO_LIST"
+        if command -v wget >/dev/null 2>&1; then
+            # gpg --dearmor при обрыве сети выдавал ПУСТОЙ keyring (apt потом
+            # отвергал репозиторий с невнятной ошибкой). Через temp + проверка -s;
+            # при фейле — rm; пустой keyring не оставляем.
+            local ktmp; ktmp="$(mktemp)"
+            if wget -qO- https://dl.xanmod.org/gpg.key 2>/dev/null | gpg --dearmor > "$ktmp" 2>/dev/null && [ -s "$ktmp" ]; then
+                declare -F node_origin_record >/dev/null 2>&1 && node_origin_record "$XANMOD_GPG"
+                atomic_write "$XANMOD_GPG" < "$ktmp"
+                node_manifest_record "$XANMOD_GPG"
+                rm -f "$ktmp" "$XANMOD_GPG_LEGACY"
+            else
+                rm -f "$ktmp" "$XANMOD_GPG" "$XANMOD_REPO_LIST"
+                [ "$explicit" = 1 ] && die "kernel: gpg key import failed (сеть/gpg?) — XanMod не устанавливаем, пустой keyring удалён"
+                log warn "kernel" "XanMod (дефолт): ключ не скачан (сеть?) — пропуск, repo убран; повторный apply доустановит"
+                return 0
+            fi
+        else
+            log warn "kernel" "wget отсутствует — добавьте ключ вручную: https://dl.xanmod.org/gpg.key"
+        fi
     fi
     # Сетевой сбой здесь НЕ убивает весь apply (счётчик шага: apply доработает,
     # но итоговая сводка назовёт xanmod_install среди упавших — return 1, не 0:
@@ -156,8 +202,16 @@ node_xanmod_install() {
     # в логе. С ноды в РФ deb.xanmod.org периодически недоступен — реальный
     # сценарий, а не теория). Повторный apply доустанавливает.
     # 2026-09-23 (v1.1.2): Acquire::Retries — разовый сетевой сбой зеркала не валит шаг
-    apt-get -o Acquire::Retries=3 update -qq || { log warn "kernel" "apt update failed (deb.xanmod.org недоступен?) — XanMod пропущен, повторите apply после исправления сети"; return 1; }
-    apt-get -o Acquire::Retries=3 install -y --no-install-recommends "$pkg" || { log warn "kernel" "apt install $pkg failed — повторите apply"; return 1; }
+    # 2026-09-24 (v1.1.6): при отказе update убираем СВОЙ только что добавленный репо и ключ —
+    # иначе битый источник ломал бы каждый последующий `apt update` хоста
+    if ! apt-get -o Acquire::Retries=3 update -qq; then
+        if [ "$own_repo" = 1 ]; then
+            rm -f "$XANMOD_REPO_LIST" "$XANMOD_GPG"
+            _xm_fail "apt update с репо XanMod ($codename) не прошёл (нет suite для $codename или сеть) — XanMod пропущен, репо и ключ убраны"; return
+        fi
+        _xm_fail "apt update не прошёл (сеть/источники) — XanMod пропущен, повторите apply"; return
+    fi
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends "$pkg" || { _xm_fail "apt install $pkg failed — повторите apply"; return; }
     # 2026-09-23 (v1.1.4): маркер ожидания reboot в state (переживает reboot, в отличие от /run)
     mkdir -p "${NODE_STATE_DIR:-/var/lib/node}"
     printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$pkg" "$(uname -r)" > "$(node_xanmod_pending_file)"
@@ -179,6 +233,15 @@ node_xanmod_install() {
 # Раньше напоминания были обычными строками `log warn`, неотличимыми от сотен
 # соседних; маркер жил только в /run (tmpfs) — после reboot, в котором GRUB
 # поднял СТАРОЕ ядро, следа не оставалось вовсе. Авто-reboot по-прежнему нет.
+# 2026-09-24 (v1.1.5): версия ядра записи GRUB по умолчанию (stdout; пусто — не определить).
+# Только GRUB_DEFAULT=0 (первая запись grub.cfg) — saved/именованные записи не угадываем.
+node_grub_default_kernel() {
+    local cfg="${NODE_GRUB_CFG:-/boot/grub/grub.cfg}" def
+    def="$(awk -F= '/^GRUB_DEFAULT=/{v=$2} END{gsub(/["'"'"']/, "", v); print v}' "${NODE_GRUB_DEFAULT_FILE:-/etc/default/grub}" 2>/dev/null || true)"
+    [ "${def:-0}" = "0" ] || return 0
+    awk '$1 == "linux" && $2 ~ /vmlinuz-/ { v = $2; sub(/.*vmlinuz-/, "", v); print v; exit }' "$cfg" 2>/dev/null || true
+}
+
 node_xanmod_pending_file() { echo "${NODE_STATE_DIR:-/var/lib/node}/pending-reboot-xanmod"; }
 
 # node_reboot_notice <текст> [fd=2] — рамка + «>>> текст <<<». Жирный жёлтый —
@@ -239,7 +302,7 @@ node_kernel_reboot_offer() {
 node_xanmod_remove() {
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "would purge XanMod kernel"; return 0; }
     apt-get purge -y 'linux-image*xanmod*' 2>/dev/null || true
-    rm -f "$XANMOD_REPO_LIST" "$XANMOD_GPG" /etc/apt/preferences.d/xanmod-kernel
+    rm -f "$XANMOD_REPO_LIST" "$XANMOD_GPG" "$XANMOD_GPG_LEGACY" /etc/apt/preferences.d/xanmod-kernel
     # восстанавливаем grub-файл из нашего последнего backup (if-guard: &&-цепочка
     # под set -e убила бы скрипт при отсутствии бэкапа)
     local g; g="$(ls -1t /etc/default/grub.pre-node-* 2>/dev/null | head -1 || true)"

@@ -8,7 +8,7 @@ SHIELD_EMERGENCY_MARKER=/run/shieldnode/emergency
 
 # shield_emergency_ruleset — минимальная таблица (stdout).
 shield_emergency_ruleset() {
-    local admin_v4="${SH_F_ADMIN_V4:-}" ssh_ports="${SH_F_SSH_PORTS:-22}"
+    local admin_v4="${SH_F_ADMIN_V4:-}" admin_v6="${SH_F_ADMIN_V6:-}" ssh_ports="${SH_F_SSH_PORTS:-22}"
     cat <<EOF
 #!/usr/sbin/nft -f
 # EMERGENCY mode — $(date -u '+%Y-%m-%dT%H:%M:%SZ'). Только SSH+whitelist.
@@ -19,6 +19,15 @@ table inet shieldnode {
         auto-merge
 EOF
     [ -n "$admin_v4" ] && echo "        elements = { $admin_v4 }"
+    # 2026-09-23 (v1.1.4): whitelist_v6 — admin v6 резолвился, но в ruleset не попадал
+    cat <<'EOF'
+    }
+    set whitelist_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+EOF
+    [ -n "$admin_v6" ] && echo "        elements = { $admin_v6 }"
     cat <<'EOF'
     }
     chain prerouting {
@@ -27,6 +36,7 @@ EOF
         iifname "lo" accept
         ct state established,related accept
         ip saddr @whitelist_v4 accept
+        ip6 saddr @whitelist_v6 accept
 EOF
     local p
     for p in $ssh_ports; do
@@ -35,6 +45,9 @@ EOF
     cat <<'EOF'
         ip protocol tcp drop
         ip protocol udp drop
+        # 2026-09-23 (v1.1.4): паритет v6 — раньше весь IPv6 TCP/UDP оставался открыт.
+        # meta l4proto (а не ip6 nexthdr) — корректно и с extension headers; ICMPv6/ND не трогаем
+        meta nfproto ipv6 meta l4proto { tcp, udp } drop
     }
 }
 EOF

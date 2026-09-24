@@ -70,6 +70,42 @@ shield_self_test() {
     return "$fails"
 }
 
+# 2026-09-24 (v1.1.5): перенос активных банов через apply. Замена таблицы
+# (table/delete/table) обнуляла динамические сеты — каждый apply/emergency off
+# снимал все баны abusers и ручные temporary_blocklist (живая нода: бан
+# 133.18.122.63 пропал). Дамп: адрес + ОСТАТОК срока (expires) -> батч на сет.
+SHIELD_CARRY_SETS="ssh_abusers ssh_abusers_v6 tcp_abusers tcp_abusers_v6 udp_abusers udp_abusers_v6 temporary_blocklist temporary_blocklist_v6"
+shield_bans_carry_dump() { # <dir> — файл <dir>/<set>.nft на каждый непустой сет
+    local dir="$1" s out
+    mkdir -p "$dir"
+    for s in $SHIELD_CARRY_SETS; do
+        out="$(nft list set inet shieldnode "$s" 2>/dev/null)" || continue
+        [[ "$out" == *elements* ]] || continue
+        printf '%s\n' "$out" | awk -v s="$s" '
+            /elements = \{/ { f = 1; sub(/.*elements = \{/, "") }
+            f { e = $0; if (e ~ /\}/) { sub(/\}.*/, "", e); f = 0 }
+                n = split(e, a, ",")
+                for (i = 1; i <= n; i++) {
+                    m = split(a[i], w, " "); if (w[1] !~ /^[0-9a-fA-F:.\/]+$/) continue
+                    t = ""; for (j = 2; j < m; j++) if (w[j] == "expires" && w[j + 1] ~ /^[0-9dhms]+$/) t = w[j + 1]
+                    printf "add element inet shieldnode %s { %s%s }\n", s, w[1], (t != "" ? " timeout " t : "")
+                } }' > "$dir/$s.nft"
+        [ -s "$dir/$s.nft" ] || rm -f "$dir/$s.nft"
+    done
+}
+shield_bans_carry_restore() { # <dir> — best-effort: отказ по сету -> warn, apply не падает
+    local dir="$1" f s n=0 bad=0
+    for f in "$dir"/*.nft; do
+        [ -e "$f" ] || continue
+        s="$(basename "$f" .nft)"
+        nft list set inet shieldnode "$s" >/dev/null 2>&1 || { bad=$((bad + 1)); continue; }   # сет выключен в новом ruleset
+        if nft -f "$f" 2>/dev/null; then n=$((n + $(wc -l < "$f"))); else bad=$((bad + 1)); fi
+    done
+    [ "$n" -gt 0 ] && log info "apply" "активные баны перенесены через apply: $n (с остатком срока)"
+    [ "$bad" -gt 0 ] && log warn "apply" "баны $bad сет(ов) не перенесены (сет выключен в новом ruleset или отказ nft)"
+    rm -rf "$dir"
+}
+
 # shield_apply — полный цикл apply (режим по умолчанию, ТЗ §4/§26).
 shield_apply() {
     shield_nft_available
@@ -112,6 +148,13 @@ shield_apply() {
     ts="$(date '+%Y%m%d-%H%M%S')"
     bdump="$SHIELD_BACKUP_DIR/${ts}.nft"
     shield_table_dump "$bdump" || log info "apply" "таблицы inet shieldnode ещё не было — чистый старт"
+    # 2026-09-24 (v1.1.5): журнал abuse и дамп банов — ДО замены таблицы (после неё
+    # динамические сеты пусты; раньше журнал писался уже по пустым сетам)
+    local carry="$tmp.carry"
+    if [ -s "$bdump" ]; then
+        declare -F shield_abuse_journal_append >/dev/null && { shield_abuse_journal_append || true; }
+        shield_bans_carry_dump "$carry" || true
+    fi
 
     # --- применение: внешний destroy УБРАН — ruleset начинается с тройки
     # table/delete/table, замена атомарна одной транзакцией nft -f (ТЗ §26).
@@ -125,13 +168,14 @@ shield_apply() {
             # delete перед restore: поверх ЖИВОЙ таблицы restore падает (meter EBUSY)
             nft delete table inet shieldnode 2>/dev/null || true
             nft -f "$bdump" || shield_emergency on "apply rejected and backup restore failed"
-            rm -f "$tmp" "$tmp.err"
+            rm -rf "$tmp" "$tmp.err" "$carry"
             die "nft -f failed: ядро отклонило ruleset; восстановлен предыдущий ruleset"
         fi
-        rm -f "$tmp" "$tmp.err"
+        rm -rf "$tmp" "$tmp.err" "$carry"
         die "nft -f failed: ядро отклонило ruleset; предыдущей таблицы не было — firewall не активен (fail-open)"
     fi
     rm -f "$tmp.err"
+    [ -d "$carry" ] && shield_bans_carry_restore "$carry"
     shield_ssh_whitelist_admin_runtime
 
     # --- self-test; при провале — auto-rollback (ТЗ §20/§27) ---
@@ -160,9 +204,6 @@ shield_apply() {
     shield_blocklist_install
     shield_guard_link
     rm -f "$tmp"
-
-    # --- журнал abuse стартуем сразу ---
-    shield_abuse_journal_append || true
 
     # --- контракт владения (ТЗ §15) ---
     shield_contract_write

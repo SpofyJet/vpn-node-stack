@@ -21,7 +21,9 @@ NODE_SYSCTL_FILES=("$NODE_SYSCTL_BASE" "$NODE_SYSCTL_DATAPATH" "$NODE_SYSCTL_CON
 NODE_PLAN_FILE=""
 
 node_sysctl_plan_init() {
-    NODE_PLAN_FILE="$(mktemp)"
+    # 2026-09-24 (v1.1.6): повторный init (status/rt-reapply) — тот же файл, не новый
+    # mktemp; удаляется на выходе (_node_tmp_cleanup, config.sh)
+    if [ -z "${NODE_PLAN_FILE:-}" ] || [ ! -f "$NODE_PLAN_FILE" ]; then NODE_PLAN_FILE="$(mktemp)"; fi
     : > "$NODE_PLAN_FILE"
 }
 
@@ -35,7 +37,10 @@ node_sysctl_add() {
     local ok_val=0
     [[ "$value" =~ ^[0-9]+([[:space:]]+[0-9]+)*$ ]] && ok_val=1
     case "$key" in net.ipv4.tcp_congestion_control|net.core.default_qdisc)
-        [[ "$value" =~ ^[a-z][a-z0-9_]*$ ]] && ok_val=1 ;; esac
+        [[ "$value" =~ ^[a-z][a-z0-9_]*$ ]] && ok_val=1 ;;
+    # 2026-09-24 (v1.1.7): список портов/диапазонов через запятую (ip-sysctl.rst)
+    net.ipv4.ip_local_reserved_ports)
+        [[ "$value" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] && ok_val=1 ;; esac
     if [ "$ok_val" != 1 ]; then
         warn "sysctl" "невалидное значение $key='$value' (конфиг?) — ключ пропущен, текущее значение ядра оставлено"
         return 0
@@ -65,6 +70,44 @@ node_sysctl_add_writable() {
             || { log warn "sysctl" "ключ $key не записываемый (контейнер?) — пропуск"; return 0; }
     fi
     node_sysctl_add "$file" "$key" "$value"
+}
+
+# 2026-09-24 (v1.1.6): исходное (до node) значение ключа — из реестра sysctl-orig,
+# иначе текущее из /proc/sys (NODE_PROC_ROOT — override фикстуры тестов)
+node_sysctl_baseline() {
+    local key="$1" v=""
+    [ -f "$NODE_STATE_DIR/sysctl-orig.tsv" ] && v="$(awk -F'\t' -v k="$key" '$1 == k { print $2; exit }' "$NODE_STATE_DIR/sysctl-orig.tsv")"
+    [ -n "$v" ] || v="$(cat "${NODE_PROC_ROOT:-/proc}/sys/${key//.//}" 2>/dev/null || true)"
+    printf '%s' "$v"
+}
+
+# node_sysctl_restore_dropped — 2026-09-24 (v1.1.7): ключи, которыми node владел на прошлом
+# apply (owner-keys.txt переписывается только в конце apply), но которых больше нет в плане,
+# получают исходное (до node) runtime-значение из реестра sysctl-orig. Раньше удалённая из
+# плана настройка (выключенная опция, пересмотренный дефолт) жила в ядре до reboot/rollback.
+# Ключ, ещё заданный оставшимся файлом node, не трогаем. Заменяет разовый
+# node_filemax_runtime_restore (v1.1.6).
+node_sysctl_restore_dropped() {
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    local owner="$NODE_STATE_DIR/owner-keys.txt" reg="$NODE_STATE_DIR/sysctl-orig.tsv" k orig cur kre n=0
+    [ -s "$owner" ] && [ -s "$reg" ] || return 0
+    while read -r k; do
+        [ -n "$k" ] || continue
+        awk -F'\t' -v k="$k" '$1 == k { f = 1 } END { exit !f }' "$NODE_PLAN_FILE" 2>/dev/null && continue
+        kre="${k//./\\.}"
+        grep -rqsE "^${kre}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null && continue
+        # 2026-09-24 (v1.1.7): пустое исходное — тоже значение (ip_local_reserved_ports «» до node)
+        awk -F'\t' -v k="$k" '$1 == k { f = 1 } END { exit !f }' "$reg" || continue
+        orig="$(awk -F'\t' -v k="$k" '$1 == k { print $2; exit }' "$reg")"
+        cur="$(sysctl -n "$k" 2>/dev/null | tr '\t' ' ' || true)"
+        [ "$cur" = "$orig" ] && continue
+        if sysctl -w "$k=$orig" >/dev/null 2>&1; then
+            log info "sysctl" "ключ $k больше не в плане node — возвращено исходное: $cur -> $orig"
+            n=$((n + 1))
+        fi
+    done < "$owner"
+    [ "$n" -gt 0 ] && ok "sysctl" "исходные значения возвращены для $n ключ(ей), выпавших из плана"
+    return 0
 }
 
 node_sysctl_write() {
@@ -112,6 +155,15 @@ node_sysctl_orig_record() {
         if [ -f "$owner" ] && grep -qxF -- "$k" "$owner"; then continue; fi
         v="$(sysctl -n "$k" 2>/dev/null)" || continue
         printf '%s\t%s\n' "$k" "$(printf '%s' "$v" | tr '\t' ' ')" >> "$reg"
+        # 2026-09-24 (v1.1.5): vm.dirty_*_bytes=0 — ядро было в ratio-режиме; вернуть 0 в
+        # *_bytes нельзя (EINVAL), вернуть режим можно только записью *_ratio — пишем и его
+        case "$k" in
+            vm.dirty_bytes|vm.dirty_background_bytes)
+                local rk="${k%_bytes}_ratio" rv
+                if [ "$v" = "0" ] && ! awk -F'\t' -v k="$rk" '$1==k{f=1} END{exit !f}' "$reg"; then
+                    rv="$(sysctl -n "$rk" 2>/dev/null)" && printf '%s\t%s\n' "$rk" "$rv" >> "$reg"
+                fi ;;
+        esac
     done < "$NODE_PLAN_FILE"
 }
 

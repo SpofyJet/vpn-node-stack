@@ -2,7 +2,13 @@
 # shieldnode — lib/common.sh: logging (scrub, §5), lock, backup, atomic write.
 set -euo pipefail
 
-C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'; C_NC=$'\033[0m'
+# 2026-09-24 (v1.1.4, backlog #9): цвет — только если stderr (куда идут warn/error) — TTY и нет
+# NO_COLOR; иначе в пайпах/журнале systemd warn-строки приходили с ANSI-мусором
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'; C_NC=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_NC=''
+fi
 
 scrub() {
     # Маскирование секретов перед записью в лог (ТЗ §5): токены/пароли/UUID.

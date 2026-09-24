@@ -3,6 +3,17 @@
 # Запуск: bash tests/test-rollback.sh  (root не обязателен: используются только tmp-пути)
 set -euo pipefail
 
+# 2026-09-24 (v1.1.5): node_rollback безусловно делает `systemctl disable --now
+# node-rt-tweaks.service`, `rm -f /usr/local/sbin/node-rt-tweaks.sh
+# /etc/udev/rules.d/99-node-rt-hotplug.rules` и daemon-reload — под root тест
+# сносил их на живой ноде. Изоляция: свой mount ns, tmpfs поверх этих путей и /run
+# (без /run systemctl/udevadm не достучатся до PID1/udevd — безвредный отказ).
+if [ "$(id -u)" -eq 0 ] && [ "${NODE_TEST_IN_NS:-0}" != "1" ] && unshare -m true 2>/dev/null; then
+    NODE_TEST_IN_NS=1 exec unshare -m bash "$0" "$@"
+fi
+if [ "${NODE_TEST_IN_NS:-0}" = "1" ]; then
+    for d in /usr/local/sbin /etc/udev/rules.d /etc/systemd/system /run; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
+fi
 NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export NODE_DIR
 export NODE_STATE_DIR=/tmp/node-test-rollback/state

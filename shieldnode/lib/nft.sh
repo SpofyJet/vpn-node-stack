@@ -30,6 +30,12 @@ shield_nft_emit_set() {
     printf '    }\n'
 }
 
+# 2026-09-24 (v1.1.4): interval-сет `size S` вмещает меньше S/2 несмежных интервалов
+# (в ядре каждый — узел начала + узел конца, плюс один служебный). Замер nft 1.0.9 /
+# ядро 6.8, flush+add одной транзакцией (как updater): N записей требуют S >= 2N+1
+# (N=1/10/1000/5000: 2N — ENFILE, 2N+1 — ок, в т.ч. refill полного сета). Блоклисты
+# объявляются с size 2*<X>_BLOCKLIST_SIZE+1, чтобы значение конфига означало ЗАПИСИ.
+# size — предел, память не преаллоцируется.
 shield_nft_build_ruleset() {
     local ts; ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     {
@@ -89,36 +95,36 @@ EOF
         # со старой веткой (scanner_blocklist_v4 и т.д.).
         if [ "${SH_F_ENABLE_BLOCKLISTS:-1}" = "1" ]; then
             if [ "${SH_F_ENABLE_SCANNER_LIST:-1}" = "1" ]; then
-                printf '' | shield_nft_emit_set scanner_blocklist_v4 ipv4_addr "size $SH_R_SCANNER_BLOCKLIST_SIZE" "flags interval" "auto-merge"
-                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set scanner_blocklist_v6 ipv6_addr "size $SH_R_SCANNER_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set scanner_blocklist_v4 ipv4_addr "size $((2 * SH_R_SCANNER_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set scanner_blocklist_v6 ipv6_addr "size $((2 * SH_R_SCANNER_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
             if [ "${SH_F_ENABLE_THREAT_LIST:-1}" = "1" ]; then
-                printf '' | shield_nft_emit_set threat_blocklist_v4 ipv4_addr "size $SH_R_THREAT_BLOCKLIST_SIZE" "flags interval" "auto-merge"
-                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set threat_blocklist_v6 ipv6_addr "size $SH_R_THREAT_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set threat_blocklist_v4 ipv4_addr "size $((2 * SH_R_THREAT_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set threat_blocklist_v6 ipv6_addr "size $((2 * SH_R_THREAT_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
             if [ "${SH_F_BLOCK_TOR:-0}" = "1" ]; then
-                printf '' | shield_nft_emit_set tor_exit_blocklist_v4 ipv4_addr "size $SH_R_TOR_BLOCKLIST_SIZE" "flags interval" "auto-merge"
-                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set tor_exit_blocklist_v6 ipv6_addr "size $SH_R_TOR_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set tor_exit_blocklist_v4 ipv4_addr "size $((2 * SH_R_TOR_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set tor_exit_blocklist_v6 ipv6_addr "size $((2 * SH_R_TOR_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
             if [ "${SH_F_ENABLE_CUSTOM_LIST:-1}" = "1" ]; then
-                printf '' | shield_nft_emit_set custom_blocklist_v4 ipv4_addr "size $SH_R_CUSTOM_BLOCKLIST_SIZE" "flags interval" "auto-merge"
-                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set custom_blocklist_v6 ipv6_addr "size $SH_R_CUSTOM_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set custom_blocklist_v4 ipv4_addr "size $((2 * SH_R_CUSTOM_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set custom_blocklist_v6 ipv6_addr "size $((2 * SH_R_CUSTOM_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
             # crowdsec community blocklist (Blocklist-as-a-Service, plain-text feed):
             # качается updater'ом с Basic-Auth endpoint'а консоли, 1 раз/24ч (лимит тарифа)
             if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
-                printf '' | shield_nft_emit_set crowdsec_blocklist_v4 ipv4_addr "size $SH_R_CROWDSEC_BLOCKLIST_SIZE" "flags interval" "auto-merge"
-                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set crowdsec_blocklist_v6 ipv6_addr "size $SH_R_CROWDSEC_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set crowdsec_blocklist_v4 ipv4_addr "size $((2 * SH_R_CROWDSEC_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set crowdsec_blocklist_v6 ipv6_addr "size $((2 * SH_R_CROWDSEC_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
             # spamhaus DROP/EDROP (+v6) — worst-of-the-worst hijacked space, бесплатно,
             # без ключа. Формат "S24-x.y.z.w/24 ; comment" — парсится updater'ом.
             if [ "${SH_F_ENABLE_SPAMHAUS_LIST:-1}" = "1" ]; then
-                printf '' | shield_nft_emit_set spamhaus_blocklist_v4 ipv4_addr "size $SH_R_SPAMHAUS_BLOCKLIST_SIZE" "flags interval" "auto-merge"
-                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set spamhaus_blocklist_v6 ipv6_addr "size $SH_R_SPAMHAUS_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set spamhaus_blocklist_v4 ipv4_addr "size $((2 * SH_R_SPAMHAUS_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
+                [ "$SH_F_IPV6" = "1" ] && printf '' | shield_nft_emit_set spamhaus_blocklist_v6 ipv6_addr "size $((2 * SH_R_SPAMHAUS_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
             # CINS Army (Collective Intelligence Network Security, ~30k IP) — бесплатно, без ключа
             if [ "${SH_F_ENABLE_CINS_LIST:-1}" = "1" ]; then
-                printf '' | shield_nft_emit_set cins_blocklist_v4 ipv4_addr "size $SH_R_CINS_BLOCKLIST_SIZE" "flags interval" "auto-merge"
+                printf '' | shield_nft_emit_set cins_blocklist_v4 ipv4_addr "size $((2 * SH_R_CINS_BLOCKLIST_SIZE + 1))" "flags interval" "auto-merge"
             fi
         fi
 
@@ -217,8 +223,12 @@ EOF
         # ICMPv6 essentials: без packet-too-big IPv6-туннели деградируют молча (PMTUD)
         icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept
         # echo-request: rate-limit per-src (здоровый ping жив, флод душим)
-        ip protocol icmp icmp type echo-request limit rate over 10/second burst 20 packets counter name c_drops_icmp drop
-        icmpv6 type echo-request limit rate over 10/second burst 20 packets counter name c_drops_icmp drop
+        # 2026-09-24 (v1.1.4): meter по saddr — раньше `limit` был ГЛОБАЛЬНЫМ (backlog #4):
+        # флуд одного источника резал легитимный ping остальных. Лимит видит только
+        # НОВЫЕ ICMP-потоки: echo в рамках одного id — ct established и принимается выше
+        # (accept established до любого drop — жёсткое ограничение anti-lockout).
+        ip protocol icmp icmp type echo-request meter icmp_echo4 { ip saddr limit rate over 10/second burst 20 packets } counter name c_drops_icmp drop
+        icmpv6 type echo-request meter icmp_echo6 { ip6 saddr limit rate over 10/second burst 20 packets } counter name c_drops_icmp drop
 EOF
         fi
 

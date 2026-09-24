@@ -88,14 +88,37 @@ t "BACKUP_KEEP=abc: backup не падает (fallback 5)" '( backup "$OUT/f.con
 # ---------- Phase 4 opt-in: ENABLE_TCP_BUF_TUNE / ENABLE_EEE_OFF ----------
 source "$NODE_DIR/lib/sysctl.sh"; source "$NODE_DIR/lib/tcp.sh"
 printf 'MemTotal:       16777216 kB\n' > "$OUT/mem16g"; printf 'MemTotal:        1048576 kB\n' > "$OUT/mem1g"
-: > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
+printf 'ENABLE_TCP_BUF_TUNE=0\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
 ( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem16g"; node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.off" )
-t "opt: по умолчанию tcp_rmem/wmem НЕ планируются (поведение прежнее)" '! grep -q "tcp_[rw]mem" "$OUT/plan.off"'
-printf 'ENABLE_TCP_BUF_TUNE=1\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
+t "ENABLE_TCP_BUF_TUNE=0: tcp_rmem/wmem НЕ планируются" '! grep -q "tcp_[rw]mem" "$OUT/plan.off"'
+: > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
 ( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem16g"; node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.t4" )
 ( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem1g";  node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.t1" )
-t "opt: T4 -> tcp_rmem max = tier rmem_max (32MiB)" 'grep -qP "^net.ipv4.tcp_rmem\t4096 131072 33554432\t" "$OUT/plan.t4" && grep -qP "^net.ipv4.tcp_wmem\t4096 16384 33554432\t" "$OUT/plan.t4"'
-t "opt: T1 (4MiB < дефолта ядра) — НЕ понижаем"  '! grep -q "tcp_[rw]mem" "$OUT/plan.t1"'
+t "дефолт (v1.1.7: TUNE=1): T4 -> tcp_rmem max = tier rmem_max (32MiB)" 'grep -qP "^net.ipv4.tcp_rmem\t4096 131072 33554432\t" "$OUT/plan.t4" && grep -qP "^net.ipv4.tcp_wmem\t4096 16384 33554432\t" "$OUT/plan.t4"'
+t "T1: rmem/wmem_max = 8MiB (v1.1.7: quic-go/Hysteria2 просит 7MiB; было 4MiB)" 'grep -qP "^net.core.rmem_max\t8388608\t" "$OUT/plan.t1" && grep -qP "^net.core.wmem_max\t8388608\t" "$OUT/plan.t1"'
+t "база (v1.1.7): slow_start_after_idle=0 и mtu_probing=1 без perf-tier" 'grep -qP "^net.ipv4.tcp_slow_start_after_idle\t0\t" "$OUT/plan.t1" && grep -qP "^net.ipv4.tcp_mtu_probing\t1\t" "$OUT/plan.t1"'
+t "ENABLE_TCP_BUF_TUNE=0: slow_start/mtu_probing всё равно в базе" 'grep -q tcp_slow_start_after_idle "$OUT/plan.off"'
+printf 'ENABLE_TCP_BUF_TUNE=1\nNET_RMEM_MAX=4194304\nNET_WMEM_MAX=4194304\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
+( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem1g";  node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.low" )
+t "opt: потолок 4MiB (< дефолта ядра 6/4MiB) — tcp_rmem/wmem НЕ понижаем"  '! grep -q "tcp_[rw]mem" "$OUT/plan.low"'
+# 2026-09-24 (v1.1.7): повторный apply — runtime уже = значение node (32MiB); база в реестре
+# 6/4 MiB -> tcp_rmem/wmem остаются в плане (раньше выпадали и откатывались: флип-флоп)
+: > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
+( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem16g"; mkdir -p "$NODE_STATE_DIR"
+  printf 'net.ipv4.tcp_rmem\t4096 131072 6291456\nnet.ipv4.tcp_wmem\t4096 16384 4194304\n' > "$NODE_STATE_DIR/sysctl-orig.tsv"
+  sysctl() { case "$*" in *tcp_rmem*|*tcp_wmem*) echo "4096 131072 33554432" ;; *) command sysctl "$@" ;; esac; }
+  node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.re"; rm -f "$NODE_STATE_DIR/sysctl-orig.tsv" )
+t "повторный apply: tcp_rmem/wmem остаются в плане (сравнение с исходным, не с runtime)" 'grep -qP "^net.ipv4.tcp_rmem\t4096 131072 33554432\t" "$OUT/plan.re" && grep -qP "^net.ipv4.tcp_wmem\t4096 16384 33554432\t" "$OUT/plan.re"'
+
+# 2026-09-24 (v1.1.7): порты inbound'ов в добавленной полосе [10240,32767] резервируются
+ss() { printf 'tcp LISTEN 0 4096 *:22 *:*\ntcp LISTEN 0 4096 [::]:20443 [::]:*\nudp UNCONN 0 0 0.0.0.0:25000 0.0.0.0:*\ntcp LISTEN 0 4096 *:443 *:*\ntcp LISTEN 0 4096 127.0.0.1:40000 *:*\n'; }
+printf 'TCP_RESERVED_PORTS=30000-30010\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
+( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem1g"; node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.rp" )
+t "reserved_ports: слушаемые 20443/25000 (tcp/udp) + TCP_RESERVED_PORTS; 22/443/40000 — нет" 'grep -qP "^net.ipv4.ip_local_reserved_ports\t30000-30010,20443,25000\t" "$OUT/plan.rp"'
+printf 'TCP_PORT_RANGE=32768 60999\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
+( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem1g"; node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.rp2" )
+t "reserved_ports: диапазон не расширен ниже 32768 -> ключ не пишется" '! grep -q ip_local_reserved_ports "$OUT/plan.rp2"'
+unset -f ss; : > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
 t "opt: остальной план идентичен выключенному"   'diff <(grep -v "tcp_[rw]mem" "$OUT/plan.t4") "$OUT/plan.off"'
 cat > "$OUT/bin/ethtool" <<EOF
 #!/bin/sh

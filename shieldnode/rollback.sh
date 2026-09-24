@@ -17,6 +17,19 @@ shield_rollback() {
 
     log info "rollback" "target backup set: ${ts:-<none — удаление своих файлов>}"
 
+    # 0. 2026-09-24 (v1.1.4): юниты останавливаем/отключаем ДО удаления их файлов (шаг 1):
+    # на отсутствующем unit-файле `systemctl disable --now` падает целиком — таймеры
+    # уходили в failed ("Unit to trigger vanished"), .path оставался active, а
+    # симлинки в *.wants — висячими (живая нода)
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        systemctl disable --now shieldnode-cleanup.timer >/dev/null 2>&1 || true
+        systemctl disable --now shieldnode-blocklist.timer shieldnode-blocklist.service \
+                           shieldnode-blocklist-custom.path shieldnode-blocklist-custom.service >/dev/null 2>&1 || true
+        # --now: без него служба оставалась «active (exited)» not-found до reboot;
+        # ExecStop у shieldnode.service нет — stop меняет только состояние юнита
+        systemctl disable --now shieldnode.service >/dev/null 2>&1 || true
+    fi
+
     # 1. восстановление/удаление по манифесту
     local reg="$SHIELD_STATE_DIR/file-origins.tsv" origin
     if [ -f "$SHIELD_MANIFEST" ]; then
@@ -87,10 +100,6 @@ shield_rollback() {
 
     # 3. службы и firewall
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        systemctl disable --now shieldnode-cleanup.timer >/dev/null 2>&1 || true
-        systemctl disable --now shieldnode-blocklist.timer shieldnode-blocklist.service \
-                           shieldnode-blocklist-custom.path shieldnode-blocklist-custom.service >/dev/null 2>&1 || true
-        systemctl disable shieldnode.service >/dev/null 2>&1 || true
         systemctl daemon-reload 2>/dev/null || true
         # откат = удаление нашего firewall (возврат к состоянию «shieldnode не было»)
         # delete, а не destroy: destroy появился только в nft 1.0.8 (Debian 12 = 1.0.6)

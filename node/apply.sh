@@ -26,9 +26,9 @@ node_contract_write() {
         echo "mss_clamp=$(node_conf_get ENABLE_MSS_CLAMP 0)"
         echo "docker_integration=$(node_conf_get INTEGRATION_DOCKER 0)"
         echo "bbr=$(node_bbr_active && echo active || echo inactive)"
-        echo "xanmod_requested=$(node_conf_get ENABLE_XANMOD 0)"
+        echo "xanmod_requested=$(node_conf_get ENABLE_XANMOD 1)"
         echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0)"
-        echo "tcp_buf_tune=$(node_conf_get ENABLE_TCP_BUF_TUNE 0) eee_off=$(node_conf_get ENABLE_EEE_OFF 0)"
+        echo "tcp_buf_tune=$(node_conf_get ENABLE_TCP_BUF_TUNE 1) eee_off=$(node_conf_get ENABLE_EEE_OFF 0)"
         echo "datapath=$(node_conf_get ENABLE_DATAPATH 1),fq_tune:$(node_conf_get ENABLE_FQ_TUNE 1),busy_poll:$(node_conf_get ENABLE_BUSY_POLL 0)"
         echo "nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)"
         echo "irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
@@ -88,6 +88,7 @@ node_apply() {
     node_step_run conntrack_ensure_module  node_conntrack_ensure_module  # до sysctl: nf_conntrack_max требует загруженного модуля
     node_sysctl_write
     node_sysctl_apply
+    node_step_run sysctl_restore_dropped   node_sysctl_restore_dropped    # 2026-09-24 (v1.1.7)
     node_step_run conntrack_persist        node_conntrack_persist
     node_step_run conntrack_apply          node_conntrack_apply
     node_step_run services_apply           node_services_apply   # irqbalance выключаем ДО ручной IRQ-affinity
@@ -104,6 +105,7 @@ node_apply() {
     node_step_run irq_apply                node_irq_apply
     node_step_run irq_affinity_apply       node_irq_affinity_apply
     node_step_run cpu_check                node_cpu_check
+    node_step_run cpu_governor_apply       node_cpu_governor_apply   # 2026-09-24 (v1.1.7)
     node_step_run network_mtu_diag         node_network_mtu_diag
     node_step_run network_mss_clamp        node_network_mss_clamp
     node_step_run network_docker           node_network_docker_integration
@@ -202,12 +204,13 @@ node_rt_boot_needed() {
     [ -n "$(node_conf_get NIC_RING_TX "")" ] && return 0
     [ "$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)" = "1" ] && return 0
     [ "$(node_conf_get ENABLE_RSS_BALANCE 0)"    = "1" ] && return 0
-    [ "$(node_conf_get ENABLE_RPS 0)"            = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_RPS 1)"            = "1" ] && return 0
     [ "$(node_conf_get ENABLE_XPS 0)"            = "1" ] && return 0
     [ "$(node_conf_get ENABLE_IRQ_AFFINITY 0)"   = "1" ] && return 0
     [ "$(node_conf_get ENABLE_FQ_TUNE 1)"        = "1" ] && return 0
     [ "$(node_conf_get ENABLE_MSS_CLAMP 0)"      = "1" ] && return 0
     [ "$(node_conf_get ENABLE_EEE_OFF 0)"        = "1" ] && return 0
+    [ "$(node_conf_get ENABLE_CPU_PERF_GOVERNOR 1)" = "1" ] && return 0   # v1.1.7
     return 1
 }
 
@@ -278,7 +281,11 @@ node_rt_boot_persist() {
     # tun/tap VPN-тоже (хуже не будет, persist-записи только по реальным iface).
     {
         echo '# node — re-apply runtime tweaks on NIC hotplug (managed by node; do not edit)'
-        echo 'ACTION=="add", SUBSYSTEM=="net", TAG+="systemd", ENV{SYSTEMD_WANTS}="node-rt-tweaks.service", RUN+="/bin/systemctl restart node-rt-tweaks.service"'
+        # 2026-09-24 (v1.1.5): tun/tap VPN — по-прежнему ловим (см. выше), но veth (каждый
+        # старт docker-контейнера, netns тестов), bridge и dummy — не NIC и noqueue: раньше
+        # каждый veth = полный rt-reapply с перезаписью файлов node (найдено на живой ноде).
+        # По драйверу (ID_NET_DRIVER из 80-net-setup-link), не по имени: имена произвольны.
+        echo 'ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}!="veth|bridge|dummy", TAG+="systemd", ENV{SYSTEMD_WANTS}="node-rt-tweaks.service", RUN+="/bin/systemctl restart node-rt-tweaks.service"'
     } | node_persist "$udev"
     # /run — tmpfs: после reboot /run/node нет, а под ProtectSystem=strict unit
     # сам его не создаст (flock-путь). systemd-tmpfiles-setup создаёт его рано при
@@ -328,6 +335,7 @@ node_rt_reapply() {
     node_nic_lro_off
     node_nic_low_latency
     node_nic_eee_off
+    source "$NODE_DIR/lib/cpu.sh"; node_cpu_governor_apply   # 2026-09-24 (v1.1.7)
     node_irq_apply
     node_irq_affinity_apply
     node_network_mss_clamp

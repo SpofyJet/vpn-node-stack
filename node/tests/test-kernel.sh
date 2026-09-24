@@ -43,8 +43,11 @@ t "perf-sysctl выключен по умолчанию: план пуст" bash
 node_sysctl_plan_init
 sed -i 's/^ENABLE_PERFORMANCE_SYSCTL=0$/ENABLE_PERFORMANCE_SYSCTL=1/' "$CONFIG_CACHE"   # user-override
 node_tcp_perf_plan
-for k in tcp_tw_reuse tcp_fin_timeout tcp_retries2 tcp_keepalive_time tcp_mtu_probing tcp_fastopen tcp_slow_start_after_idle tcp_no_metrics_save tcp_synack_retries; do
+for k in tcp_tw_reuse tcp_fin_timeout tcp_retries2 tcp_keepalive_time tcp_fastopen tcp_no_metrics_save tcp_synack_retries; do
     t "perf: $k запланирован" grep -q "net.ipv4.$k" "$NODE_PLAN_FILE"
+done
+for k in tcp_sack tcp_dsack tcp_mtu_probing tcp_slow_start_after_idle; do   # v1.1.7: no-op/перенесены в базу
+    t "perf: $k больше не в perf-tier" bash -c "! grep -q 'net.ipv4.$k	' '$NODE_PLAN_FILE'"
 done
 sed -i 's/^ENABLE_PERFORMANCE_SYSCTL=1$/ENABLE_PERFORMANCE_SYSCTL=0/' "$CONFIG_CACHE"
 

@@ -68,8 +68,9 @@ if [ "${args[0]:-}" = "list" ]; then
     exit 1
 fi
 [ -n "$batch" ] || exit 1
-# эмуляция старого nft: rename set не поддерживается
-if [ "${FAKE_NFT_NO_SWAP:-0}" = "1" ] && [ "$check" = "1" ] && grep -q "rename set" "$batch"; then
+# 2026-09-23 (v1.1.4): `rename set` не поддерживает НИ ОДИН nft (проверено на
+# 1.0.9: "unexpected set, expecting chain") — fake отвергает его всегда, как настоящий
+if [ "$check" = "1" ] && grep -q "rename set" "$batch"; then
     exit 1
 fi
 [ "$check" = "1" ] && exit 0
@@ -407,7 +408,9 @@ BL_URLS_scanner="file://$OUT/fixtures/scanner.txt file://$OUT/fixtures/drop.json
 BL_MIN_scanner=2
 EOF
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT"
-t "swap: rename-путь (без flush live-сета)" bash -c "grep -q 'rename set scanner_blocklist_v4__next scanner_blocklist_v4' '$OUT/nftdb/ops.log' && ! grep -q 'flush set scanner_blocklist_v4' '$OUT/nftdb/ops.log'"
+# 2026-09-23 (v1.1.4): было «rename-путь (без flush)» — утверждало несуществующую в nft
+# операцию; замена = flush+refill одной транзакцией, без __next и rename
+t "swap: одна транзакция flush+refill (без __next/rename)" bash -c "grep -q 'flush set scanner_blocklist_v4' '$OUT/nftdb/ops.log' && ! grep -q 'rename set\|__next' '$OUT/nftdb/ops.log'"
 t "swap: tmp-сет подчищен" bash -c "test ! -e '$OUT/nftdb/set_scanner_blocklist_v4__next'"
 t "swap: live-сет содержит 5 агрегированных записей" bash -c "test \$(wc -l < '$OUT/nftdb/set_scanner_blocklist_v4') = 5"
 t "swap: drop-правило пересоздано ОДИН раз, с counter, на прежней позиции" \
@@ -451,7 +454,9 @@ t "crowdsec: creds-файл создан (0600) с кредами" bash -c "test
 t "crowdsec: updater mode 0750 (не world-readable)" bash -c "test \$(stat -c %a '$SHIELD_BLOCKLIST_SCRIPT') = 750"
 t "crowdsec: интервал 1440м (лимит community-тарифа) запечён" grep -q '^BL_INTERVAL_crowdsec="1440"' "$SHIELD_BLOCKLIST_SCRIPT"
 t "crowdsec: updater валиден после перепечки" bash -n "$SHIELD_BLOCKLIST_SCRIPT"
-t "crowdsec: fetch-ветка с Basic-Auth + --compressed присутствует" bash -c "grep -q 'admin.api.crowdsec.net/\*' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q -- '--compressed' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q -- '-u \"\$CROWDSEC_USER:\$CROWDSEC_PASSWORD\"' '$SHIELD_BLOCKLIST_SCRIPT'"
+# 2026-09-24 (v1.1.4): backlog #8 (решение оператора: закрыть) — было `-u "$CROWDSEC_USER:$CROWDSEC_PASSWORD"`
+# (пароль в argv curl); Basic-Auth теперь curl-конфигом через stdin (-K -), `-u` в updater'е нет
+t "crowdsec: fetch-ветка с Basic-Auth + --compressed присутствует" bash -c "grep -q 'admin.api.crowdsec.net/\*' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q -- '--compressed' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q -- '-K - ' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'user = ' '$SHIELD_BLOCKLIST_SCRIPT' && ! grep -q -- '-u \"\$CROWDSEC_USER' '$SHIELD_BLOCKLIST_SCRIPT'"
 t "crowdsec: гард интервала + FORCE-обход присутствуют" bash -c "grep -q 'BL_INTERVAL_' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'lastok-' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'FORCE' '$SHIELD_BLOCKLIST_SCRIPT'"
 
 # функционально: свежий lastok → пропуск; FORCE=1 → применение

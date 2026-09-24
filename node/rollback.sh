@@ -17,6 +17,17 @@ node_rollback() {
 
     log info "rollback" "target backup set: ${ts:-<none — только удаление своих файлов>}"
 
+    # 0. 2026-09-24 (v1.1.5): юниты node — disable --now ДО удаления их файлов (шаг 1).
+    # Раньше шаг 4 проверял `systemctl cat` уже после удаления — disable не делался:
+    # «not-found active exited» и висячие симлинки в *.wants (живая нода);
+    # node-fq-tune.service не отключался вовсе.
+    local u
+    for u in node-mss-clamp.service node-rt-tweaks.service node-fq-tune.service; do
+        if systemctl cat "$u" >/dev/null 2>&1; then
+            systemctl disable --now "$u" >/dev/null 2>&1 || true
+        fi
+    done
+
     # 1. восстановление/удаление по манифесту
     local dropdirs=() reg="$NODE_STATE_DIR/file-origins.tsv" origin
     if [ -f "$NODE_MANIFEST" ]; then
@@ -81,6 +92,9 @@ node_rollback() {
         while IFS=$'\t' read -r rk rv; do
             [ -n "$rk" ] || continue
             skre="${rk//./\\.}"
+            # 2026-09-24 (v1.1.5): *_ratio (из реестра для bytes=0) — «управляется», пока
+            # оставшиеся файлы node задают парный *_bytes (запись ratio обнулила бы его)
+            case "$rk" in vm.dirty_ratio|vm.dirty_background_ratio) skre="${skre%_ratio}_bytes" ;; esac
             if grep -rqsE "^${skre}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null; then
                 printf '%s\t%s\n' "$rk" "$rv" >> "$stmp"; continue
             fi

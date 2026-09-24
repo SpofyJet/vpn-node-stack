@@ -26,6 +26,8 @@ node_status() {
     local k v actual st
     while IFS=$'\t' read -r k v f; do
         actual="$(sysctl -n "$k" 2>/dev/null || echo '?')"
+        # 2026-09-24 (v1.1.5): многозначные ключи ядро печатает через TAB, план — через пробел
+        actual="${actual//$'\t'/ }"
         if [ "$actual" = "$v" ]; then st="✓"; else st="✗"; fi
         printf '%-46s %-14s %-14s %s\n' "$k" "$v" "$actual" "$st"
     done < "$NODE_PLAN_FILE"
@@ -68,9 +70,15 @@ node_status() {
     echo "kernel: $(uname -r) $(node_kernel_is_xanmod && echo '[XanMod]' || echo '[stock]')"
     echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) gen=$(node_bbr_generation) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
     echo "congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 0) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)$(node_kernel_version_ge 6 15 && echo ' | mainline>=6.15: BBRv3 уже есть, XanMod не нужен' || true)"
+    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
+    # 2026-09-24 (v1.1.5): XanMod, поставленный НЕ по запросу (другим инструментом/вручную),
+    # в записи GRUB по умолчанию — следующий reboot молча сменит ядро (ограничение №2)
+    local gk; gk="$(node_grub_default_kernel)"
+    if [ "$(node_conf_get ENABLE_XANMOD 1)" != "1" ] && [[ "$gk" == *xanmod* ]] && [ "$gk" != "$(uname -r)" ]; then
+        warn "kernel" "ENABLE_XANMOD=0, но следующий reboot загрузит $gk (первая запись GRUB, GRUB_DEFAULT=0) вместо $(uname -r); node его не ставил. Нужен XanMod — ENABLE_XANMOD=1; не нужен — удали пакеты linux-*xanmod* и apt-репозиторий xanmod, затем update-grub"
+    fi
     echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0) nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0) irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
-    echo "datapath=$(node_conf_get ENABLE_DATAPATH 1) fq_tune=$(node_conf_get ENABLE_FQ_TUNE 1) busy_poll=$(node_conf_get ENABLE_BUSY_POLL 0) netdev_budget=$(node_conf_get NETDEV_BUDGET 600)/$(node_conf_get NETDEV_BUDGET_USECS 8000)"
+    echo "datapath=$(node_conf_get ENABLE_DATAPATH 1) fq_tune=$(node_conf_get ENABLE_FQ_TUNE 1) busy_poll=$(node_conf_get ENABLE_BUSY_POLL 0) netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo '?')/$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo '?')"
     echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash $NODE_DIR/install.sh rollback)"
     # runtime-твики и reboot-напоминание — против молчаливой потери после reboot
     if node_rt_boot_needed 2>/dev/null; then

@@ -72,11 +72,22 @@ node_nic_apply_rings() {
 }
 
 # node_nic_opt_apply — «сильный» режим NIC (opt-in, ENABLE_NIC_OFFLOAD_OPT=1):
-# rings до максимума, tso/gso off, gro ВКЛ (на форвардинге UDP-флуда выключение
-# GRO бьёт по CPU), txqueuelen 10000. Всё runtime — откат через runtime-tweaks.
+# rings до максимума, lro off, адаптивный coalescing; gro/tso/gso не трогаем.
+# Всё runtime — откат через runtime-tweaks.
+# 2026-09-24 (v1.1.7): убраны tso/gso off и txqueuelen 10000.
+#   tso/gso off — рецепт шейпинга медленных домашних линков: на сервере каждый 64К-сегмент
+#   режется CPU на ~45 MSS-пакетов в стеке (минус пропускная способность/плюс softirq), а
+#   размер TSO-пачки при BBR+fq и так ограничен tcp_tso_autosize() по pacing rate.
+#   txqueuelen — лимит только pfifo_fast/fq_codel-на-dev; у fq свой limit (10000 пакетов),
+#   на корне mq/fq значение не участвует. Твики прежних версий возвращаются (node_rt_drop).
 node_nic_opt_apply() {
+    [ "${DRY_RUN:-0}" = "1" ] || {
+        node_rt_drop offload tcp-segmentation-offload
+        node_rt_drop offload generic-segmentation-offload
+        node_rt_drop txqueuelen
+    }
     [ "$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)" = "1" ] || return 0
-    [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "nic: rings->max, tso/gso off, txqueuelen 10000"; return 0; }
+    [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "nic: rings->max, lro off, adaptive coalescing"; return 0; }
     local ifname
     ifname="$(node_default_iface)"
     [ -z "$ifname" ] && return 0
@@ -96,17 +107,8 @@ node_nic_opt_apply() {
         fi
     fi
 
-    local feat orig
-    for feat in tcp-segmentation-offload generic-segmentation-offload; do
-        orig="$(ethtool -k "$ifname" 2>/dev/null | awk -v f="$feat:" '$1==f{print $2; exit}')"
-        if [ "$orig" = "on" ]; then
-            if ethtool -K "$ifname" "$feat" off >/dev/null 2>&1; then
-                ok "nic" "$feat off (orig on — restore при rollback)"
-                node_rt_record "$ifname" offload "$feat" "$orig"
-            fi
-        fi
-    done
     # gro оставляем включённым; lro выключаем если включён
+    local orig
     orig="$(ethtool -k "$ifname" 2>/dev/null | awk '$1=="large-receive-offload:"{print $2; exit}')"
     if [ "$orig" = "on" ] && ethtool -K "$ifname" lro off >/dev/null 2>&1; then
         node_rt_record "$ifname" offload "large-receive-offload" "$orig"
@@ -125,14 +127,6 @@ node_nic_opt_apply() {
             fi
         fi
     done
-
-    local tql tql_orig
-    tql_orig="$(cat "/sys/class/net/$ifname/tx_queue_len" 2>/dev/null || echo 1000)"
-    tql="$(node_conf_get NIC_TXQUEUELEN 10000)"
-    if [ "$tql_orig" != "$tql" ] && ip link set dev "$ifname" txqueuelen "$tql" >/dev/null 2>&1; then
-        ok "nic" "txqueuelen $tql_orig -> $tql"
-        node_rt_record "$ifname" txqueuelen "$tql" "$tql_orig"
-    fi
 }
 
 # node_nic_lro_off — дефолтный дефенсивный LRO off (NIC_LRO_OFF=1): LRO конфликтует

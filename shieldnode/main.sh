@@ -2,7 +2,7 @@
 # shieldnode — main.sh: точка входа, режимы, lock, диспетчеризация (TZ §4, §28).
 set -euo pipefail
 
-SHIELD_VERSION="1.1.3"
+SHIELD_VERSION="1.1.5"
 # readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
 SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
@@ -14,7 +14,7 @@ export LOG_LEVEL=info
 
 usage() {
     cat <<'EOF'
-shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.3
+shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.5
 
 Использование: shieldnode [опции] <команда> [аргумент]
 
@@ -75,9 +75,21 @@ source "$SHIELD_DIR/config.sh"
 shield_load_config
 log info "main" "shieldnode v$SHIELD_VERSION cmd=$cmd dry_run=$DRY_RUN"
 
+# 2026-09-24 (v1.1.4): основной lock держит и blocklist-updater (весь прогон, секунды —
+# минуты на fetch). acquire_lock берёт его неблокирующе — apply сразу после apply
+# (updater от kick'а) и `emergency on` во время тика умирали «another shieldnode
+# instance holds the lock». Ждём освобождения (≤600с = TimeoutStartSec updater'а).
+shield_wait_lock() {
+    mkdir -p "$(dirname "$SHIELD_LOCK")" 2>/dev/null || true
+    if ! flock -n "$SHIELD_LOCK" true 2>/dev/null; then
+        log info "main" "lock занят (идёт обновление блоклистов?) — ждём до 600с"
+        flock -w 600 "$SHIELD_LOCK" true 2>/dev/null || true
+    fi
+}
+
 case "$cmd" in
     apply)
-        acquire_lock
+        shield_wait_lock; acquire_lock
         # shellcheck source=detect.sh
         source "$SHIELD_DIR/detect.sh"
         # shellcheck source=lib/nft.sh
@@ -97,6 +109,7 @@ case "$cmd" in
         # shellcheck source=lib/blocklist.sh
         source "$SHIELD_DIR/lib/blocklist.sh"
         shield_apply
+        shield_blocklist_kick   # 2026-09-24 (v1.1.4): после apply, без основного lock'а
         ;;
     detect)
         # shellcheck source=detect.sh
@@ -122,14 +135,14 @@ case "$cmd" in
         shield_guard
         ;;
     rollback)
-        acquire_lock
+        shield_wait_lock; acquire_lock
         # shellcheck source=rollback.sh
         source "$SHIELD_DIR/rollback.sh"
         shield_rollback "$subarg"
         ;;
     emergency)
         # on/off меняют таблицу — тот же lock, что и у apply (status — read-only, не нужен)
-        [ "$subarg" = "status" ] || acquire_lock
+        [ "$subarg" = "status" ] || { shield_wait_lock; acquire_lock; }
         # off требует полного apply — подключаем весь стек как в apply
         # (blocklist/crowdsec обязательны: shield_apply зовёт shield_blocklist_install,
         # без source — command not found и падение посреди apply)
@@ -152,9 +165,11 @@ case "$cmd" in
         # shellcheck source=lib/blocklist.sh
         source "$SHIELD_DIR/lib/blocklist.sh"
         shield_emergency "$subarg"
+        # 2026-09-24 (v1.1.4): emergency off = полный apply — первый тик updater'а без lock'а
+        if declare -F shield_blocklist_kick >/dev/null; then shield_blocklist_kick; fi
         ;;
     uninstall)
-        acquire_lock  # гонка с apply/rollback исключена
+        shield_wait_lock; acquire_lock  # гонка с apply/rollback исключена
         # shellcheck source=rollback.sh
         source "$SHIELD_DIR/rollback.sh"
         # shellcheck source=uninstall.sh

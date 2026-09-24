@@ -48,6 +48,8 @@ shield_guard() {
         while read -r n p _b; do prev_p[$n]="$p"; done < <(tail -n +2 "$SHIELD_GUARD_SNAPSHOT" 2>/dev/null || true)
     fi
     local dt=$(( now_ts - prev_ts )); [ "$dt" -le 0 ] && dt=0
+    # 2026-09-24 (v1.1.4): нет снапшота (prev_ts=0) — дельты нет, а не «за N с 1970»
+    [ "$prev_ts" -gt 0 ] 2>/dev/null || dt=0
     local total_lines
     total_lines="$(guard_counters | wc -l)"
     if [ "$total_lines" -eq 0 ]; then
@@ -144,7 +146,7 @@ shield_guard() {
 
     # --- 6) алерты updater'а (stale-фиды, fail counters) ---
     echo "--- updater alerts ---"
-    local alerts=0 a f
+    local alerts=0 f
     for f in "$SHIELD_STATE_DIR"/blocklists/.alert-*; do
         [ -e "$f" ] || continue
         printf '  STALE: %s (since %s)\n' "$(basename "$f" | sed 's/^\.alert-//')" "$(cat "$f" 2>/dev/null || echo '?')"

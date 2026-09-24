@@ -6,7 +6,7 @@
 #   security-sysctl -> исходные; stack.conf через mktemp в каталоге назначения;
 #   blocklist-юниты: ReadWritePaths с '-', tmpfiles, state-каталог; creds без
 #   исполнения кода при source; guard -> main.sh +x.
-#   (креды в argv curl -u — НЕ исправлено: конфликт с test-blocklist.sh, см. отчёт)
+#   (креды в argv curl -u — исправлено 2026-09-24 v1.1.4, см. test-crowdsec-argv.sh)
 # Под root тест уходит в `unshare -mn`: tmpfs поверх реальных путей (/etc/*,
 # /usr/local/sbin, /var/lib/shieldnode, /var/log, /run) — хост не затрагивается.
 set -euo pipefail

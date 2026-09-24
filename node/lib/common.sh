@@ -2,7 +2,13 @@
 # node — lib/common.sh: logging (scrub), lock, backup, atomic write.
 set -euo pipefail
 
-C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'; C_NC=$'\033[0m'
+# 2026-09-24 (v1.1.5, backlog #9): цвет — только если stderr (куда идут warn/error) — TTY и нет
+# NO_COLOR; иначе в пайпах/журнале systemd warn-строки приходили с ANSI-мусором
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'; C_NC=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_NC=''
+fi
 
 scrub() {
     # Маскирование секретов перед записью в лог (ТЗ §5).
@@ -140,7 +146,9 @@ node_rt_record() {
     mkdir -p "$NODE_STATE_DIR"
     # re-apply: первый проход зафиксировал ИСХОДНОЕ значение — не перезаписываем
     # его текущим (уже подкрученным), иначе rollback вернёт не заводское состояние
-    if [ -f "$NODE_RT_TWEAKS" ] && grep -qF "$(printf '%s\t%s\t%s\t' "$1" "$2" "$3")" "$NODE_RT_TWEAKS"; then
+    # 2026-09-24 (v1.1.5): `--` — для iface "-" (sysfs/THP) шаблон начинался с '-', grep
+    # принимал его за опцию, дедупликация не срабатывала и re-apply дописывал текущее значение
+    if [ -f "$NODE_RT_TWEAKS" ] && grep -qF -- "$(printf '%s\t%s\t%s\t' "$1" "$2" "$3")" "$NODE_RT_TWEAKS"; then
         log debug "rt" "tweak уже записан (re-apply), пропуск: $1/$2/$3"
         return 0
     fi
@@ -177,6 +185,11 @@ node_rt_rollback() {
                             && log info "rt" "xps $iface/$param restored=$orig" || true ;;
             sysfs)      [ -w "/sys/$param" ] && printf '%s' "$orig" > "/sys/$param" 2>/dev/null \
                             && log info "rt" "sysfs /sys/$param restored=$orig" || true ;;
+            # 2026-09-24 (v1.1.5): fq-параметры (param = "root" | "parent X:Y", orig = "limit N flow_limit N buckets N")
+            fq)         # param/orig — несколько слов tc из нашего реестра, split намеренный
+                        # shellcheck disable=SC2086
+                        command -v tc >/dev/null && tc qdisc replace dev "$iface" $param fq $orig >/dev/null 2>&1 \
+                            && log info "rt" "fq $iface/$param restored ($orig)" || true ;;
             mount)      findmnt -rn "$param" >/dev/null 2>&1 \
                             && mount -o "remount,$orig" "$param" >/dev/null 2>&1 \
                             && log info "rt" "mount $param remounted (orig opts)" || true ;;
@@ -187,4 +200,20 @@ node_rt_rollback() {
     ok "rt" "runtime tweaks restored"
 }
 
-# shellcheck source=lib/sysctl.sh
+# node_rt_drop <kind> [param] — 2026-09-24 (v1.1.7): вернуть исходное значение твика, который
+# node больше не делает (записи прежних версий), и убрать его из реестра; остальное не трогаем.
+node_rt_drop() {
+    [ -f "$NODE_RT_TWEAKS" ] || return 0
+    local sel rest
+    sel="$(mktemp)"; rest="$(mktemp "$NODE_RT_TWEAKS.XXXXXX")"
+    awk -F'\t' -v k="$1" -v p="${2:-}" -v s="$sel" '$2 == k && (p == "" || $3 == p) { print > s; next } { print }' \
+        "$NODE_RT_TWEAKS" > "$rest"
+    if [ -s "$sel" ]; then
+        NODE_RT_TWEAKS="$sel" node_rt_rollback >/dev/null 2>&1 || true
+        log info "rt" "твик $1${2:+/$2} прежней версии возвращён к исходному и снят с учёта"
+        mv -f "$rest" "$NODE_RT_TWEAKS"
+    else
+        rm -f "$rest"
+    fi
+    rm -f "$sel"
+}
