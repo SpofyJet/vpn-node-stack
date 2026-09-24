@@ -1,7 +1,7 @@
 #!/bin/bash
 # node — lib/datapath.sh: datapath-pack 2 (порт ШАГ 7.12A/B старой ветки, v5.x).
 # Обоснования — из боевого лога старого скрипта:
-#   netdev_budget=600 (usecs пропорционально: 4000; v1.1.7 — было 8000): дефолтный
+#   netdev_budget=600 (usecs — v1.1.8: пропорционально budget в целых jiffy, >= 2 jiffy): дефолтный
 #     NAPI budget=300 пакетов/2ms — softirq не успевает выгребать RX-ring при 20k+ сессий;
 #   tcp_max_tw_buckets=524288: TIME_WAIT-потолок (дефолт 16-32k) — узкое
 #     место массовых коротких VPN-сессий;
@@ -48,6 +48,14 @@ node_softnet_read() {
     _NODE_SN_READ=1
 }
 # node_conf_user_set — в config.sh (v1.1.7: нужен и irq.sh в rt-reapply)
+
+# node_kernel_hz — CONFIG_HZ текущего ядра (пусто, если не определить). 2026-09-25 (v1.1.8)
+node_kernel_hz() {
+    local f="${NODE_KERNEL_CONFIG:-/boot/config-$(uname -r)}" v=""
+    [ -r "$f" ] && v="$(sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' "$f" | head -1)"
+    [ -z "$v" ] && [ -r /proc/config.gz ] && v="$(zcat /proc/config.gz 2>/dev/null | sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' | head -1)"
+    printf '%s' "$v"
+}
 # node_softnet_value <ключ-конфига> <значение-плана> <drop|squeeze> — шаг вверх (x2)
 # ТОЛЬКО при доказанном насыщении и AUTO_SOFTNET_TUNE=1; иначе значение плана как есть.
 node_softnet_value() {
@@ -128,16 +136,39 @@ node_datapath_plan() {
     local f="$NODE_SYSCTL_DATAPATH"
 
     node_softnet_read
-    local nb; nb="$(node_softnet_value NETDEV_BUDGET "$(node_conf_get NETDEV_BUDGET 600)" squeeze)"
-    [ "$nb" != "$(node_conf_get NETDEV_BUDGET 600)" ] && log info "datapath" "softnet: time_squeeze=${_NODE_SN_SQZ}/${_NODE_SN_PROC} (>0.1%) — netdev_budget -> $nb (AUTO_SOFTNET_TUNE)"
+    # 2026-09-24 (v1.1.8): значение конфига идёт в $(( )) ниже — bash вычисляет содержимое
+    # переменной как выражение (NETDEV_BUDGET='x[$(cmd)]' исполнил бы cmd): только цифры
+    local nb; nb="$(node_conf_get NETDEV_BUDGET 600)"
+    [[ "$nb" =~ ^[0-9]{1,7}$ ]] || { warn "datapath" "NETDEV_BUDGET='$nb' — не число, берём 600"; nb=600; }
+    nb="$(node_softnet_value NETDEV_BUDGET "$nb" squeeze)"
+    node_conf_user_set NETDEV_BUDGET || [ "$nb" = 600 ] || log info "datapath" "softnet: time_squeeze=${_NODE_SN_SQZ}/${_NODE_SN_PROC} (>0.1%) — netdev_budget -> $nb (AUTO_SOFTNET_TUNE)"
     node_sysctl_add "$f" net.core.netdev_budget "$nb"
-    # 2026-09-24 (v1.1.7): usecs — пропорционально budget (дефолт ядра 2000µs на 300 пакетов):
-    # 600 -> 4000, после авто-удвоения по time_squeeze 1200 -> 8000. Прежние безусловные 8000
-    # при budget 600 давали softirq-циклы до 8мс (2 тика при HZ=250 у XanMod) — задержка
-    # Xray/real-time UDP на этом ядре CPU без выигрыша (packet-budget исчерпывается раньше).
-    local nbu; nbu="$(node_conf_get NETDEV_BUDGET_USECS "")"
-    [[ "$nbu" =~ ^[0-9]+$ ]] || nbu=$(( nb > 0 ? 2000 * nb / 300 : 4000 ))
-    node_sysctl_add "$f" net.core.netdev_budget_usecs "$nbu"
+    # 2026-09-25 (v1.1.8): usecs — В ЦЕЛЫХ JIFFY. net_rx_action считает лимит как
+    # jiffies + usecs_to_jiffies(usecs); дефолт ядра = 2 jiffy (hotdata.c: 2*USEC_PER_SEC/HZ),
+    # и с 6.x это же МИНИМУМ (sysctl_net_core.c: netdev_budget_usecs_min). Прежняя формула v1.1.7
+    # (2000µs на 300 пакетов -> 4000) исходила из HZ=1000: на XanMod (HZ=250) 4000 = 1 jiffy ->
+    # EINVAL на 6.18, sysctl -p ронял apply (живая нода). Теперь: пропорционально budget, но
+    # не меньше 2 jiffy и кратно jiffy; ключ пишем, только если это БОЛЬШЕ дефолта ядра.
+    # HZ неизвестен — не пишем вовсе (дефолт ядра всегда валиден). Явное значение < минимума — warn.
+    local nbu hz jus min want
+    hz="$(node_kernel_hz)"
+    nbu="$(node_conf_get NETDEV_BUDGET_USECS "")"
+    if [[ "$hz" =~ ^[0-9]+$ ]] && [ "$hz" -gt 0 ]; then
+        jus=$((1000000 / hz)); min=$((2 * jus))
+        if [ -n "$nbu" ]; then
+            if ! [[ "$nbu" =~ ^[0-9]{1,8}$ ]] || [ "$nbu" -lt "$min" ]; then
+                warn "datapath" "NETDEV_BUDGET_USECS='$nbu' — не число или < минимума ядра ${min}µs (2 jiffy при HZ=$hz): ключ не пишем"
+                nbu=""
+            fi
+        else
+            want=$(( 2000 * nb / 300 ))
+            want=$(( (want + jus - 1) / jus * jus ))            # вверх до целого jiffy
+            [ "$want" -gt "$min" ] && nbu="$want"              # == дефолт ядра — не трогаем
+        fi
+    elif [ -n "$nbu" ]; then
+        [[ "$nbu" =~ ^[0-9]{1,8}$ ]] && [ "$nbu" -ge 20000 ] || { warn "datapath" "HZ ядра не определён — NETDEV_BUDGET_USECS='$nbu' не пишем (минимум неизвестен)"; nbu=""; }
+    fi
+    [ -n "$nbu" ] && node_sysctl_add "$f" net.core.netdev_budget_usecs "$nbu"
     node_sysctl_add "$f" net.ipv4.tcp_max_tw_buckets "$(node_conf_get TCP_MAX_TW_BUCKETS 524288)"
 
     # tcp_mem: потолок ≈ TCP_MEM_PCT% RAM (страницы), pressure 75%/87.5% от него
@@ -189,7 +220,9 @@ node_datapath_plan() {
     # имела 45056, tier T1 32768 его ПОНИЖАЛ — меньше запаса для GFP_ATOMIC skb в softirq,
     # обратное задуманному. Базовое значение ниже tier — поднимаем, иначе ключ не пишем.
     local mfb; mfb="$(node_sysctl_baseline vm.min_free_kbytes)"
+    local mft="$mfk"
     mfk="$(node_conf_get VM_MIN_FREE_KBYTES "$mfk")"
+    [[ "$mfk" =~ ^[0-9]{1,9}$ ]] || { warn "datapath" "VM_MIN_FREE_KBYTES='$mfk' — не число, tier-значение $mft"; mfk="$mft"; }
     if node_conf_user_set VM_MIN_FREE_KBYTES || ! [[ "$mfb" =~ ^[0-9]+$ ]] || [ "$mfk" -gt "$mfb" ]; then
         node_sysctl_add "$NODE_SYSCTL_MEM" vm.min_free_kbytes "$mfk"
     fi

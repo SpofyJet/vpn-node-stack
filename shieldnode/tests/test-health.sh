@@ -18,7 +18,7 @@ for d in /run /etc/node-profile.d; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
 SHIELD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT=/tmp/shieldnode-test-health
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/state" "$OUT/elems" "$OUT/bl"
-export SHIELD_DIR SHIELD_VERSION=test SHIELD_STATE_DIR="$OUT/state" SHIELD_LOG="$OUT/log" SHIELD_EXCLUDE="$OUT/none"
+export SHIELD_DIR SHIELD_VERSION=test SHIELD_STATE_DIR="$OUT/state" SHIELD_LOG="$OUT/log" SHIELD_EXCLUDE="$OUT/none" SHIELD_UFW_DIR="$OUT/no-ufw"
 export SHIELD_BLOCKLIST_STATE="$OUT/bl" LIVE="$OUT/live.nft" ELEMS="$OUT/elems" CNTS="$OUT/counters"
 : > "$SHIELD_LOG"; : > "$CNTS"; unset SSH_CONNECTION
 
@@ -69,8 +69,9 @@ gen()  { cfg "$1"; ( shield_limits_resolve >/dev/null 2>&1; SH_F_IPV6=1; shield_
 H()    { shield_health > "$OUT/h.txt" 2>&1; }
 has()  { grep -qF -- "$1" "$OUT/h.txt"; }
 sumf() { grep -oE "health: FAIL=[0-9]+ WARN=[0-9]+" "$OUT/h.txt"; }
-fill() { local s; for s in scanner_blocklist_v4 threat_blocklist_v4 custom_blocklist_v4 spamhaus_blocklist_v4 cins_blocklist_v4; do printf '1.2.3.0/24\n5.6.7.8/32\n' > "$ELEMS/$s"; done
-         for n in scanner threat custom spamhaus cins; do : > "$OUT/bl/last-good-$n.txt"; done; }
+# 2026-09-24 (v1.1.6): crowdsec включён по умолчанию — здоровая нода имеет и его сет
+fill() { local s; for s in scanner_blocklist_v4 threat_blocklist_v4 custom_blocklist_v4 spamhaus_blocklist_v4 cins_blocklist_v4 crowdsec_blocklist_v4; do printf '1.2.3.0/24\n5.6.7.8/32\n' > "$ELEMS/$s"; done
+         for n in scanner threat custom spamhaus cins crowdsec; do : > "$OUT/bl/last-good-$n.txt"; done; }
 healthy() { printf '[shieldnode]\nversion=test\nupdated=2026-09-23T10:00:00Z\n' > /etc/node-profile.d/stack.conf; fill; printf 'c_drops_scanner_v4 42\nc_drops_invalid 3\n' > "$CNTS"; }
 
 # ---------- 1. здоровая нода ----------
@@ -80,7 +81,7 @@ t "порядок: established/lo/whitelist до первого drop"    'has "[
 t "SSH 22 (SSH_PORT пуст -> авто-детект) под защитой"    'has "[PASS] SSH 22: rate/conn-limit активны (авто-детект)"'
 t "внешний xray 443/tcp под защитой, loopback 10085 игнорируется" 'has "все внешние порты xray/remnanode под защитой (tcp: 443;" && ! has "10085"'
 t "блоклисты: записи + пояснение про MIN до схлопывания" 'has "[PASS] scanner: 2 записей" && has "MIN проверяет updater"'
-t "tor/crowdsec выключены и отсутствуют — PASS"          'has "[PASS] tor: выключен и отсутствует" && has "[PASS] crowdsec: выключен и отсутствует"'
+t "tor выключен и отсутствует — PASS; crowdsec (дефолт ВКЛ, v1.1.6) — есть записи" 'has "[PASS] tor: выключен и отсутствует" && has "[PASS] crowdsec: 2 записей"'
 t "последний apply, дропы 45, abuse-сеты, журнал"       'has "последний apply: 2026-09-23T10:00:00Z" && has "дропов с последнего apply: 45 пакетов" && has "abuse-сеты сейчас: ssh=0"'
 t "таймер + boot-служба PASS"                            'has "[PASS] shieldnode-blocklist.timer активен" && has "[PASS] shieldnode.service enabled"'
 

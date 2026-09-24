@@ -70,7 +70,7 @@ node_status() {
     echo "kernel: $(uname -r) $(node_kernel_is_xanmod && echo '[XanMod]' || echo '[stock]')"
     echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) gen=$(node_bbr_generation) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
     echo "congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
+    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{sub(/^linux-image-/, "", $2); o = o (o ? "," : "") $2} END{print o ? o : "none"}' || echo none)$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
     # 2026-09-24 (v1.1.5): XanMod, поставленный НЕ по запросу (другим инструментом/вручную),
     # в записи GRUB по умолчанию — следующий reboot молча сменит ядро (ограничение №2)
     local gk; gk="$(node_grub_default_kernel)"

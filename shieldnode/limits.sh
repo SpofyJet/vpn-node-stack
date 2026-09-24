@@ -77,7 +77,7 @@ shield_limits_resolve() {
     SH_F_BLOCK_TOR="$(shield_conf_get BLOCK_TOR 0)"
     SH_F_ENABLE_CUSTOM_LIST="$(shield_conf_get ENABLE_CUSTOM_LIST 1)"
     # crowdsec: opt-in (default 0) — без креденшелов консоли фид бессмысленен
-    SH_F_ENABLE_CROWDSEC_LIST="$(shield_conf_get ENABLE_CROWDSEC_LIST 0)"
+    SH_F_ENABLE_CROWDSEC_LIST="$(shield_conf_get ENABLE_CROWDSEC_LIST 1)"   # v1.1.6: дефолт 1
     # spamhaus/cins: бесплатные фиды без ключа — default 1 (worst-of-the-worst, ложных срабатываний почти нет)
     SH_F_ENABLE_SPAMHAUS_LIST="$(shield_conf_get ENABLE_SPAMHAUS_LIST 1)"
     SH_F_ENABLE_CINS_LIST="$(shield_conf_get ENABLE_CINS_LIST 1)"
@@ -105,7 +105,7 @@ shield_limits_resolve() {
         # 2026-09-23: у `ss -ulnp` есть колонка State (UNCONN) — $5 был Peer
         # ('0.0.0.0:*'), мусор уходил в protected_udp и nft -c отвергал ruleset
         # при ЛЮБОМ UDP-inbound xray. Local = первое поле вида адрес:порт.
-        det_u="$(ss -ulnp 2>/dev/null | _ss_local_ports 'xray|remnanode' | sort -un | tr '\n' ' ' | sed 's/ $//' || true)"
+        det_u="$(shield_detect_vpn_listen udp)"
     fi
     # 2026-09-24 (v1.1.5): keep-last-good и для UDP (раньше не было вовсе — apply во время
     # рестарта xray оставлял protected_udp пустым до следующего apply)
@@ -116,6 +116,7 @@ shield_limits_resolve() {
         det_u="$(cat "$ustate")"
         log warn "limits" "xray/remnanode не слушает UDP — keep-last-good: $det_u"
     fi
+    det_u="$det_u $(shield_detect_ufw_ports udp)"   # 2026-09-24 (v1.1.6): после keep-last-good
     local extra_t extra_u
     extra_t="$(shield_conf_get PROTECTED_TCP_EXTRA "")"
     extra_u="$(shield_conf_get PROTECTED_UDP_EXTRA "")"
@@ -136,8 +137,12 @@ shield_limits_resolve() {
             fi
             case "$op" in
                 PORT)  excl_ports_v4="$excl_ports_v4 $arg" ;;
-                IP)    case "$arg" in *:*) excl_v6="$excl_v6 $arg" ;; *) excl_v4="$excl_v4 $arg" ;; esac ;;
-                IP6)   excl_v6="$excl_v6 $arg" ;;
+                IP|IP6)
+                       # 2026-09-24 (v1.1.6): только валидный адрес/CIDR (см. shield_valid_cidr)
+                       if ! shield_valid_cidr "$arg"; then
+                           log warn "exclude" "не адрес/CIDR или маска шире /8 (v4) //16 (v6), пропущено: $line"; continue
+                       fi
+                       case "$arg" in *:*) excl_v6="$excl_v6 $arg" ;; *) excl_v4="$excl_v4 $arg" ;; esac ;;
                 *)     log warn "exclude" "неизвестная директива: $line" ;;
             esac
         done < "$SHIELD_EXCLUDE"
@@ -145,12 +150,16 @@ shield_limits_resolve() {
 
     # вычитаем exclude-порты из protected
     local p out_t="" out_u=""
+    # 2026-09-24 (v1.1.6): невалидный порт (опечатка в *_EXTRA) раньше уходил в nft и
+    # nft -c отвергал ВЕСЬ ruleset — теперь пропускается с warn
     for p in $det_t $extra_t; do
+        shield_port_valid "$p" || { log warn "limits" "protected tcp: '$p' — не порт/диапазон, пропущен"; continue; }
         case " $excl_ports_v4 " in *" $p "*) continue ;; esac
         case " $out_t " in *" $p "*) continue ;; esac
         out_t="$out_t $p"
     done
     for p in $det_u $extra_u; do
+        shield_port_valid "$p" || { log warn "limits" "protected udp: '$p' — не порт/диапазон, пропущен"; continue; }
         case " $excl_ports_v4 " in *" $p "*) continue ;; esac
         case " $out_u " in *" $p "*) continue ;; esac
         out_u="$out_u $p"
@@ -163,6 +172,8 @@ shield_limits_resolve() {
     trusted="$(shield_conf_get TRUSTED_IPS "")"
     local tip
     for tip in $trusted; do
+        # 2026-09-24 (v1.1.6): невалидный/слишком широкий адрес — warn и пропуск (не ломаем apply)
+        shield_valid_cidr "$tip" || { log warn "limits" "TRUSTED_IPS: '$tip' — не адрес/CIDR или маска шире /8 (v4) //16 (v6), пропущен"; continue; }
         case "$tip" in
             *:*) t_v6="$t_v6 $tip" ;;
             *)   t_v4="$t_v4 $tip" ;;

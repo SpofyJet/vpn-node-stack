@@ -14,6 +14,8 @@ LOG_LEVEL=info
 
 rm -rf /tmp/node-dp-test
 mkdir -p "$NODE_STATE_DIR" "$NODE_DIAG_DIR" "$NODE_PROFILE_DIR"
+# 2026-09-25 (v1.1.8): netdev_budget_usecs зависит от HZ ядра — фиксируем (1000, как Ubuntu generic)
+printf 'CONFIG_HZ=1000\n' > /tmp/node-dp-test/kconfig; export NODE_KERNEL_CONFIG=/tmp/node-dp-test/kconfig
 
 source "$NODE_DIR/lib/common.sh"
 source "$NODE_DIR/config.sh"
@@ -42,7 +44,29 @@ elif [ "$tier_mb" -le 4096 ]; then exp_rd=2097152
 else exp_rd=8388608; fi
 
 t "plan: netdev_budget=600" bash -c "grep -q 'net.core.netdev_budget	600' '$PLAN'"
-t "plan: netdev_budget_usecs=4000 (v1.1.7: пропорционально budget, было 8000)" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+t "plan (HZ=1000): netdev_budget_usecs=4000 (4 jiffy, пропорционально budget 600)" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+# HZ=250 (XanMod): 4000 = 1 jiffy < минимума ядра 8000 (EINVAL на 6.18) -> ключ не пишем, дефолт ядра
+printf 'CONFIG_HZ=250\n' > "$NODE_KERNEL_CONFIG"; replan
+t "plan (HZ=250): netdev_budget_usecs НЕ пишется (дефолт ядра = минимум 8000 = 2 jiffy)" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN' && grep -q 'net.core.netdev_budget	600' '$PLAN'"
+printf 'CONFIG_HZ=100\n' > "$NODE_KERNEL_CONFIG"; replan
+t "plan (HZ=100): не пишется (минимум 20000)" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN'"
+: > "$NODE_KERNEL_CONFIG"; replan
+t "plan (HZ неизвестен): не пишется" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN'"
+# живое ядро: план с НАСТОЯЩИМ /boot/config — значение должно приниматься ядром (4000 на 6.18/HZ=250
+# давал EINVAL и ронял apply). Ключ глобальный (не netns) — пишем на миг и сразу возвращаем исходное.
+if [ "$(id -u)" -eq 0 ] && [ -w /proc/sys/net/core/netdev_budget_usecs ]; then
+    ( unset NODE_KERNEL_CONFIG; replan; cp "$PLAN" /tmp/node-dp-test/plan.live )
+    live_v="$(awk -F'\t' '$1 == "net.core.netdev_budget_usecs" {print $2}' /tmp/node-dp-test/plan.live)"
+    if [ -n "$live_v" ]; then
+        orig_v="$(sysctl -n net.core.netdev_budget_usecs)"
+        if sysctl -qw "net.core.netdev_budget_usecs=$live_v" 2>/dev/null; then acc=1; else acc=0; fi
+        sysctl -qw "net.core.netdev_budget_usecs=$orig_v" 2>/dev/null || true
+        t "живое ядро $(uname -r): план netdev_budget_usecs=$live_v принимается" test "$acc" = 1
+    else
+        t "живое ядро $(uname -r): netdev_budget_usecs не пишется (дефолт ядра)" true
+    fi
+fi
+printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"; replan
 t "plan: tcp_max_tw_buckets=524288" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	524288' '$PLAN'"
 t "plan: tcp_mem по формуле 25% RAM" bash -c "grep -q \"net.ipv4.tcp_mem	$exp_tcp_mem\" '$PLAN'"
 # 2026-09-24 (v1.1.7): ревизия тюнинга — rmem/wmem_default по умолчанию НЕ пишутся (дефолт ядра)

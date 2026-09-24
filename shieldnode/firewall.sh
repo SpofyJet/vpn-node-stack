@@ -5,6 +5,27 @@ set -euo pipefail
 
 SHIELD_BACKUP_DIR="$SHIELD_STATE_DIR/backups"
 
+# 2026-09-24 (v1.1.6): дампы ruleset'а (~1МБ с блок-листами) писались на КАЖДЫЙ apply без
+# ротации (живая нода: 21 файл, 13МБ) и были world-readable 0644 — внутри whitelist (IP
+# админа, TRUSTED_IPS = IP панели). Теперь каталог 0700, файлы 0600, хранится BACKUP_KEEP
+# последних (отдельно для обычных и emergency-дампов; только что записанный — самый новый).
+shield_backup_dir_prep() {
+    mkdir -p "$SHIELD_BACKUP_DIR"
+    chmod 0700 "$SHIELD_BACKUP_DIR" 2>/dev/null || true
+    chmod 0600 "$SHIELD_BACKUP_DIR"/*.nft 2>/dev/null || true
+}
+shield_backup_prune() {
+    local keep; keep="$(shield_conf_get BACKUP_KEEP 5)"
+    case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
+    [ "$keep" -ge 1 ] || keep=1
+    # `|| true`: пустой каталог -> ls rc 2, под pipefail+errexit это молча убивало apply
+    # shellcheck disable=SC2012
+    ls -1t "$SHIELD_BACKUP_DIR"/[0-9]*.nft 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f || true
+    # shellcheck disable=SC2012
+    ls -1t "$SHIELD_BACKUP_DIR"/emergency-*.nft 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f || true
+    return 0
+}
+
 # shield_nft_available — жёсткое требование nftables (ТЗ §4: без iptables-fallback).
 shield_nft_available() {
     command -v nft >/dev/null 2>&1 || die "nft не найден. Требуется nftables (apt install nftables / yum install nftables)."
@@ -143,11 +164,12 @@ shield_apply() {
     rm -f "$tmp.err"
 
     # --- backup текущей таблицы для auto-rollback ---
-    mkdir -p "$SHIELD_BACKUP_DIR"
+    shield_backup_dir_prep
     local ts bdump
     ts="$(date '+%Y%m%d-%H%M%S')"
     bdump="$SHIELD_BACKUP_DIR/${ts}.nft"
-    shield_table_dump "$bdump" || log info "apply" "таблицы inet shieldnode ещё не было — чистый старт"
+    ( umask 077; shield_table_dump "$bdump" ) || log info "apply" "таблицы inet shieldnode ещё не было — чистый старт"
+    shield_backup_prune
     # 2026-09-24 (v1.1.5): журнал abuse и дамп банов — ДО замены таблицы (после неё
     # динамические сеты пусты; раньше журнал писался уже по пустым сетам)
     local carry="$tmp.carry"

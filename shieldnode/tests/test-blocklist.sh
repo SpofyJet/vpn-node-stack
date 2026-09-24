@@ -436,7 +436,10 @@ t "swap-mixed: legacy flush отработал" bash -c "grep -q 'flush set scan
 
 echo
 # ================= 9) crowdsec community blocklist (feed без демона) =================
-t "crowdsec: по умолчанию выключен (BL_ENABLED_crowdsec=0)" grep -q '^BL_ENABLED_crowdsec="0"' "$SHIELD_BLOCKLIST_SCRIPT"
+t "crowdsec: SH_F не задан -> updater не включает (BL_ENABLED_crowdsec=0)" grep -q '^BL_ENABLED_crowdsec="0"' "$SHIELD_BLOCKLIST_SCRIPT"
+# 2026-09-24 (v1.1.6): дефолт конфига — ВКЛ (решение оператора), limits.sh резолвит в SH_F=1
+t "crowdsec: по умолчанию ВКЛ (defaults: ENABLE_CROWDSEC_LIST=1)" grep -qx 'ENABLE_CROWDSEC_LIST=1' "$SHIELD_DIR/shieldnode.defaults.conf"
+t "crowdsec: limits.sh без конфига -> SH_F_ENABLE_CROWDSEC_LIST=1" bash -c "SHIELD_CONFIG=/nonexistent bash -c 'source \"\$SHIELD_DIR/lib/common.sh\"; source \"\$SHIELD_DIR/config.sh\"; shield_load_config >/dev/null 2>&1; source \"\$SHIELD_DIR/detect.sh\"; source \"\$SHIELD_DIR/limits.sh\"; shield_limits_resolve >/dev/null 2>&1; [ \"\$SH_F_ENABLE_CROWDSEC_LIST\" = 1 ]'"
 
 # креды в конфиге → endpoint и Basic-Auth запекаются в updater
 { printf 'ENABLE_CROWDSEC_LIST=1\nCROWDSEC_INTEGRATION_ID=integration-4242\nCROWDSEC_USER=testuser\nCROWDSEC_PASSWORD=testpass\n'
@@ -488,18 +491,28 @@ t "crowdsec: last-good снапшот сохранён" bash -c "grep -qx '185.2
   grep -v '^CROWDSEC_INTEGRATION_ID\|^CROWDSEC_USER\|^CROWDSEC_PASSWORD' "$CONFIG_CACHE"; } > "$CONFIG_CACHE.new"
 mv "$CONFIG_CACHE.new" "$CONFIG_CACHE"
 SHIELD_BLOCKLIST_SCRIPT=/usr/local/sbin/shieldnode-blocklist
-shield_blocklist_install
+rm -f "$OUT/etc/systemd/system/shieldnode-blocklist-crowdsec."*
+SH_F_ENABLE_CROWDSEC_LIST=1 shield_blocklist_install
 SHIELD_BLOCKLIST_SCRIPT="$OUT/usr/local/sbin/shieldnode-blocklist"
+# 2026-09-24 (v1.1.6): общий таймер тикает раз в 360 мин — у agent-режима свой таймер
+t "crowdsec-agent: свой таймер каждые 30 мин" bash -c "grep -qx 'OnUnitActiveSec=30min' '$OUT/etc/systemd/system/shieldnode-blocklist-crowdsec.timer'"
+t "crowdsec-agent: служба обновляет ТОЛЬКО crowdsec" bash -c "grep -qx 'ExecStart=/usr/local/sbin/shieldnode-blocklist crowdsec' '$OUT/etc/systemd/system/shieldnode-blocklist-crowdsec.service'"
+t "общий таймер — прежний интервал (360 мин)" bash -c "grep -qx 'OnUnitActiveSec=360min' '$OUT/etc/systemd/system/shieldnode-blocklist.timer'"
 t "crowdsec-agent: local://cscli-decisions запечён (не admin.api)" bash -c "grep -q '^BL_URLS_crowdsec=\"local://cscli-decisions\"' '$SHIELD_BLOCKLIST_SCRIPT'"
-t "crowdsec-agent: интервал 30м запечён (local-чтение, без 429)" grep -q '^BL_INTERVAL_crowdsec="30"' "$SHIELD_BLOCKLIST_SCRIPT"
+t "crowdsec-agent: interval-guard выключен (0) — частоту задаёт свой таймер (v1.1.6)" grep -q '^BL_INTERVAL_crowdsec="0"' "$SHIELD_BLOCKLIST_SCRIPT"
 t "crowdsec-agent: ветка local://cscli-decisions присутствует" bash -c "grep -q 'local://cscli-decisions)' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'cscli decisions list' '$SHIELD_BLOCKLIST_SCRIPT'"
 
 # функционально: fake cscli отдаёт decisions JSON
 cat > "$OUT/bin/cscli" <<'CSCLI_EOF'
 #!/bin/bash
+# как настоящий cscli (1.8): без -a — только ЛОКАЛЬНЫЕ решения; community (CAPI) — только с -a
 case "$*" in
+    "decisions list -a -t ban --limit 0 -o json")
+        echo '[{"scenario":"crowdsecurity/ssh-slow-bf","decisions":[{"value":"45.83.64.77","scope":"Ip","origin":"crowdsec","type":"ban"}]},
+               {"scenario":"update : +2/-0 IPs","decisions":[{"value":"185.220.101.9","scope":"Ip","origin":"CAPI","type":"ban"},{"value":"91.240.118.0/24","scope":"Range","origin":"CAPI","type":"ban"}]}]'
+        exit 0 ;;
     "decisions list -t ban -o json")
-        echo '[{"value":"185.220.101.9","type":"ban","origin":"CAPI"},{"value":"91.240.118.0/24","type":"ban","origin":"CAPI"}]'
+        echo '[{"scenario":"crowdsecurity/ssh-slow-bf","decisions":[{"value":"45.83.64.77","scope":"Ip","origin":"crowdsec","type":"ban"}]}]'
         exit 0 ;;
     *) exit 1 ;;
 esac
@@ -515,7 +528,9 @@ BL_MIN_crowdsec=0
 BL_INTERVAL_crowdsec=0
 EOF
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec
-t "crowdsec-agent: decisions из cscli применены в set" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4' && grep -qx '91.240.118.0/24' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+t "crowdsec-agent: community (CAPI, только с -a) применён в set" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4' && grep -qx '91.240.118.0/24' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+t "crowdsec-agent: и локальные решения (SSH-брутфорс) тоже" bash -c "grep -qx '45.83.64.77/32' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+t "crowdsec-agent: минимум для локальной БД = 0 (feed — 500)" grep -q '^BL_MIN_crowdsec="0"' "$SHIELD_BLOCKLIST_SCRIPT"
 
 # ================= 11) spamhaus/cins: дефолты + парсинг Sxx- формата =================
 t "spamhaus/cins: URL запечены" bash -c "grep -q 'spamhaus.org/drop/drop.txt' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'cinsscore.com/list/ci-badguys.txt' '$SHIELD_BLOCKLIST_SCRIPT'"
@@ -572,5 +587,23 @@ EOF
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom
 t "custom-central: URL + local объединены (3 записи)" bash -c "test \$(wc -l < '$OUT/nftdb/set_custom_blocklist_v4') = 3"
 t "custom-central: записи из обоих источников в set" bash -c "grep -qx '45.148.10.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '91.240.118.9/32' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '93.184.216.34/32' '$OUT/nftdb/set_custom_blocklist_v4'"
+
+# 2026-09-24 (v1.1.6): значения конфига запекаются в root-скрипт внутри "..." — инъекция
+cp "$CONFIG_CACHE" "$CONFIG_CACHE.bak-inj"
+{ printf 'BLOCKLIST_CUSTOM_URLS="https://x.test/a.txt$(touch /tmp/pwned-bl)"\n'
+  printf 'CROWDSEC_INTEGRATION_ID=id`touch /tmp/pwned-bl2`\n'
+  printf 'MIN_ENTRIES_CINS=5;touch${IFS}/tmp/pwned-bl3\n'
+  printf 'CROWDSEC_MODE=feed\nCROWDSEC_UPDATE_INTERVAL_MIN=$(id)\n'
+  cat "$CONFIG_CACHE.bak-inj"; } > "$CONFIG_CACHE"
+rm -f /tmp/pwned-bl /tmp/pwned-bl2 /tmp/pwned-bl3
+SHIELD_BLOCKLIST_SCRIPT=/usr/local/sbin/shieldnode-blocklist   # production-путь, stub маппит под $OUT
+shield_blocklist_install >/dev/null 2>&1
+SHIELD_BLOCKLIST_SCRIPT="$OUT/usr/local/sbin/shieldnode-blocklist"
+t "инъекция: updater синтаксически валиден" bash -n "$SHIELD_BLOCKLIST_SCRIPT"
+t "инъекция: \$( ), \`, ; из конфига НЕ попали в updater" bash -c "! grep -qE 'pwned-bl|\\\$\\(id\\)' '$SHIELD_BLOCKLIST_SCRIPT'"
+t "инъекция: числа — дефолты (MIN_ENTRIES_CINS=2000, интервал 1440)" bash -c "grep -qx 'BL_MIN_cins=\"2000\"' '$SHIELD_BLOCKLIST_SCRIPT' && grep -qx 'BL_INTERVAL_crowdsec=\"1440\"' '$SHIELD_BLOCKLIST_SCRIPT'"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom >/dev/null 2>&1 || true
+t "инъекция: запуск updater ничего не исполнил" bash -c "[ ! -e /tmp/pwned-bl ] && [ ! -e /tmp/pwned-bl2 ] && [ ! -e /tmp/pwned-bl3 ]"
+mv "$CONFIG_CACHE.bak-inj" "$CONFIG_CACHE"
 
 if [ "$fails" -eq 0 ]; then echo "PASS: blocklist (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

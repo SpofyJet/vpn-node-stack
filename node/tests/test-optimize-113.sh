@@ -15,6 +15,8 @@ NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT=/tmp/node-test-opt113
 export NODE_DIR NODE_STATE_DIR="$OUT/state" NODE_LOG="$OUT/node.log" NODE_RT_TWEAKS="$OUT/state/rt.tsv" DRY_RUN=0
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$NODE_STATE_DIR" "$OUT/proc/net"; : > "$NODE_LOG"; : > "$NODE_RT_TWEAKS"
+# netdev_budget_usecs зависит от HZ ядра (v1.1.8) — фиксируем HZ=1000
+printf 'CONFIG_HZ=1000\n' > "$OUT/kconfig"; export NODE_KERNEL_CONFIG="$OUT/kconfig"
 printf '#!/bin/sh\necho "default via 10.0.0.1 dev eth0 proto static"\n' > "$OUT/bin/ip"
 cat > "$OUT/bin/ethtool" <<'EOF'
 #!/bin/bash
@@ -115,7 +117,12 @@ t "hex-разбор без strtonum (mawk): ffffffff = 4294967295" '[ "$_NODE_SN
 cfg 'NETDEV_BUDGET=900\n'; sn "000f4240 00000000 00002710"; plan
 t "явный NETDEV_BUDGET оператора не трогается даже при squeeze" '[ "$(val net.core.netdev_budget)" = 900 ]'
 cfg 'NETDEV_BUDGET_USECS=2000\n'; sn "000f4240 00000000 00000000"; plan
-t "явный NETDEV_BUDGET_USECS оператора соблюдается" '[ "$(val net.core.netdev_budget_usecs)" = 2000 ]'
+t "явный NETDEV_BUDGET_USECS оператора соблюдается (>= минимума 2 jiffy)" '[ "$(val net.core.netdev_budget_usecs)" = 2000 ]'
+printf 'CONFIG_HZ=250\n' > "$NODE_KERNEL_CONFIG"; cfg 'NETDEV_BUDGET_USECS=4000\n'; sn "000f4240 00000000 00000000"; plan
+t "HZ=250: явный 4000 < минимума 8000 — не пишется (было EINVAL -> apply падал)" '[ -z "$(val net.core.netdev_budget_usecs)" ] && grep -q "минимума ядра 8000" "$NODE_LOG"'
+cfg 'NETDEV_BUDGET_USECS=12000\n'; plan
+t "HZ=250: явный 12000 — пишется" '[ "$(val net.core.netdev_budget_usecs)" = 12000 ]'
+printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"
 cfg 'AUTO_SOFTNET_TUNE=0\n'; sn "000f4240 00000009 00002710"; plan
 t "AUTO_SOFTNET_TUNE=0: прежние фиксированные значения" '[ "$(val net.core.netdev_budget)" = 600 ] && [ "$(val net.core.netdev_max_backlog)" = 8192 ]'
 cfg ''

@@ -14,7 +14,7 @@ SHIELD_HEALTH_LISTS="scanner:ENABLE_SCANNER_LIST:1:scanner_blocklist_v4
 threat:ENABLE_THREAT_LIST:1:threat_blocklist_v4
 tor:BLOCK_TOR:0:tor_exit_blocklist_v4
 custom:ENABLE_CUSTOM_LIST:1:custom_blocklist_v4
-crowdsec:ENABLE_CROWDSEC_LIST:0:crowdsec_blocklist_v4
+crowdsec:ENABLE_CROWDSEC_LIST:1:crowdsec_blocklist_v4
 spamhaus:ENABLE_SPAMHAUS_LIST:1:spamhaus_blocklist_v4
 cins:ENABLE_CINS_LIST:1:cins_blocklist_v4"
 
@@ -39,9 +39,9 @@ _h_set_elems() { # <set> -> элементы через пробел (много
     nft -n list set inet shieldnode "$1" 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")}
         f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
 }
-# порты xray/remnanode, слушающие НЕ только loopback (API 127.0.0.1:... снаружи недоступен)
+# порты VPN-ядра (SHIELD_VPN_PROC_RE, v1.1.6), слушающие НЕ только loopback (API 127.0.0.1:... снаружи недоступен)
 _h_listen() { # <t|u>
-    { ss -"$1"lnp 2>/dev/null || true; } | awk '/xray|remnanode/ { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
+    { ss -"$1"lnp 2>/dev/null || true; } | awk -v re="$SHIELD_VPN_PROC_RE" '$0 ~ re { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
         a = $i; n = split(a, x, ":"); p = x[n]; sub(/:[0-9]+$/, "", a)
         if (a !~ /^(127\.|\[::1\]|::1$)/) print p; break } }' | sort -un | tr '\n' ' ' | sed 's/ $//'
 }
@@ -111,6 +111,16 @@ shield_health() {
     for p in $(shield_conf_get PROTECTED_UDP_EXTRA ""); do
         if _h_port_in "$p" "$pu"; then _hc PASS "PROTECTED_UDP_EXTRA $p — в protected_udp"; else _hc FAIL "PROTECTED_UDP_EXTRA $p — НЕТ в protected_udp (повтори apply)"; fi
     done
+    # 2026-09-24 (v1.1.6): порты, открытые в UFW, тоже должны быть под abuse-лимитами
+    local ut uu
+    ut="$(shield_detect_ufw_ports tcp)"; uu="$(shield_detect_ufw_ports udp)"
+    if [ -n "$ut$uu" ]; then
+        local miss=""
+        for p in $ut; do _h_port_in "$p" "$pt" || miss="$miss $p/tcp"; done
+        for p in $uu; do _h_port_in "$p" "$pu" || miss="$miss $p/udp"; done
+        if [ -n "$miss" ]; then _hc WARN "открыты в UFW, но НЕ в protected_*:$miss — повтори apply"
+        else _hc PASS "все порты, открытые в UFW, под защитой (tcp: ${ut:--}; udp: ${uu:--})"; fi
+    fi
     if command -v ss >/dev/null 2>&1; then
         lt="$(_h_listen t)"; lu="$(_h_listen u)"
         for p in $lt; do _h_port_in "$p" "$pt" || { _hc WARN "xray/remnanode слушает $p/tcp снаружи, но порта нет в protected_tcp — без abuse-лимитов; повтори apply"; bad=1; }; done
@@ -253,7 +263,7 @@ shield_status() {
 
     echo "--- crowdsec ---"
     # main.sh в ветке status НЕ source'ит limits.sh (SH_F_* unset) — читаем конфиг напрямую
-    if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 0)" = "1" ]; then
+    if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 1)" = "1" ]; then
         echo "mode: $(shield_crowdsec_resolve_mode)"
         echo "agent: $(shield_crowdsec_agent_status)"
     else

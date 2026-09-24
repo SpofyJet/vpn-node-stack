@@ -25,6 +25,11 @@ shield_rollback() {
         systemctl disable --now shieldnode-cleanup.timer >/dev/null 2>&1 || true
         systemctl disable --now shieldnode-blocklist.timer shieldnode-blocklist.service \
                            shieldnode-blocklist-custom.path shieldnode-blocklist-custom.service >/dev/null 2>&1 || true
+        # 2026-09-24 (v1.1.6): таймер crowdsec есть не всегда (только agent-режим) — отдельным
+        # вызовом и только при наличии файла: несуществующий юнит в общем списке роняет disable целиком
+        if [ -e /etc/systemd/system/shieldnode-blocklist-crowdsec.timer ]; then
+            systemctl disable --now shieldnode-blocklist-crowdsec.timer shieldnode-blocklist-crowdsec.service >/dev/null 2>&1 || true
+        fi
         # --now: без него служба оставалась «active (exited)» not-found до reboot;
         # ExecStop у shieldnode.service нет — stop меняет только состояние юнита
         systemctl disable --now shieldnode.service >/dev/null 2>&1 || true

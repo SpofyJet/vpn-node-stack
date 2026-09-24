@@ -3,6 +3,65 @@
 set -euo pipefail
 
 SHIELD_PROTECTED_STATE="$SHIELD_STATE_DIR/protected-ports.txt"
+# 2026-09-24 (v1.1.6): процессы VPN-ядра, чьи слушающие порты защищаются автоматически.
+# rw-core — имя Xray в образе remnawave/node; sing-box/hysteria — отдельные Hysteria2-серверы.
+SHIELD_VPN_PROC_RE='xray|rw-core|remnanode|sing-box|hysteria|v2ray'
+
+# shield_ss_public_ports — stdin: вывод ss -lnp; $1 = ERE по строке (процесс). Порты сокетов,
+# слушающих НЕ только loopback (2026-09-24, v1.1.6: API Xray 127.0.0.1:10085 снаружи
+# недоступен — защищать нечего). Колонки как в _ss_local_ports (первое поле адрес:порт).
+shield_ss_public_ports() {
+    awk -v re="$1" '$0 ~ re { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
+        a = $i; n = split(a, x, ":"); p = x[n]; sub(/:[0-9]+$/, "", a)
+        if (a !~ /^(127\.|\[::1\]$|::1$)/ && a !~ /%lo$/) print p; break } }'
+}
+
+# shield_detect_vpn_listen <tcp|udp> — внешние порты, слушаемые VPN-ядром (v1.1.6)
+shield_detect_vpn_listen() {
+    local f=-tlnp; [ "$1" = udp ] && f=-ulnp
+    command -v ss >/dev/null 2>&1 || return 0
+    { ss "$f" 2>/dev/null || true; } | shield_ss_public_ports "$SHIELD_VPN_PROC_RE" | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+# shield_port_valid <port|a-b> — 0 если порт 1-65535 или диапазон a-b (a<=b)
+shield_port_valid() {
+    local a b
+    case "$1" in
+        *-*) a="${1%-*}"; b="${1#*-}" ;;
+        *)   a="$1"; b="$1" ;;
+    esac
+    [[ "$a" =~ ^[0-9]{1,5}$ && "$b" =~ ^[0-9]{1,5}$ ]] || return 1
+    [ "$((10#$a))" -ge 1 ] && [ "$((10#$b))" -le 65535 ] && [ "$((10#$a))" -le "$((10#$b))" ]
+}
+
+# shield_detect_ufw_ports <tcp|udp> — 2026-09-24 (v1.1.6): порты, открытые оператором в UFW
+# (allow/limit на вход). Раньше защищались только порты, которые В МОМЕНТ apply слушал
+# xray/remnanode: при лежащем/ещё не поднятом контейнере и для порта API ноды (2222, его
+# слушает процесс node, а не xray) protected_tcp сводился к SSH. Читаем правила из
+# /etc/ufw/user{,6}.rules (формат iptables-save, без вызова ufw); только при ENABLED=yes.
+# Диапазоны a:b -> a-b (сеты protected_* — interval). Правила без порта (allow from IP) — нет.
+shield_detect_ufw_ports() {
+    local proto="$1" d="${SHIELD_UFW_DIR:-/etc/ufw}"
+    [ "$(shield_conf_get PROTECTED_FROM_UFW 1)" = "1" ] || return 0
+    grep -qsE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' "$d/ufw.conf" || return 0
+    cat "$d/user.rules" "$d/user6.rules" 2>/dev/null \
+      | awk -v pr="$proto" '
+          $1 == "-A" && ($2 == "ufw-user-input" || $2 == "ufw6-user-input") {
+              p = ""; ports = ""; tgt = ""
+              for (i = 3; i <= NF; i++) {
+                  if ($i == "-p") p = $(i + 1)
+                  else if ($i == "--dport" || $i == "--dports") ports = $(i + 1)
+                  else if ($i == "-j") tgt = $(i + 1)
+              }
+              if (p != pr || ports == "") next
+              if (tgt != "ACCEPT" && tgt !~ /^ufw6?-user-limit/) next
+              n = split(ports, a, ",")
+              for (j = 1; j <= n; j++) { gsub(":", "-", a[j]); print a[j] }
+          }' \
+      | while read -r p; do shield_port_valid "$p" && echo "$p"; done \
+      | sort -u | sort -n | tr '\n' ' ' | sed 's/ $//'
+    return 0
+}
 
 # --- обнаружение SSH-портов sshd (ТЗ §19): -p из /proc/<pid>/cmdline + ss fallback ---
 shield_detect_ssh_ports() {
@@ -44,6 +103,22 @@ shield_valid_ip() {
     [[ "$a" == *:* && "$a" =~ ^[0-9A-Fa-f:.]+$ ]]
 }
 
+# shield_valid_cidr <addr[/mask]> — 2026-09-24 (v1.1.6): для whitelist (TRUSTED_IPS, exclude.conf).
+# Раньше значения шли в текст ruleset без проверки: опечатка -> nft -c отвергал ВЕСЬ apply,
+# а 0.0.0.0/0 (валиден для nft) выводил весь интернет из-под лимитов и блок-листов.
+# Маска: IPv4 /8../32, IPv6 /16../128 — шире whitelist не бывает осмысленным.
+shield_valid_cidr() {
+    local a="${1%/*}" m=""
+    [[ "$1" == */* ]] && m="${1#*/}"
+    shield_valid_ip "$a" || return 1
+    [ -z "$m" ] && return 0
+    [[ "$m" =~ ^[0-9]{1,3}$ ]] || return 1
+    case "$a" in
+        *:*) [ "$((10#$m))" -ge 16 ] && [ "$((10#$m))" -le 128 ] ;;
+        *)   [ "$((10#$m))" -ge 8 ]  && [ "$((10#$m))" -le 32 ] ;;
+    esac
+}
+
 # --- админ IP текущей сессии (anti-lockout, ТЗ §20): только если реально SSH-сессия ---
 shield_detect_admin_ip() {
     local a=""
@@ -73,7 +148,7 @@ shield_detect_protected_ports() {
     ports="$(shield_detect_ssh_ports)"
     if command -v ss >/dev/null 2>&1; then
         local xports
-        xports="$(ss -tulnp 2>/dev/null | _ss_local_ports 'xray|remnanode' | sort -un | tr '\n' ' ' | sed 's/ $//')"
+        xports="$(shield_detect_vpn_listen tcp)"
         [ -n "$xports" ] && ports="$ports $xports"
     fi
     # 2026-09-24 (v1.1.5): keep-last-good по ЧАСТИ xray — SSH-порты в списке есть всегда,
@@ -85,6 +160,9 @@ shield_detect_protected_ports() {
     fi
     ports="$(echo "$ports" | tr ' ' '\n' | awk 'NF' | sort -un | tr '\n' ' ' | sed 's/ $//')"
     [ -n "$ports" ] && echo "$ports" > "$SHIELD_PROTECTED_STATE"
+    # UFW-порты — после keep-last-good (живой источник, в state не пишем: снятое в UFW
+    # правило не должно «залипать» в защищаемых портах)
+    ports="$(echo "$ports $(shield_detect_ufw_ports tcp)" | tr ' ' '\n' | awk 'NF' | sort -un | tr '\n' ' ' | sed 's/ $//')"
     echo "$ports"
 }
 

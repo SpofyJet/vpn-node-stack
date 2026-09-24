@@ -18,43 +18,44 @@
 
 ## Установка
 
-Одной командой (скрипт сам скачает снапшот этого репозитория с GitHub, распакует в `/opt/vpn-node-stack` и запустит оба инсталлятора — сначала фаервол, потом оптимизация):
+Одна команда — скачает стек, откроет меню (установка, статус, безопасность, оптимизация):
 
 ```bash
-sudo bash -c 'bash <(curl -sL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)'
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)"
 ```
 
-Опции: `--dry-run` (только план), `status` (без root), `rollback` (откат).
-
-Либо из клонированного репозитория:
+После установки всё управление — короткой командой:
 
 ```bash
-git clone https://github.com/SpofyJet/vpn-node-stack.git
-cd vpn-node-stack
-
-# 1) оптимизация ноды
-sudo bash node/install.sh            # plan → apply → self-test; --dry-run для просмотра
-
-# 2) фаервол
-sudo bash shieldnode/install.sh      # SSH-whitelist спросит текущий IP автоматически
+sudo vpn-node                 # меню
+sudo vpn-node status          # что применено (фаервол + оптимизация)
+sudo vpn-node apply           # обновить стек до последней версии и применить
+sudo vpn-node apply --dry-run # план изменений, ничего не пишет
+sudo vpn-node emergency on    # аварийный режим: только SSH + whitelist
+sudo vpn-node rollback        # откатить всё к исходному состоянию
+guard                         # дашборд дропов фаервола
 ```
 
-## Использование
+Без терминала (CI, cloud-init) — та же команда с аргументом: `sudo bash -c "$(curl -fsSL …/vpn-node-setup.sh)" _ apply`.
+Порядок всегда: сначала фаервол (shieldnode), затем оптимизация (node).
+
+### Меню безопасности
+
+- **Защищаемые порты** — видно, откуда каждый порт: SSH, порты Xray/RemnaNode (rw-core, sing-box, hysteria), открытые в UFW, добавленные вручную. Порт или диапазон (`20000-20100`) добавляется в два нажатия.
+- **Доверенные IP** — панель Remnawave, мониторинг: без лимитов и блок-листов.
+- **CrowdSec** — community blocklist включён по умолчанию (агент без аккаунта, обновление каждые 30 мин).
+- **Блок-листы**, **дашборд guard**, **аварийный режим**, **применить фаервол**.
+
+## Использование без меню
 
 ```bash
-bash node/install.sh status          # что применено, какие значения
-bash node/install.sh rollback        # вернуть исходное состояние
-bash node/install.sh detect          # диагностика без изменений
-
-bash shieldnode/install.sh status
-bash shieldnode/install.sh rollback
-
-# тесты (не требуют root, кроме test-policies.sh)
-bash node/tests/test-config.sh && bash node/tests/test-datapath.sh && bash node/tests/test-rollback.sh
-bash shieldnode/tests/test-blocklist.sh && bash shieldnode/tests/test-template.sh
+bash /opt/vpn-node-stack/node/install.sh status       # оптимизация: что применено
+bash /opt/vpn-node-stack/shieldnode/install.sh status # фаервол: health-check
+bash /opt/vpn-node-stack/node/install.sh detect       # диагностика без изменений
 ```
 
-Конфиги (всё опционально, значения по умолчанию разумные): `/etc/node/node.conf`, `/etc/shieldnode/shieldnode.conf`.
+Конфиги (всё опционально, значения по умолчанию разумные): `/etc/node/node.conf`, `/etc/shieldnode/config.conf`.
+Формат — `KEY=value`, файлы не исполняются; меню пишет их само, с проверкой ввода.
 
 ## Гарантии безопасности
 

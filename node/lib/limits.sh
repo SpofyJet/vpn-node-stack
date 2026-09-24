@@ -5,7 +5,10 @@ set -euo pipefail
 
 node_limits_plan() {
     : # значение нужно только на persist-этапе
-    export NODE_LIMIT_NOFILE="$(node_conf_get LIMIT_NOFILE 1048576)"
+    # 2026-09-24 (v1.1.8): значение пишется в systemd drop-in чужого юнита — только число/infinity
+    local v; v="$(node_conf_get LIMIT_NOFILE 1048576)"
+    [[ "$v" =~ ^([0-9]{1,10}|infinity)$ ]] || { warn "limits" "LIMIT_NOFILE='$v' — не число, берём 1048576"; v=1048576; }
+    export NODE_LIMIT_NOFILE="$v"
 }
 
 # Детект systemd-unit'ов, в которых живёт xray/remnanode (read-only)
