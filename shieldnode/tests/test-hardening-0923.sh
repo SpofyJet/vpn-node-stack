@@ -62,6 +62,10 @@ t() { local name="$1" cmd="$2"
 # ---------- ss / валидация ----------
 t "admin IP: peer из 2-го поля адрес:порт, loopback пропущен" '[ "$(shield_detect_admin_ip)" = 203.0.113.7 ]'
 t "admin IP: SSH_CONNECTION приоритетнее"      '[ "$(SSH_CONNECTION="198.51.100.4 5555 10.0.0.5 22" shield_detect_admin_ip)" = 198.51.100.4 ]'
+# 2026-09-25 (v1.1.7): под sudo (SSH_CONNECTION сброшен) ss на dual-stack sshd отдаёт ::ffff:v4 —
+# админ уходил в admin6 и при выключенном IPv6 не whitelist'ился вовсе
+t "admin IP: IPv4-mapped (::ffff:a.b.c.d) из SSH_CONNECTION -> чистый IPv4" '[ "$(SSH_CONNECTION="::ffff:46.163.138.178 1690 ::ffff:10.0.0.5 22" shield_detect_admin_ip)" = 46.163.138.178 ]'
+t "admin IP: настоящий IPv6 не трогается" '[ "$(SSH_CONNECTION="2001:db8::7 1690 2001:db8::1 22" shield_detect_admin_ip)" = 2001:db8::7 ]'
 t "admin IP: мусор в SSH_CONNECTION не проходит в nft" '[ -z "$(SSH_CONNECTION="1.2.3.4}; flush 1 2 3" shield_detect_admin_ip 2>/dev/null)" ]'
 t "valid_ip: v4/v6 да, 999.1.1.1/process-строка нет" 'shield_valid_ip 203.0.113.7 && shield_valid_ip 2001:db8::1 && ! shield_valid_ip 999.1.1.1 && ! shield_valid_ip "users:((\"sshd\",pid=1))"'
 shield_limits_resolve >/dev/null 2>&1

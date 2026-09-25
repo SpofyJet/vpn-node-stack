@@ -2,7 +2,7 @@
 # shieldnode — main.sh: точка входа, режимы, lock, диспетчеризация (TZ §4, §28).
 set -euo pipefail
 
-SHIELD_VERSION="1.1.6"
+SHIELD_VERSION="1.1.7"
 # readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
 SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
@@ -14,7 +14,7 @@ export LOG_LEVEL=info
 
 usage() {
     cat <<'EOF'
-shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.6
+shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.7
 
 Использование: shieldnode [опции] <команда> [аргумент]
 
@@ -22,7 +22,8 @@ shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.
   apply               применить политики (по умолчанию; с --dry-run — только показ)
   detect              снапшот окружения (без изменений)
   status              ожидаемое vs фактическое состояние
-  guard               пульт: дропы, наборы, conntrack, службы, алерты (read-only)
+  guard               пульт защиты: атаки, баны, блок-листы, проблемы + меню действий
+                      (--once — только снимок, --raw — технические счётчики)
   rollback [id]       откат к backup-набору (без id — последний/удаление своих)
   emergency on|off    аварийный минимальный режим
   uninstall           полный откат + удаление своих файлов
@@ -40,6 +41,9 @@ POSITIONAL=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
+        # 2026-09-25 (v1.1.7): guard — снимок без меню / технические счётчики
+        --once) export SHIELD_GUARD_MODE=once ;;
+        --raw)  export SHIELD_GUARD_MODE=raw ;;
         --mode=*) POSITIONAL+=("${1#*=}") ;;
         -h|--help) usage; exit 0 ;;
         --*) echo "unknown option: $1" >&2; usage >&2; exit 64 ;;
@@ -73,7 +77,12 @@ if [ "$(id -u)" -eq 0 ] && [ ! -e "$SHIELD_LOG" ]; then install -m 0640 /dev/nul
 # shellcheck source=config.sh
 source "$SHIELD_DIR/config.sh"
 shield_load_config
-log info "main" "shieldnode v$SHIELD_VERSION cmd=$cmd dry_run=$DRY_RUN"
+if [ "$cmd" = guard ]; then
+    # 2026-09-25 (v1.1.7): у пульта строка старта — только в журнал, не поверх дашборда
+    [ -w "$SHIELD_LOG" ] && printf '%s [info] main: shieldnode v%s cmd=guard\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SHIELD_VERSION" >> "$SHIELD_LOG" || true
+else
+    log info "main" "shieldnode v$SHIELD_VERSION cmd=$cmd dry_run=$DRY_RUN"
+fi
 
 # 2026-09-24 (v1.1.4): основной lock держит и blocklist-updater (весь прогон, секунды —
 # минуты на fetch). acquire_lock берёт его неблокирующе — apply сразу после apply

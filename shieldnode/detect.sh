@@ -137,6 +137,10 @@ shield_detect_admin_ip() {
             | grep -vE '^(127\.|::1$|0\.0\.0\.0$)' | head -1 || true)"
     fi
     [ -n "$a" ] || return 0
+    # 2026-09-25 (v1.1.7): IPv4-mapped (::ffff:1.2.3.4) — sshd слушает dual-stack [::]:22, и под sudo
+    # (SSH_CONNECTION сброшен) ss отдаёт IPv4 админа в такой форме. Он уходил в admin6, а при
+    # выключенном IPv6 v6-правил нет — админ НЕ попадал в whitelist вовсе (живая нода, apply из меню)
+    case "$a" in ::ffff:*.*.*.*|::FFFF:*.*.*.*) a="${a#::[fF][fF][fF][fF]:}" ;; esac
     # в nft попадает только синтаксически валидный адрес
     if shield_valid_ip "$a"; then echo "$a"; else log warn "detect" "admin IP '$a' не похож на адрес — в whitelist НЕ добавлен"; fi
 }

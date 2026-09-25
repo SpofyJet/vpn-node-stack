@@ -145,13 +145,21 @@ shield_health() {
             continue
         fi
         if [ "$has_set" = 0 ] || [ "$has_rule" = 0 ]; then _hc FAIL "$name: включён, но set/drop-правила нет — повтори apply"; continue; fi
-        cnt="$(nft_set_elem_count "$set")"; age_h=""
+        cnt="$(nft_set_elem_count "$set")"; age_h=""; lg=""
         if [ -r "$st" ]; then
             lg="$st/last-good-$name.txt"
             [ -f "$lg" ] && age_h=$(( (now - $(stat -c %Y "$lg" 2>/dev/null || echo "$now")) / 3600 ))
             alert=""; [ -f "$st/.alert-$name" ] && alert="$(cat "$st/.alert-$name" 2>/dev/null)"
         else alert=""; fi
-        if [ "${cnt:-0}" -eq 0 ]; then
+        if [ "${cnt:-0}" -eq 0 ] && [ -n "${lg:-}" ] && [ -f "$lg" ] && [ ! -s "$lg" ] && [ -z "$alert" ]; then
+            # 2026-09-25 (v1.1.7): последнее УСПЕШНОЕ обновление дало 0 записей — пустой set корректен
+            # (custom без IP в custom.txt, свежий crowdsec без решений). Раньше — ложный WARN «ПУСТ».
+            if [ "$name" = custom ]; then
+                _hc PASS "custom: пуст — в /etc/shieldnode/lists/custom.txt и BLOCKLIST_CUSTOM_URLS нет записей (добавь IP/CIDR — применится сразу)"
+            else
+                _hc PASS "$name: пуст — источник сейчас не содержит записей (обновление успешно)"
+            fi
+        elif [ "${cnt:-0}" -eq 0 ]; then
             local last="нет данных"; [ -n "$age_h" ] && last="${age_h}ч назад"
             _hc WARN "$name: set ПУСТ — updater ещё не отработал или фид недоступен (последний успех: $last)"
         else
@@ -159,7 +167,12 @@ shield_health() {
         fi
         [ -n "$alert" ] && _hc WARN "$name: фид падает подряд — алерт с $alert (см. /var/log/shieldnode.log)"
         if [ "$name" != "custom" ] && [ -r "$st" ]; then
-            iv="$(shield_conf_get BLOCKLIST_UPDATE_INTERVAL 360)"; [ "$name" = "crowdsec" ] && iv="$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)"
+            iv="$(shield_conf_get BLOCKLIST_UPDATE_INTERVAL 360)"
+            # 2026-09-25 (v1.1.7): agent-режим обновляется своим таймером (30 мин), feed — раз в сутки
+            if [ "$name" = "crowdsec" ]; then
+                if [ "$(shield_crowdsec_resolve_mode)" = agent ]; then iv="$(shield_conf_get CROWDSEC_AGENT_INTERVAL_MIN 30)"
+                else iv="$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)"; fi
+            fi
             [[ "$iv" =~ ^[0-9]+$ ]] || iv=360
             if [ -z "$age_h" ]; then _hc WARN "$name: успешных обновлений ещё не было (last-good нет)"
             elif [ $((age_h * 60)) -gt $((iv * 2 + 60)) ]; then _hc WARN "$name: последнее успешное обновление ${age_h}ч назад (> 2 интервалов по ${iv} мин) — проверь таймер/сеть"; fi

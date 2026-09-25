@@ -34,6 +34,9 @@ case "$*" in
     "list counters")
         cat "$FAKE_NFT_DB/counters" 2>/dev/null; exit 0 ;;
     "list table inet shieldnode") [ -f "$FAKE_NFT_DB/table" ]; exit $? ;;
+    # 2026-09-25 (v1.1.7): guard проверяет админа через `nft get element` (учитывает CIDR)
+    "get element inet shieldnode whitelist_v4 { "*)
+        grep -q 'admin-wl' "$FAKE_NFT_DB/flags" 2>/dev/null; exit $? ;;
     "list chain inet shieldnode prerouting")
         grep -q 'loopback' "$FAKE_NFT_DB/flags" 2>/dev/null && echo 'iifname "lo" accept'
         grep -q 'scanner' "$FAKE_NFT_DB/flags" 2>/dev/null && echo 'ip saddr @scanner_blocklist_v4 counter name c_drops_scanner_v4 drop'
@@ -54,7 +57,8 @@ esac
 EOF
 chmod +x "$OUT/bin/nft"
 : > "$OUT/nftdb/table"
-printf 'loopback scanner' > "$OUT/nftdb/flags"
+printf 'loopback scanner admin-wl' > "$OUT/nftdb/flags"
+export SSH_CONNECTION="203.0.113.10 40000 10.0.0.1 22" SHIELD_UNIT_DIR="$OUT/units"
 # реальный формат `nft list counters`: блоки "counter X {\n packets N bytes M\n}"
 cat > "$OUT/nftdb/counters" <<'EOF'
 table inet shieldnode {
@@ -77,17 +81,11 @@ EOF
 # guard показывает только при rc!=0 от `systemctl cat` (не от is-active!).
 cat > "$OUT/bin/systemctl" <<EOF
 #!/bin/bash
+# FAKE_TIMER=0 — таймер блок-листов остановлен
 case "\$*" in
-    "cat shieldnode.service") exit 0 ;;
-    "cat shieldnode-blocklist.timer") exit 0 ;;
-    "cat shieldnode-blocklist-custom.path") exit 0 ;;
-    "cat shieldnode-updater.service") exit 1 ;;  # не существует
-    "is-active shieldnode.service") echo active; exit 0 ;;
-    "is-active shieldnode-blocklist.timer") echo active; exit 0 ;;
-    "is-active shieldnode-blocklist-custom.path") echo inactive; exit 1 ;;
-    "is-enabled shieldnode.service") echo enabled; exit 0 ;;
-    "is-enabled shieldnode-blocklist.timer") echo enabled; exit 0 ;;
-    "is-enabled shieldnode-blocklist-custom.path") echo disabled; exit 1 ;;
+    "is-enabled --quiet shieldnode.service") exit 0 ;;
+    "is-active --quiet shieldnode-blocklist.timer") [ "\${FAKE_TIMER:-1}" = 1 ] ;;
+    "list-timers --all --no-legend shieldnode-blocklist.timer") echo "Fri 2030-01-01 07:26:06 UTC 5h 56min - - shieldnode-blocklist.timer shieldnode-blocklist.service"; exit 0 ;;
     *) exit 1 ;;
 esac
 EOF
@@ -103,31 +101,32 @@ t() { local name="$1"; shift
 
 # --- firewall ABSENT: дашборд не падает ---
 rm -f "$OUT/nftdb/table"
+# ---------- 1. таблицы нет ----------
+rm -f "$OUT/nftdb/table"
 shield_guard > "$OUT/guard-absent.txt" 2>&1 || true
-t "absent: не падает без таблицы" grep -q "firewall: ABSENT" "$OUT/guard-absent.txt"
-t "absent: сообщение «firewall не применён» (отлично от пусто-нормы)" grep -q "firewall не применён" "$OUT/guard-absent.txt"
+t "absent: не падает, «не применён» по-русски" grep -q "○ не применён" "$OUT/guard-absent.txt"
+t "absent: вместо счётчиков — пояснение" grep -q "счётчиков нет — фаервол не применён" "$OUT/guard-absent.txt"
 t "absent: снапшот НЕ создан без таблицы" bash -c "! test -f '$SHIELD_GUARD_SNAPSHOT'"
-
-# --- firewall ACTIVE: полный дашборд ---
 : > "$OUT/nftdb/table"
+
+# ---------- 2. рабочая нода ----------
 shield_guard > "$OUT/guard1.txt" 2>&1
-t "active: статус ACTIVE" grep -q "firewall: ACTIVE" "$OUT/guard1.txt"
-t "counters: syn_v4 показан" grep -q "c_drops_syn_v4" "$OUT/guard1.txt"
-t "counters: сортировка по packets (syn первым)" bash -c "grep -n 'c_drops_syn_v4' '$OUT/guard1.txt' | head -1 | cut -d: -f1 | xargs -I{} sh -c 'head -{} \"$OUT/guard1.txt\" | tail -1 | grep -q c_drops_syn_v4'"
-t "counters: нулевой global_udp показан" grep -q "c_drops_global_udp" "$OUT/guard1.txt"
-t "sets: scanner 3 элемента" grep -q "scanner_blocklist_v4 .*3" "$OUT/guard1.txt"
-t "sets: пустой threat скрыт (не whitelist/protected)" bash -c "! grep -q 'threat_blocklist_v4' '$OUT/guard1.txt'"
-t "conntrack: секция есть (или честный fallback)" bash -c "grep -qE 'usage: [0-9]+%|не доступен' '$OUT/guard1.txt'"
-t "services: blocklist-custom.path inactive+disabled показан" bash -c "grep 'shieldnode-blocklist-custom.path' '$OUT/guard1.txt' | grep -q 'active=inactive'"
-t "services: timer active+enabled" bash -c "grep 'shieldnode-blocklist.timer ' '$OUT/guard1.txt' | grep -q 'active=active'"
-t "services: единый формат active=/enabled= (не голый 'inactive')" bash -c "grep -qE 'shieldnode-blocklist-custom.path +active=inactive +enabled=disabled' '$OUT/guard1.txt'"
-t "counters-пусто: ACTIVE без дропов — «нормально», не «не применён»" bash -c "! grep -q 'нет счётчиков' '$OUT/guard1.txt'"
-t "alerts: none при чистом состоянии" grep -q "updater alerts" "$OUT/guard1.txt"
-t "quick: loopback-accept ✓" grep -q "loopback-accept: ✓" "$OUT/guard1.txt"
+t "active: «● работает»" grep -q "● работает" "$OUT/guard1.txt"
+t "атаки по смыслу: сканеры 42" grep -qE "Сканеры интернета +42" "$OUT/guard1.txt"
+t "атаки по смыслу: SYN-флуд -> «Флуд соединениями» 123 456 (разряды)" grep -qE "Флуд соединениями TCP/SYN +123 456" "$OUT/guard1.txt"
+t "атаки по смыслу: invalid -> «Мусорные и поддельные пакеты» 7" grep -qE "Мусорные и поддельные пакеты +7" "$OUT/guard1.txt"
+t "итого = сумма групп (123 505)" grep -qE "Итого +123 505" "$OUT/guard1.txt"
+t "нулевые второстепенные группы скрыты (Tor), ключевые видны (UDP-флуд 0)" bash -c "! grep -q 'Выходы Tor' '$OUT/guard1.txt' && grep -qE 'UDP-флуд +0' '$OUT/guard1.txt'"
+t "без технических имён счётчиков (c_drops_*) в обычном виде" bash -c "! grep -q 'c_drops_' '$OUT/guard1.txt'"
+t "баны: SSH 1 (ssh_abusers)" grep -q "SSH 1 · TCP 0 · UDP 0" "$OUT/guard1.txt"
+t "блок-листы: «Сканеры 3»" grep -q "Сканеры 3" "$OUT/guard1.txt"
+t "блок-листы: время следующего обновления" grep -q "следующее через" "$OUT/guard1.txt"
+t "проблем нет + админ в белом списке" grep -q "Проблем не найдено · ваш IP 203.0.113.10 в белом списке" "$OUT/guard1.txt"
+t "без терминала — только снимок, без меню" bash -c "! grep -q 'Действия' '$OUT/guard1.txt'"
 t "снапшот создан" test -f "$SHIELD_GUARD_SNAPSHOT"
 t "снапшот: первая строка unixts" bash -c "head -1 '$SHIELD_GUARD_SNAPSHOT' | grep -qE '^[0-9]+\$'"
 
-# --- второй запуск: дельты ---
+# ---------- 3. дельты «+N с прошлого просмотра» ----------
 sleep 1
 cat > "$OUT/nftdb/counters" <<'EOF'
 table inet shieldnode {
@@ -146,15 +145,29 @@ table inet shieldnode {
 }
 EOF
 shield_guard > "$OUT/guard2.txt" 2>&1
-t "delta: у syn_v4 появилась дельта +N/s" bash -c "grep 'c_drops_syn_v4' '$OUT/guard2.txt' | grep -qE '\+[0-9]+/s'"
-t "delta: у scanner дельта +0/s (не менялся)" bash -c "grep 'c_drops_scanner_v4' '$OUT/guard2.txt' | grep -q '+0/s'"
+t "дельта: SYN-флуд +100" grep -qE "Флуд соединениями TCP/SYN +123 556 +\+100" "$OUT/guard2.txt"
+t "дельта: сканеры +0 (не менялись)" grep -qE "Сканеры интернета +42 +\+0" "$OUT/guard2.txt"
+t "дельта: итого +110" grep -qE "Итого +123 615 +\+110" "$OUT/guard2.txt"
 
-# --- emergency ---
-printf 'loopback' > "$OUT/nftdb/flags"
-mkdir -p "$OUT/run-shieldnode" 2>/dev/null || true
-# emergency-маркер читается из /run/shieldnode — подменить нельзя, проверяем только отсутствие краха
-shield_guard > "$OUT/guard3.txt" 2>&1
-t "flags: scanner-правило пропало — не падает" grep -q "firewall: ACTIVE" "$OUT/guard3.txt"
+# ---------- 4. проблемы — понятным языком ----------
+printf 'loopback scanner' > "$OUT/nftdb/flags"
+FAKE_TIMER=0 shield_guard > "$OUT/guard3.txt" 2>&1
+t "проблема: IP админа не в белом списке — с подсказкой" grep -q "ваш IP 203.0.113.10 не в белом списке" "$OUT/guard3.txt"
+t "проблема: таймер блок-листов остановлен — с командой" grep -q "автообновление блок-листов остановлено" "$OUT/guard3.txt"
+printf 'admin-wl' > "$OUT/nftdb/flags"
+shield_guard > "$OUT/guard4.txt" 2>&1
+t "проблема: нет loopback-accept" grep -q "нет правила loopback-accept" "$OUT/guard4.txt"
 
+# ---------- 5. технический вид ----------
+SHIELD_GUARD_MODE=raw shield_guard > "$OUT/guard-raw.txt" 2>&1
+t "--raw: технические счётчики nft" grep -qE "c_drops_syn_v4 +123556" "$OUT/guard-raw.txt"
+
+# ---------- 6. меню (в терминале) ----------
+if command -v script >/dev/null 2>&1; then
+    printf '1\n\n2\n1.2.3\n\n0\n' | SHIELD_GUARD_MODE=menu bash -c 'source "$SHIELD_DIR/lib/common.sh"; source "$SHIELD_DIR/config.sh"; shield_load_config; source "$SHIELD_DIR/detect.sh"; source "$SHIELD_DIR/guard.sh"; shield_guard' > "$OUT/guard-menu.txt" 2>&1 || true
+    t "меню: пункты действий по-русски" bash -c "grep -q 'Кто сейчас в бане' '$OUT/guard-menu.txt' && grep -q 'Разбанить IP' '$OUT/guard-menu.txt' && grep -q 'Доверенные IP' '$OUT/guard-menu.txt'"
+    t "меню: «кто в бане» показывает набор SSH" grep -q "45.148.10.0/28" "$OUT/guard-menu.txt"
+    t "меню: мусорный IP при разбане отвергнут" bash -c "grep -q '«1.2.3» — не IP-адрес' '$OUT/guard-menu.txt' || grep -q 'Нужен root' '$OUT/guard-menu.txt'"
+fi
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: guard (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

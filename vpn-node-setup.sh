@@ -30,7 +30,7 @@
 #   VPN_STACK_REF=v1.2.0   VPN_STACK_REPO=Owner/name   VPN_STACK_TARBALL_URL=https://...
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 REPO="${VPN_STACK_REPO:-SpofyJet/vpn-node-stack}"
 RAW_BASE="${VPN_STACK_RAW_BASE:-https://raw.githubusercontent.com/$REPO/main}"
 # 2026-09-24 (v1.1.3): VPN_STACK_REF — воспроизводимая установка (тег/ветка/коммит).
@@ -69,10 +69,11 @@ stack_main() {
     # 2026-09-23: --dry-run ищем во ВСЕХ аргументах (раньше break на команде: для
     # `apply --dry-run` dry=0 -> пост-проверка nft давала ложную «ФАЕРВОЛ НЕ АКТИВЕН»)
     CMD="apply"
-    dry=0; cmd_seen=0
+    dry=0; cmd_seen=0; verbose=0
     for a in "$@"; do
         case "$a" in
             --dry-run) dry=1 ;;
+            --verbose|-v) verbose=1 ;;
             -*) : ;;
             *)  [ "$cmd_seen" = 1 ] || { CMD="$a"; cmd_seen=1; } ;;
         esac
@@ -81,6 +82,28 @@ stack_main() {
         apply|status|detect|rollback|uninstall|install|emergency|guard) : ;;
         *) die "неизвестная команда '$CMD' (ожидалось: menu|apply|status|detect|rollback|emergency|guard|uninstall)" ;;
     esac
+    # --verbose — только установщику (стеки его не знают: shieldnode отвечает exit 64)
+    if [ "$verbose" = 1 ]; then
+        _args=(); for a in "$@"; do case "$a" in --verbose|-v) ;; *) _args+=("$a") ;; esac; done
+        set -- ${_args[@]+"${_args[@]}"}
+    fi
+    # 2026-09-25 (v1.3.0): компактный вывод apply — по строке на этап (✔/✘), подробный журнал
+    # стеков — в файл, хвост журнала — при ошибке. В терминале по умолчанию; --verbose или
+    # VPN_STACK_QUIET=0 — полный вывод; без терминала (CI) — полный вывод, как прежде.
+    QUIET=0
+    if [ "$CMD" = apply ] || [ "$CMD" = install ]; then
+        case "${VPN_STACK_QUIET:-auto}" in
+            1) [ "$verbose" = 0 ] && QUIET=1 ;;   # --verbose сильнее
+            auto) [ "$verbose" = 0 ] && [ -t 1 ] && QUIET=1 ;;
+        esac
+    fi
+    SETUP_LOG="${VPN_STACK_LOG:-/var/log/vpn-node-setup.log}"
+    if [ "$QUIET" = 1 ]; then
+        { : >> "$SETUP_LOG" && chmod 0640 "$SETUP_LOG"; } 2>/dev/null || SETUP_LOG="$(mktemp)"
+        printf '\n===== %s vpn-node-setup v%s: %s =====\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$VERSION" "$*" >> "$SETUP_LOG"
+        # в компактном режиме стеки не спрашивают (stdin=/dev/null): reboot предлагает установщик в итоге
+        export NODE_NO_REBOOT_PROMPT=1
+    fi
     # 2026-09-23: `install` не знает ни один из стеков — shieldnode падал, авто-откат
     # снимал рабочий фаервол. Это алиас apply: подменяем слово в пробрасываемых аргументах.
     if [ "$CMD" = "install" ]; then
@@ -121,7 +144,8 @@ stack_main() {
     RUN_DIR="$WORK_DIR"
     DL=""
     trap 'if [ -n "$DL" ]; then rm -rf "$DL"; fi' EXIT
-    say "==> vpn-node-setup v$VERSION"
+    vsay "==> vpn-node-setup v$VERSION"
+    if [ "$QUIET" = 1 ] && [ "$need_download" = 1 ]; then printf '\n  %s[1/3]%s Загрузка стека с GitHub ' "$C_D" "$C_0"; STAGE_OPEN=1; fi
     if [ "$need_download" = 1 ]; then
         if [ "$replace_tree" = 1 ]; then
             mkdir -p "$WORK_DIR"
@@ -129,7 +153,7 @@ stack_main() {
         else
             DL="$(mktemp -d "${TMPDIR:-/tmp}/vpn-node-stack.XXXXXX")"   # установку не трогаем
         fi
-        say "==> репозиторий: $REPO${VPN_STACK_REF:+ @ $VPN_STACK_REF}"
+        vsay "==> репозиторий: $REPO${VPN_STACK_REF:+ @ $VPN_STACK_REF}"
         curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$DL/repo.tar.gz" "$TARBALL_URL" \
             || die "не удалось скачать снапшот $TARBALL_URL (проверь сеть, имя репозитория и его видимость — приватный repo вернёт 404)"
 
@@ -171,16 +195,22 @@ stack_main() {
                     && mv -f "$WORK_DIR/.vpn-node-setup.sh.new" "$WORK_DIR/vpn-node-setup.sh"
             fi
             rm -rf "$DL"; DL=""
-            say "==> распаковано в $WORK_DIR (exec-биты восстановлены)"
+            vsay "==> распаковано в $WORK_DIR (exec-биты восстановлены)"
         else
             RUN_DIR="$DL/extract"
-            say "==> временная копия (установка не тронута): $RUN_DIR"
+            vsay "==> временная копия (установка не тронута): $RUN_DIR"
         fi
     else
-        say "==> установленная копия: $WORK_DIR (без загрузки)"
+        vsay "==> установленная копия: $WORK_DIR (без загрузки)"
     fi
     NODE_DIR="$RUN_DIR/node"
     SHIELD_DIR="$RUN_DIR/shieldnode"
+    if [ "$QUIET" = 1 ] && [ "$need_download" = 1 ]; then
+        STAGE_OPEN=0
+        printf '%s✔%s %s(node %s · shieldnode %s)%s\n' "$C_G" "$C_0" "$C_D" \
+            "$(sed -nE 's/^NODE_VERSION="([^"]+)"/\1/p' "$NODE_DIR/main.sh" 2>/dev/null | head -1)" \
+            "$(sed -nE 's/^SHIELD_VERSION="([^"]+)"/\1/p' "$SHIELD_DIR/main.sh" 2>/dev/null | head -1)" "$C_0"
+    fi
     cd "$RUN_DIR"
 
     # ---------- запуск ----------
@@ -209,8 +239,7 @@ stack_main() {
             bash "$SHIELD_DIR/install.sh" "$@" || rc_shield=$?
             ;;
         apply)
-            say "==> [1/2] shieldnode (nftables-фаервол)"
-            if bash "$SHIELD_DIR/install.sh" "$@"; then
+            if run_stage 2/3 "Фаервол (shieldnode)" bash "$SHIELD_DIR/install.sh" "$@"; then
                 :
             else
                 rc_shield=$?   # код берём в else: в then-ветке $? был бы 0
@@ -222,8 +251,7 @@ stack_main() {
                 bash "$SHIELD_DIR/install.sh" rollback || warn "авто-откат shieldnode не полностью (см. /var/log/shieldnode.log)"
                 die "установка ОТМЕНЕНА: фаервол не поднят — node (оптимизация) намеренно не запускался"
             fi
-            say "==> [2/2] node (оптимизация ОС/сети)"
-            bash "$NODE_DIR/install.sh" "$@" || rc_node=$?
+            run_stage 3/3 "Оптимизация сети и ОС (node)" bash "$NODE_DIR/install.sh" "$@" || rc_node=$?
             ;;
         *)
             say "==> [1/2] shieldnode"
@@ -242,7 +270,7 @@ stack_main() {
             if [ "$dry" -eq 1 ]; then
                 say "==> dry-run: пост-проверка nft пропущена (фаервол намеренно не применялся)"
             elif command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1; then
-                say "==> фаервол: таблица inet shieldnode активна"
+                vsay "==> фаервол: таблица inet shieldnode активна"
             else
                 printf 'ОШИБКА: ФАЕРВОЛ НЕ АКТИВЕН — таблицы inet shieldnode в nft нет.\n' >&2
                 printf '       Лог: /var/log/shieldnode.log; диагностика: bash %s/install.sh status\n' "$SHIELD_DIR" >&2
@@ -268,11 +296,12 @@ stack_main() {
     fi
 
     [ "$CMD" = apply ] && [ "$dry" = 0 ] && install_shortcut
-    say
-    say "${C_G}ГОТОВО.${C_0} Дальше всё — одной командой:"
-    say "  ${C_B}sudo vpn-node${C_0}             # меню: статус, безопасность, оптимизация, откат"
-    say "  ${C_B}sudo vpn-node status${C_0}      # что применено"
-    say "  ${C_B}guard${C_0}                     # дашборд дропов фаервола"
+    if [ "$CMD" = apply ] && [ "$dry" = 0 ]; then
+        print_summary
+    else
+        say
+        say "${C_G}ГОТОВО.${C_0} Управление: ${C_B}sudo vpn-node${C_0} · пульт защиты: ${C_B}sudo guard${C_0}"
+    fi
 }
 
 # ---------- UI и меню (v1.2.0) ----------
@@ -281,8 +310,72 @@ C_0="" C_B="" C_D="" C_G="" C_Y="" C_R="" C_C=""
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
     C_0=$'\033[0m' C_B=$'\033[1m' C_D=$'\033[2m' C_G=$'\033[32m' C_Y=$'\033[33m' C_R=$'\033[31m' C_C=$'\033[36m'
 fi
-die()  { printf '%sОШИБКА:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+die()  {
+    # открытая строка этапа (компактный режим) — закрываем ✘, чтобы ошибка не прилипла к ней
+    [ "${STAGE_OPEN:-0}" = 1 ] && { printf '%s✘%s\n' "$C_R" "$C_0"; STAGE_OPEN=0; }
+    printf '%sОШИБКА:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1
+}
+vsay() { [ "${QUIET:-0}" = 1 ] || say "$@"; }   # служебные строки — только в подробном режиме
 warn() { printf '%sВНИМАНИЕ:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+
+# run_stage <n/N> <название> <команда...> — этап установки. Компактный режим: строка с
+# индикатором и ✔/✘, вывод команды — в журнал, при ошибке — хвост журнала. Подробный — как прежде.
+run_stage() {
+    local tag="$1" title="$2" rc t0 pid i=0 sp='|/-\'
+    shift 2
+    if [ "${QUIET:-0}" != 1 ]; then say "==> [$tag] $title"; "$@"; return $?; fi
+    t0="$(date +%s)"
+    printf '  %s[%s]%s %s ' "$C_D" "$tag" "$C_0" "$title"
+    printf '\n----- [%s] %s: %s\n' "$tag" "$title" "$*" >> "$SETUP_LOG"
+    "$@" >> "$SETUP_LOG" 2>&1 < /dev/null &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        [ -t 1 ] && printf '%s\b' "${sp:$((i++ % 4)):1}"
+        sleep 0.2
+    done
+    set +e; wait "$pid"; rc=$?; set -e
+    if [ "$rc" -eq 0 ]; then
+        printf '%s✔%s %s(%sс)%s\n' "$C_G" "$C_0" "$C_D" $(( $(date +%s) - t0 )) "$C_0"
+    else
+        printf '%s✘%s код %s — последние строки журнала:\n' "$C_R" "$C_0" "$rc"
+        tail -n 12 "$SETUP_LOG" | sed "s/^/      ${C_D}│${C_0} /"
+        printf '      %sполностью: %s%s\n' "$C_D" "$SETUP_LOG" "$C_0"
+    fi
+    return "$rc"
+}
+
+# print_summary — итог установки: что защищено/настроено, нужна ли перезагрузка
+print_summary() {
+    local pt pu cs cc qd v6
+    pt="$(set_elems protected_tcp)"; pu="$(set_elems protected_udp)"
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+    qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+    v6="включён"; [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" = 1 ] && v6="выключен"
+    if systemctl is-active --quiet crowdsec.service 2>/dev/null; then cs="${C_G}работает${C_0}"
+    elif [ "$(conf_get "$SHIELD_CONF" ENABLE_CROWDSEC_LIST)" = 0 ]; then cs="${C_D}выключен${C_0}"
+    else cs="${C_Y}не запущен${C_0} (журнал: /var/log/shieldnode.log)"; fi
+    echo
+    printf '  %s✔ Нода настроена%s\n' "$C_G$C_B" "$C_0"
+    kv "Защита" "TCP ${C_B}${pt:-—}${C_0}   UDP ${C_B}${pu:-—}${C_0}"
+    kv "CrowdSec" "$cs"
+    kv "Сеть" "${cc^^} + $qd · IPv6 $v6"
+    if [ -f /run/node/reboot-required ]; then
+        echo
+        printf '  %s⚠ Установлено новое ядро (XanMod) — оно заработает после перезагрузки.%s\n' "$C_Y" "$C_0"
+        if [ -t 0 ] && [ "${VPN_STACK_NO_REBOOT:-0}" != 1 ]; then
+            if confirm "Перезагрузить сейчас? VPN-клиенты отключатся на 1-2 минуты" n; then
+                say "  Перезагрузка… После неё снова: sudo vpn-node"
+                systemctl reboot 2>/dev/null || reboot
+                exit 0
+            fi
+        fi
+        printf '    %sперезагрузить позже: sudo reboot%s\n' "$C_D" "$C_0"
+    fi
+    echo
+    printf '  Управление: %ssudo vpn-node%s   ·   пульт защиты: %ssudo guard%s\n' "$C_B" "$C_0" "$C_B" "$C_0"
+    [ "${QUIET:-0}" = 1 ] && printf '  %sподробный журнал установки: %s%s\n' "$C_D" "$SETUP_LOG" "$C_0"
+    return 0
+}
 
 # install_shortcut — /usr/local/sbin/vpn-node -> установленная копия установщика
 install_shortcut() {
@@ -396,6 +489,9 @@ run_tool() { # run_tool <node|shieldnode> <args...> — только один с
     echo
     if [ "$rc" -eq 0 ]; then ok_ "$t: готово"; else bad_ "$t: код $rc (лог: /var/log/$t.log)"; fi
     return "$rc"
+}
+run_tool_plain() { # интерактивный инструмент со своим экраном (guard) — без итоговых ✔/✘
+    bash "$WORK_DIR/$1/install.sh" "${@:2}"
 }
 need_installed() {
     is_installed && return 0
@@ -551,14 +647,14 @@ sec_emergency() {
 menu_security() {
     while :; do
         header
-        printf '  %s🛡  Безопасность (shieldnode)%s\n\n' "$C_B" "$C_0"
+        printf '  %sБезопасность (shieldnode)%s\n\n' "$C_B" "$C_0"
         item 1 "Защищаемые порты — показать"
         item 2 "Добавить защищаемый порт"
         item 3 "Убрать ручной порт"
         item 4 "Доверенные IP (панель, мониторинг)"
         item 5 "CrowdSec — включить / выключить"
         item 6 "Обновить блок-листы сейчас"
-        item 7 "Дашборд дропов (guard)"
+        item 7 "Пульт защиты — атаки и баны (guard)"
         item 8 "Аварийный режим — вкл / выкл"
         item 9 "Применить фаервол"
         item 0 "Назад"
@@ -571,7 +667,7 @@ menu_security() {
             4) sec_trusted ;;
             5) sec_crowdsec ;;
             6) echo; if systemctl start shieldnode-blocklist.service 2>/dev/null; then ok_ "блок-листы обновлены (журнал: /var/log/shieldnode.log)"; else bad_ "не удалось (systemctl status shieldnode-blocklist)"; fi; pause ;;
-            7) run_stack guard || true; pause ;;
+            7) run_tool_plain shieldnode guard || true ;;
             8) sec_emergency ;;
             9) echo; run_tool shieldnode apply || true; pause ;;
             0|q|"") return 0 ;;
@@ -586,7 +682,7 @@ menu_node() {
     while :; do
         header
         v6="$(conf_get "$NODE_CONF" HARDEN_IPV6)"; [ -n "$v6" ] || v6=1
-        printf '  %s⚙  Оптимизация (node)%s\n\n' "$C_B" "$C_0"
+        printf '  %sОптимизация (node)%s\n\n' "$C_B" "$C_0"
         item 1 "Статус оптимизации"
         item 2 "Применить оптимизацию"
         item 3 "План изменений (ничего не меняет)"
@@ -616,28 +712,39 @@ menu_main() {
     [ "$(id -u)" -eq 0 ] || die "меню требует root: sudo vpn-node"
     # ширина рамок/колонок считается в символах — нужна UTF-8 локаль (под sudo бывает C/POSIX)
     case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*utf8*) : ;; *) export LC_ALL=C.UTF-8 ;; esac
+    # 2026-09-25 (v1.3.0): первый запуск на чистой ноде — сразу к установке, без поиска пункта
+    if ! is_installed; then
+        header
+        printf '  На этой ноде стек ещё не установлен. Установка займёт 1-3 минуты:\n'
+        printf '   %s1.%s фаервол shieldnode — защита SSH и VPN-портов, блок-листы, CrowdSec\n' "$C_B" "$C_0"
+        printf '   %s2.%s оптимизация node — BBR, буферы, conntrack, лимиты (ядро XanMod)\n' "$C_B" "$C_0"
+        printf '   %sSSH не прервётся: ваш IP попадёт в белый список, при ошибке — автооткат.%s\n\n' "$C_D" "$C_0"
+        if confirm "Установить сейчас?" y; then run_stack apply || true; pause; fi
+    fi
     while :; do
         header
-        if is_installed; then item 1 "🚀 Обновить стек (скачать последнюю версию и применить)"
-        else item 1 "🚀 Установить стек (фаервол + оптимизация)"; fi
-        item 2 "📊 Статус"
-        item 3 "🛡  Безопасность — порты, доверенные IP, CrowdSec, аварийный режим"
-        item 4 "⚙  Оптимизация — статус, IPv6, откат"
-        item 5 "🔍 План изменений (ничего не меняет)"
-        item 6 "↩  Откатить всё"
-        item 7 "🗑  Удалить стек"
+        if is_installed; then item 1 "Обновить стек (скачать последнюю версию и применить)"
+        else item 1 "Установить стек (фаервол + оптимизация)"; fi
+        item 2 "Пульт защиты — атаки, баны, блок-листы (guard)"
+        item 3 "Статус — что применено, проверки"
+        item 4 "Безопасность — порты, доверенные IP, CrowdSec, аварийный режим"
+        item 5 "Оптимизация — статус, IPv6, откат"
+        item 6 "План изменений (ничего не меняет)"
+        item 7 "Откатить всё к исходному состоянию"
+        item 8 "Удалить стек"
         item 0 "Выход"
         echo
-        [ -x "$BIN_LINK" ] && printf '  %sзапуск в следующий раз: sudo %s%s\n\n' "$C_D" "$(basename "$BIN_LINK")" "$C_0"
+        [ -x "$BIN_LINK" ] && printf '  %sзапуск в следующий раз: sudo %s · пульт: sudo guard%s\n\n' "$C_D" "$(basename "$BIN_LINK")" "$C_0"
         ask "  Выбор: "
         case "$REPLY" in
             1) echo; confirm "Скачать стек с GitHub и применить (сначала фаервол, затем оптимизация)?" y && run_stack apply || true; pause ;;
-            2) echo; need_installed && { run_stack status || true; pause; } ;;
-            3) need_installed && menu_security ;;
-            4) need_installed && menu_node ;;
-            5) echo; run_stack apply --dry-run || true; pause ;;
-            6) echo; need_installed && { confirm "Откатить оптимизацию и фаервол к исходному состоянию?" n && run_stack rollback || true; pause; } ;;
-            7) echo; need_installed && {
+            2) need_installed && { run_tool_plain shieldnode guard || true; } ;;
+            3) echo; need_installed && { run_stack status || true; pause; } ;;
+            4) need_installed && menu_security ;;
+            5) need_installed && menu_node ;;
+            6) echo; run_stack apply --dry-run || true; pause ;;
+            7) echo; need_installed && { confirm "Откатить оптимизацию и фаервол к исходному состоянию?" n && run_stack rollback || true; pause; } ;;
+            8) echo; need_installed && {
                    warn "будут сняты фаервол shieldnode и оптимизации node"
                    ask "  Для подтверждения введи ${C_B}удалить${C_0}: "
                    if [ "$REPLY" = удалить ]; then run_stack uninstall && rm -f "$BIN_LINK" || true; else info_ "отменено"; fi

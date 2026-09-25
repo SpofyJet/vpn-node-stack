@@ -71,7 +71,8 @@ has()  { grep -qF -- "$1" "$OUT/h.txt"; }
 sumf() { grep -oE "health: FAIL=[0-9]+ WARN=[0-9]+" "$OUT/h.txt"; }
 # 2026-09-24 (v1.1.6): crowdsec включён по умолчанию — здоровая нода имеет и его сет
 fill() { local s; for s in scanner_blocklist_v4 threat_blocklist_v4 custom_blocklist_v4 spamhaus_blocklist_v4 cins_blocklist_v4 crowdsec_blocklist_v4; do printf '1.2.3.0/24\n5.6.7.8/32\n' > "$ELEMS/$s"; done
-         for n in scanner threat custom spamhaus cins crowdsec; do : > "$OUT/bl/last-good-$n.txt"; done; }
+         # last-good как у настоящего updater'а: снапшот ЗАПИСЕЙ последнего успешного обновления
+         for n in scanner threat custom spamhaus cins crowdsec; do printf '1.2.3.0/24\n5.6.7.8/32\n' > "$OUT/bl/last-good-$n.txt"; done; }
 healthy() { printf '[shieldnode]\nversion=test\nupdated=2026-09-23T10:00:00Z\n' > /etc/node-profile.d/stack.conf; fill; printf 'c_drops_scanner_v4 42\nc_drops_invalid 3\n' > "$CNTS"; }
 
 # ---------- 1. здоровая нода ----------
@@ -107,6 +108,13 @@ t "scanner пуст -> WARN «set ПУСТ» (возраст last-good без а
 t "threat обновлён 72ч назад (> 2x360мин) -> WARN"       'has "[WARN] threat: последнее успешное обновление 72ч назад"'
 t "spamhaus алерт -> WARN"                               'has "[WARN] spamhaus: фид падает подряд"'
 t "cins без last-good -> WARN «успешных обновлений не было»" 'has "[WARN] cins: успешных обновлений ещё не было"'
+# 2026-09-25 (v1.1.7): custom без записей (успешное обновление, пустой снапшот) — не WARN (живая нода)
+gen ''; healthy; : > "$ELEMS/custom_blocklist_v4"; : > "$OUT/bl/last-good-custom.txt"; touch -d '25 hours ago' "$OUT/bl/last-good-custom.txt"; H
+t "custom пуст, т.к. в custom.txt нет записей -> PASS с подсказкой, не WARN" 'has "[PASS] custom: пуст — в /etc/shieldnode/lists/custom.txt" && ! has "[WARN] custom"'
+gen ''; healthy; : > "$ELEMS/custom_blocklist_v4"; H
+t "custom: set пуст, а снапшот НЕ пуст -> WARN (реальная проблема)" 'has "[WARN] custom: set ПУСТ"'
+gen ''; healthy; : > "$ELEMS/scanner_blocklist_v4"; touch -d '3 days ago' "$OUT/bl/last-good-threat.txt"
+date -u +%FT%TZ > "$OUT/bl/.alert-spamhaus"; rm -f "$OUT/bl/last-good-cins.txt"; H
 t "custom не проверяется на свежесть (hash-guard, неизменный контент — норма)" '! grep -q "custom: последнее успешное" "$OUT/h.txt"'
 
 # ---------- 5. порты: EXTRA, внешний UDP xray, интервалы ----------

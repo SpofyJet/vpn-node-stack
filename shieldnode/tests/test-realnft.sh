@@ -65,8 +65,9 @@ t "status: в секции firewall перечислены цепочки prerou
 # 2026-09-24 (v1.1.4): первый guard (снапшота нет, prev_ts=0) печатал «дельта за
 # <секунды с 1970>s» — на живой ноде «дельта за 1790200980s»
 NO_COLOR=1 bash "$SHIELD_DIR/main.sh" guard > "$OUT/guard1.out" 2>&1 || true
-t "guard: первый запуск — сводка счётчиков без «дельта за Ns»" \
-  "grep -q 'счётчиков ненулевые ---' $OUT/guard1.out && ! grep -q 'дельта за' $OUT/guard1.out"
+# 2026-09-25 (v1.1.7): новый дашборд — первый запуск без «+N — за …», итог и группы есть
+t "guard: первый запуск — итог без «+N — за …» (снапшота ещё нет)" \
+  "grep -qE '(Итого|пока ничего — атак не было)' $OUT/guard1.out && ! grep -q '+N — за' $OUT/guard1.out && grep -q '● работает' $OUT/guard1.out"
 
 # --- updater: эмитим через shield_blocklist_install в tmpfs-пути ---
 (
