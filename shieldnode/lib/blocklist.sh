@@ -114,7 +114,10 @@ HEADER_EOF
         # custom: локальный файл /etc/shieldnode/lists/custom.txt (оператор) +
         # опциональный центральный URL (BLOCKLIST_CUSTOM_URLS — например raw
         # custom.txt из операторского репо; синкается каждый тик таймера)
-        printf 'BL_URLS_custom="%s"\n' "$(_bl_safe BLOCKLIST_CUSTOM_URLS "$(shield_conf_get BLOCKLIST_CUSTOM_URLS "")")"
+        # 2026-09-25 (v1.1.8): дефолт — список оператора; none/off/0 — только локальный файл
+        local cu; cu="$(shield_conf_get BLOCKLIST_CUSTOM_URLS "")"
+        case "$cu" in none|off|0|no) cu="" ;; esac
+        printf 'BL_URLS_custom="%s"\n' "$(_bl_safe BLOCKLIST_CUSTOM_URLS "$cu")"
         printf 'BL_URLS_crowdsec="%s"\n' "$(_bl_safe CROWDSEC_INTEGRATION_ID "$cs_endpoint")"
         # spamhaus DROP/EDROP (v4) + dropv6 (v6): формат "S24-x.y.z.w/24 ; comment"
         # (префикс S<len>- и хвост после ';' срезаются парсером)

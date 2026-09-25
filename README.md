@@ -52,6 +52,7 @@ sudo guard                    # пульт защиты: что отбито, к
 - **Доверенные IP** — панель Remnawave, мониторинг: без лимитов и блок-листов.
 - **CrowdSec** — community blocklist включён по умолчанию (агент без аккаунта, обновление каждые 30 мин).
 - **Блок-листы**, **пульт защиты (guard)**, **аварийный режим**, **применить фаервол**.
+- **Свой список** — по умолчанию [SpofyJet/shield · lists/custom.txt](https://github.com/SpofyJet/shield/blob/main/lists/custom.txt): правишь файл в репозитории — все ноды подтянут при ближайшем обновлении (≤ 6 ч, или сразу: `sudo guard` → «Обновить блок-листы»). Локальные добавки — `/etc/shieldnode/lists/custom.txt`; свой URL — `BLOCKLIST_CUSTOM_URLS` в `/etc/shieldnode/config.conf`, выключить — `BLOCKLIST_CUSTOM_URLS=none`.
 
 ## Использование без меню
 

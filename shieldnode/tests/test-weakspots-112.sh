@@ -85,7 +85,7 @@ t "каждый ключ, читаемый кодом, есть в defaults${mis
 t "контракт: значение оператора побеждает документированный ключ" \
   '( printf "PROTECTED_TCP_EXTRA=9443\n" > "$OUT/op.conf"; SHIELD_CONFIG="$OUT/op.conf" shield_load_config; [ "$(shield_conf_get PROTECTED_TCP_EXTRA "")" = 9443 ] )'
 t "контракт: дописанное в кэш переопределение не перекрыто defaults" \
-  '( SHIELD_CONFIG=/nonexistent shield_load_config; echo BLOCKLIST_CUSTOM_URLS=x >> "$CONFIG_CACHE"; [ "$(shield_conf_get BLOCKLIST_CUSTOM_URLS "")" = x ] )'
+  '( SHIELD_CONFIG=/nonexistent shield_load_config; echo PROTECTED_TCP_EXTRA=x >> "$CONFIG_CACHE"; [ "$(shield_conf_get PROTECTED_TCP_EXTRA "")" = x ] )'
 
 # ---------- updater: парсер + collapse (реальный сгенерированный скрипт) ----------
 if [ "$IN_NS" != "1" ]; then

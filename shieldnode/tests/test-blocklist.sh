@@ -147,7 +147,8 @@ export DRY_RUN=0
 mkdir -p "$(dirname "$SHIELD_CONFIG")" 2>/dev/null || true
 # центральный custom-URL (аналог старого репо) — должен запечься в updater.
 # Пишем в CONFIG_CACHE (user-часть мержа), т.к. /etc в sandbox не для записи.
-printf 'BLOCKLIST_CUSTOM_URLS="file://%s/fixtures/custom-central.txt"\n' "$OUT" >> "$CONFIG_CACHE"
+# в НАЧАЛО кэша (как строка config.conf): с v1.1.8 в defaults есть живой BLOCKLIST_CUSTOM_URLS (first-match)
+{ printf 'BLOCKLIST_CUSTOM_URLS="file://%s/fixtures/custom-central.txt"\n' "$OUT"; cat "$CONFIG_CACHE"; } > "$CONFIG_CACHE.new" && mv "$CONFIG_CACHE.new" "$CONFIG_CACHE"
 
 fails=0
 t() { local name="$1"; shift
@@ -587,6 +588,17 @@ EOF
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom
 t "custom-central: URL + local объединены (3 записи)" bash -c "test \$(wc -l < '$OUT/nftdb/set_custom_blocklist_v4') = 3"
 t "custom-central: записи из обоих источников в set" bash -c "grep -qx '45.148.10.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '91.240.118.9/32' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '93.184.216.34/32' '$OUT/nftdb/set_custom_blocklist_v4'"
+
+# 2026-09-25 (v1.1.8): центральный custom-лист оператора — по умолчанию; none — выключить
+t "custom: по умолчанию — список оператора SpofyJet/shield" grep -qx 'BLOCKLIST_CUSTOM_URLS="https://raw.githubusercontent.com/SpofyJet/shield/main/lists/custom.txt"' "$SHIELD_DIR/shieldnode.defaults.conf"
+cp "$CONFIG_CACHE" "$CONFIG_CACHE.bak-cu"
+{ printf 'BLOCKLIST_CUSTOM_URLS=none\n'; cat "$CONFIG_CACHE.bak-cu"; } > "$CONFIG_CACHE"
+SHIELD_BLOCKLIST_SCRIPT=/usr/local/sbin/shieldnode-blocklist; shield_blocklist_install >/dev/null 2>&1; SHIELD_BLOCKLIST_SCRIPT="$OUT/usr/local/sbin/shieldnode-blocklist"
+t "custom: BLOCKLIST_CUSTOM_URLS=none -> только локальный файл (URL пуст)" grep -qx 'BL_URLS_custom=""' "$SHIELD_BLOCKLIST_SCRIPT"
+{ grep -v '^BLOCKLIST_CUSTOM_URLS=' "$CONFIG_CACHE.bak-cu"; grep '^BLOCKLIST_CUSTOM_URLS=' "$SHIELD_DIR/shieldnode.defaults.conf"; } > "$CONFIG_CACHE"
+SHIELD_BLOCKLIST_SCRIPT=/usr/local/sbin/shieldnode-blocklist; shield_blocklist_install >/dev/null 2>&1; SHIELD_BLOCKLIST_SCRIPT="$OUT/usr/local/sbin/shieldnode-blocklist"
+t "custom: дефолт запекается в updater" grep -qx 'BL_URLS_custom="https://raw.githubusercontent.com/SpofyJet/shield/main/lists/custom.txt"' "$SHIELD_BLOCKLIST_SCRIPT"
+mv "$CONFIG_CACHE.bak-cu" "$CONFIG_CACHE"
 
 # 2026-09-24 (v1.1.6): значения конфига запекаются в root-скрипт внутри "..." — инъекция
 cp "$CONFIG_CACHE" "$CONFIG_CACHE.bak-inj"

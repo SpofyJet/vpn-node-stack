@@ -97,7 +97,8 @@ _g_draw() {
     printf '%s╭%s╮%s\n' "$G_C" "$bar" "$G_0"
     printf '%s│%s %s%s%s %s│%s\n' "$G_C" "$G_0" "$G_B" "$title" "$G_0" "$G_C" "$G_0"
     printf '%s╰%s╯%s\n' "$G_C" "$bar" "$G_0"
-    printf '  %sshieldnode v%s · %s · сервер работает %s%s\n\n' "$G_D" "$SHIELD_VERSION" "${ip:-?}" "$(_g_dur "$up")" "$G_0"
+    # 2026-09-25 (v1.1.8): без внутренних имён компонентов — только то, что важно оператору
+    printf '  %s%s · сервер работает %s%s\n\n' "$G_D" "${ip:-?}" "$(_g_dur "$up")" "$G_0"
 
     # 1) состояние
     case "$G_FW" in
@@ -177,16 +178,15 @@ _g_draw() {
     local probs="" svc f cnt
     if [ "$G_FW" != "ABSENT" ]; then
         systemctl is-enabled --quiet shieldnode.service 2>/dev/null \
-            || probs="${probs}фаервол не восстановится после перезагрузки (shieldnode.service выключен) — повтори установку"$'\n'
-        for svc in shieldnode-blocklist.timer; do
-            systemctl is-active --quiet "$svc" 2>/dev/null || probs="${probs}автообновление блок-листов остановлено ($svc) — sudo systemctl enable --now $svc"$'\n'
-        done
+            || probs="${probs}фаервол не восстановится после перезагрузки — sudo vpn-node → «Обновить стек»"$'\n'
+        systemctl is-active --quiet shieldnode-blocklist.timer 2>/dev/null \
+            || probs="${probs}автообновление блок-листов остановлено — sudo vpn-node → «Обновить стек»"$'\n'
         if [ -e "${SHIELD_UNIT_DIR:-/etc/systemd/system}/shieldnode-blocklist-crowdsec.timer" ] && ! systemctl is-active --quiet shieldnode-blocklist-crowdsec.timer 2>/dev/null; then
-            probs="${probs}обновление CrowdSec остановлено — sudo systemctl enable --now shieldnode-blocklist-crowdsec.timer"$'\n'
+            probs="${probs}автообновление CrowdSec остановлено — sudo vpn-node → «Обновить стек»"$'\n'
         fi
         for f in "$SHIELD_STATE_DIR"/blocklists/.alert-*; do
             [ -e "$f" ] || continue
-            probs="${probs}блок-лист «$(basename "$f" | sed 's/^\.alert-//')» не обновляется с $(cut -c1-16 "$f" 2>/dev/null | tr T ' ') — сеть/источник? (журнал: /var/log/shieldnode.log)"$'\n'
+            probs="${probs}блок-лист «$(basename "$f" | sed 's/^\.alert-//')» не обновляется с $(cut -c1-16 "$f" 2>/dev/null | tr T ' ') — нет сети или источник недоступен (старый список продолжает работать)"$'\n'
         done
         # SSH слушает?
         local ssh_port ss_out
@@ -220,6 +220,7 @@ _g_draw() {
     elif [ "$G_FW" != "ABSENT" ]; then
         printf '  %s✔ Проблем не найдено%s%s\n' "$G_G" "$G_0" "${G_ADMIN_OK:+ · ваш IP ${G_ADMIN_OK} в белом списке}"
     fi
+    printf '  %sv%s%s\n' "$G_D" "$SHIELD_VERSION" "$G_0"
     echo
 }
 
@@ -295,14 +296,14 @@ _g_act_trusted() {
     _g_trusted_write "$new"
     printf '  сохранено: TRUSTED_IPS="%s" — применяю фаервол…\n' "$new"
     if bash "$SHIELD_DIR/main.sh" apply >/dev/null 2>&1; then printf '  %s✔ применено%s\n' "$G_G" "$G_0"
-    else printf '  %s✘ применение не удалось — прежний фаервол сохранён (журнал: /var/log/shieldnode.log)%s\n' "$G_R" "$G_0"; fi
+    else printf '  %s✘ применение не удалось — прежние правила сохранены (подробности: sudo vpn-node → «Статус»)%s\n' "$G_R" "$G_0"; fi
     _g_pause
 }
 _g_act_update() {
     _g_need_root || { _g_pause; return 0; }
     printf '\n  Обновляю блок-листы (до минуты)…\n'
     if systemctl start shieldnode-blocklist.service 2>/dev/null; then printf '  %s✔ блок-листы обновлены%s\n' "$G_G" "$G_0"
-    else printf '  %s✘ часть источников недоступна — старые списки сохранены (журнал: /var/log/shieldnode.log)%s\n' "$G_Y" "$G_0"; fi
+    else printf '  %s✘ часть источников недоступна — старые списки продолжают работать%s\n' "$G_Y" "$G_0"; fi
     if [ -e "${SHIELD_UNIT_DIR:-/etc/systemd/system}/shieldnode-blocklist-crowdsec.service" ]; then
         systemctl start shieldnode-blocklist-crowdsec.service 2>/dev/null && printf '  %s✔ CrowdSec обновлён%s\n' "$G_G" "$G_0" || true
     fi
@@ -333,6 +334,12 @@ shield_guard() {
     # ширина рамок/колонок — в символах: нужна UTF-8 локаль (под sudo бывает C/POSIX)
     case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*utf8*) : ;; *) export LC_ALL=C.UTF-8 ;; esac
     _g_colors
+    # 2026-09-25 (v1.1.8): правила фаервола читаются только root'ом — без него nft «не видит»
+    # таблицу, и пульт ложно писал «фаервол не применён — нода без защиты»
+    if [ "$(id -u)" -ne 0 ] && [ "${SHIELD_GUARD_ALLOW_NONROOT:-0}" != 1 ]; then
+        printf '%sПульт защиты читает правила фаервола — запусти с правами root:%s sudo guard\n' "$G_Y" "$G_0" >&2
+        return 1
+    fi
     local mode="${SHIELD_GUARD_MODE:-auto}"
     [ "$mode" = auto ] && { if [ -t 0 ] && [ -t 1 ]; then mode=menu; else mode=once; fi; }
     G_ADMIN_OK=""
