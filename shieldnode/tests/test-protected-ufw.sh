@@ -42,6 +42,8 @@ cat > "$OUT/ufw/user6.rules" <<'EOS'
 EOS
 export PATH="$OUT/bin:$PATH" SHIELD_DIR SHIELD_STATE_DIR="$OUT/state" SHIELD_LOG="$OUT/log"
 export SHIELD_CONFIG="$OUT/c" SHIELD_EXCLUDE="$OUT/none" SSH_CONNECTION="" SHIELD_UFW_DIR="$OUT/ufw"
+mkdir -p "$OUT/sys/net/ipv4"; echo "10240 65535" > "$OUT/sys/net/ipv4/ip_local_port_range"; : > "$OUT/sys/net/ipv4/ip_local_reserved_ports"
+export SHIELD_XRAY_LSI_FILE=/nonexistent SHIELD_PROC_SYS="$OUT/sys" SHIELD_DETECT_STABLE_DELAY=0 SHIELD_REMNANODE_DIR="$OUT/no-rn"
 : > "$OUT/log"
 fails=0
 t() { local name="$1"; shift
@@ -53,16 +55,18 @@ resolve() { printf '%b' "$1" > "$OUT/c"
 
 r="$(resolve 'SSH_PORT=22\n')"; echo "  ($r)"
 t "UFW tcp: 80, 443, 2222 (allow from IP), 22 (limit), multiport 7000,7001" "[[ '$r' == 'TCP=[22 80 443 2222 7000 7001 8443]'* ]]"
-t "UFW udp: диапазон 20000:20100 -> 20000-20100, v6-правило 4443" "[[ '$r' == *'UDP=[36712 4443 20000-20100]' ]]"
+t "UFW udp: диапазон 20000:20100 -> 20000-20100, v6-правило 4443" "[[ '$r' == *'UDP=[4443 20000-20100]' ]]"
 t "UFW: DROP, output-цепочка и правило без порта — не берутся" "[[ '$r' != *9999* && '$r' != *' 25 '* && '$r' != *25]* ]]"
 t "rw-core (Xray в remnawave/node) — tcp 8443 защищён" "[[ '$r' == *8443* ]]"
 t "loopback-API ядра (127.0.0.1:61000) не защищается" "[[ '$r' != *61000* ]]"
-t "hysteria (UDP) не попал в protected_tcp (было -tulnp)" "[[ '$r' == TCP=*'] UDP='*36712* && '$r' != TCP=*36712*'] UDP'* ]]"
+# v1.2.0: UDP-сокет без API (hysteria-процесс, в эфемерном диапазоне, без TCP-двойника) не угадывается —
+# неотличим от эфемерного; реальный UDP-инбаунд за UFW (default deny) всё равно открыт в UFW -> берётся оттуда
+t "hysteria 36712/udp без API и без UFW-правила — не угадывается; и не в protected_tcp" "[[ '$r' != *36712* ]]"
 
 r="$(resolve 'SSH_PORT=22\nPROTECTED_FROM_UFW=0\n')"
-t "PROTECTED_FROM_UFW=0: из UFW ничего" "[[ '$r' == 'TCP=[22 8443] UDP=[36712]' ]]"
+t "PROTECTED_FROM_UFW=0: из UFW ничего" "[[ '$r' == 'TCP=[22 8443] UDP=[]' ]]"
 echo 'ENABLED=no' > "$OUT/ufw/ufw.conf"; r="$(resolve 'SSH_PORT=22\n')"
-t "UFW выключен (ENABLED=no): из UFW ничего" "[[ '$r' == 'TCP=[22 8443] UDP=[36712]' ]]"
+t "UFW выключен (ENABLED=no): из UFW ничего" "[[ '$r' == 'TCP=[22 8443] UDP=[]' ]]"
 echo 'ENABLED=yes' > "$OUT/ufw/ufw.conf"
 
 r="$(resolve 'SSH_PORT=22\nPROTECTED_FROM_UFW=0\nPROTECTED_TCP_EXTRA="9443 abc 70000 30000-30010 5-3"\nPROTECTED_UDP_EXTRA="x 5000"\n')"

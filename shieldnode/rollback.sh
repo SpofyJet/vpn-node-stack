@@ -25,8 +25,14 @@ shield_rollback() {
         systemctl disable --now shieldnode-cleanup.timer >/dev/null 2>&1 || true
         systemctl disable --now shieldnode-blocklist.timer shieldnode-blocklist.service \
                            shieldnode-blocklist-custom.path shieldnode-blocklist-custom.service >/dev/null 2>&1 || true
+        [ -e /etc/systemd/system/shieldnode-blocklist-restore.service ] && \
+            { systemctl disable shieldnode-blocklist-restore.service >/dev/null 2>&1 || true; }
         # 2026-09-24 (v1.1.6): таймер crowdsec есть не всегда (только agent-режим) — отдельным
         # вызовом и только при наличии файла: несуществующий юнит в общем списке роняет disable целиком
+        # 2026-09-25 (v1.2.0): ports-watch — до снятия таблицы (иначе успеет «досинхронизировать»)
+        if [ -e /etc/systemd/system/shieldnode-ports.service ]; then
+            systemctl disable --now shieldnode-ports.service >/dev/null 2>&1 || true
+        fi
         if [ -e /etc/systemd/system/shieldnode-blocklist-crowdsec.timer ]; then
             systemctl disable --now shieldnode-blocklist-crowdsec.timer shieldnode-blocklist-crowdsec.service >/dev/null 2>&1 || true
         fi

@@ -18,7 +18,8 @@ shield_uninstall() {
     rm -f /etc/systemd/system/shieldnode.service /etc/systemd/system/shieldnode-cleanup.service /etc/systemd/system/shieldnode-cleanup.timer \
           /etc/systemd/system/shieldnode-blocklist.service /etc/systemd/system/shieldnode-blocklist.timer \
           /etc/systemd/system/shieldnode-blocklist-custom.service /etc/systemd/system/shieldnode-blocklist-custom.path \
-          /etc/systemd/system/shieldnode-blocklist-crowdsec.service /etc/systemd/system/shieldnode-blocklist-crowdsec.timer
+          /etc/systemd/system/shieldnode-blocklist-crowdsec.service /etc/systemd/system/shieldnode-blocklist-crowdsec.timer \
+          /etc/systemd/system/shieldnode-ports.service /etc/systemd/system/shieldnode-blocklist-restore.service
 
     log info "uninstall" "сохранены пользовательские конфиги: /etc/shieldnode/ (config.conf, exclude.conf, extensions.d/)"
     # 2026-09-24 (v1.1.6): crowdsec (agent-режим) — отдельный пакет со своей БД; не удаляем молча

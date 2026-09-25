@@ -150,16 +150,19 @@ EOF
         # amp/icmp-counters — при включённых соответствующих гардах
         [ "${SH_F_ENABLE_AMP_GUARD:-1}" = "1" ] && echo "    counter c_drops_amp { }"
         [ "${SH_F_ENABLE_ICMP_GUARD:-1}" = "1" ] && echo "    counter c_drops_icmp { }"
+        # 2026-09-25 (v1.2.0): IPv6 fail-safe и ограничение API ноды — всегда
+        echo "    counter c_drops_ipv6_failsafe { }"
+        echo "    counter c_drops_nodeapi { }"
+        # API ноды (remnanode): порт — только если известны разрешённые источники (TRUSTED_IPS/UFW
+        # «allow from»); пока их нет, набор порта ПУСТ — правило инертно и панель не отрезается
+        for p in ${SH_F_NODE_API_PORT_SET:-}; do echo "$p"; done | shield_nft_emit_set node_api_port inet_service "flags interval"
+        for ip in ${SH_F_NODE_API_ALLOW_V4:-}; do echo "$ip"; done | shield_nft_emit_set node_api_allow_v4 ipv4_addr "flags interval" "auto-merge"
 
         # ---------- prerouting (ТЗ §21–25): priority -150, policy accept ----------
         cat <<EOF
 
     chain prerouting {
         type filter hook prerouting priority -150; policy accept;
-EOF
-        [ "$SH_F_ENABLE_ESTABLISHED" = "1" ] && cat <<'EOF'
-        # established/related — вернувшийся трафик не трогаем (ТЗ §23)
-        ct state established,related accept
 EOF
         if [ "$SH_F_ENABLE_LOOPBACK" = "1" ]; then
             cat <<'EOF'
@@ -168,6 +171,18 @@ EOF
 EOF
         fi
         cat <<'EOF'
+        # 2026-09-25 (v1.2.0): IPv6 на ноде выключен ОБЯЗАТЕЛЬНО — fail-safe: если IPv6 вернётся
+        # (откат, провайдер, обновление ядра/netplan), не пройдёт ни один пакет (DIAGNOSIS P1-4)
+        meta nfproto ipv6 counter name c_drops_ipv6_failsafe drop
+EOF
+        [ "$SH_F_ENABLE_ESTABLISHED" = "1" ] && cat <<'EOF'
+        # established/related — вернувшийся трафик не трогаем (ТЗ §23)
+        ct state established,related accept
+EOF
+        cat <<'EOF'
+        # API ноды — только панель (TRUSTED_IPS + UFW «allow from» для этого порта); ДО whitelist:
+        # сессия админа по SSH к API ноды доступа не даёт (DIAGNOSIS P0-2)
+        tcp dport @node_api_port ip saddr != @node_api_allow_v4 counter name c_drops_nodeapi drop
         # whitelist первым из блокирующих решений: админ/исключения §30 не режутся
         ip saddr @whitelist_v4 accept
 EOF
@@ -356,6 +371,21 @@ EOF
         fi
 
         cat <<'EOF'
+    }
+EOF
+
+        # ---------- IPv6 fail-safe на выходе и транзите (v1.2.0) ----------
+        cat <<'EOF'
+
+    chain v6_output {
+        type filter hook output priority -150; policy accept;
+        oifname "lo" accept
+        meta nfproto ipv6 counter name c_drops_ipv6_failsafe drop
+    }
+
+    chain v6_forward {
+        type filter hook forward priority -150; policy accept;
+        meta nfproto ipv6 counter name c_drops_ipv6_failsafe drop
     }
 EOF
 

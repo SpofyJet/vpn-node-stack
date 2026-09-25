@@ -2,7 +2,7 @@
 # shieldnode — main.sh: точка входа, режимы, lock, диспетчеризация (TZ §4, §28).
 set -euo pipefail
 
-SHIELD_VERSION="1.1.8"
+SHIELD_VERSION="1.2.0"
 # readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
 SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
@@ -14,7 +14,7 @@ export LOG_LEVEL=info
 
 usage() {
     cat <<'EOF'
-shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.8
+shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.2.0
 
 Использование: shieldnode [опции] <команда> [аргумент]
 
@@ -23,6 +23,8 @@ shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.1.
   detect              снапшот окружения (без изменений)
   status              ожидаемое vs фактическое состояние
   guard               пульт защиты: атаки, баны, блок-листы, проблемы + меню действий
+  verify              проверка «фаервол жив»: хуки, правила, наборы, IPv6 fail-safe, whitelist SSH
+  ports-sync          разово сверить защищаемые порты с реальностью (инбаунды Xray, UFW)
                       (--once — только снимок, --raw — технические счётчики)
   rollback [id]       откат к backup-набору (без id — последний/удаление своих)
   emergency on|off    аварийный минимальный режим
@@ -77,9 +79,9 @@ if [ "$(id -u)" -eq 0 ] && [ ! -e "$SHIELD_LOG" ]; then install -m 0640 /dev/nul
 # shellcheck source=config.sh
 source "$SHIELD_DIR/config.sh"
 shield_load_config
-if [ "$cmd" = guard ]; then
+if [ "$cmd" = guard ] || [ "$cmd" = verify ] || [ "$cmd" = ports-sync ] || [ "$cmd" = ports-watch ]; then
     # 2026-09-25 (v1.1.7): у пульта строка старта — только в журнал, не поверх дашборда
-    [ -w "$SHIELD_LOG" ] && printf '%s [info] main: shieldnode v%s cmd=guard\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SHIELD_VERSION" >> "$SHIELD_LOG" || true
+    [ -w "$SHIELD_LOG" ] && printf '%s [info] main: shieldnode v%s cmd=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SHIELD_VERSION" "$cmd" >> "$SHIELD_LOG" || true
 else
     log info "main" "shieldnode v$SHIELD_VERSION cmd=$cmd dry_run=$DRY_RUN"
 fi
@@ -142,6 +144,22 @@ case "$cmd" in
         # shellcheck source=guard.sh
         source "$SHIELD_DIR/guard.sh"
         shield_guard
+        ;;
+    # 2026-09-25 (v1.2.0): синхронизация защищаемых портов (DIAGNOSIS P0-2) и проверка «жив»
+    ports-sync|ports-watch|verify)
+        # shellcheck source=detect.sh
+        source "$SHIELD_DIR/detect.sh"
+        # shellcheck source=limits.sh
+        source "$SHIELD_DIR/limits.sh"
+        # shellcheck source=firewall.sh
+        source "$SHIELD_DIR/firewall.sh"
+        # shellcheck source=lib/ports.sh
+        source "$SHIELD_DIR/lib/ports.sh"
+        case "$cmd" in
+            ports-sync)  shield_ports_sync ;;
+            ports-watch) shield_ports_watch ;;
+            verify)      shield_verify ;;
+        esac
         ;;
     rollback)
         shield_wait_lock; acquire_lock

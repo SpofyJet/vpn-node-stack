@@ -106,13 +106,10 @@ node_svc_mask() { # <unit...> — disable --now + mask со снапшотом
 }
 
 # --- IPv6: безопасный sysctl-метод (boot не трогаем; доказан старой веткой) ---
-node_harden_ipv6() {
-    [ "$(node_conf_get HARDEN_IPV6 1)" = "1" ] || return 0
-    # probed: на ядрах без IPv6 просто пропускаем, apply не падает
-    node_sysctl_add_probed "$NODE_SYSCTL_IPV6" net.ipv6.conf.all.disable_ipv6 1
-    node_sysctl_add_probed "$NODE_SYSCTL_IPV6" net.ipv6.conf.default.disable_ipv6 1
-    node_sysctl_add_probed "$NODE_SYSCTL_IPV6" net.ipv6.conf.lo.disable_ipv6 1
-}
+# 2026-09-25 (v1.2.0, P1-4): IPv6 — инвариант стека (lib/ipv6.sh), не ключи плана: файл 99-z3
+# удалялся rollback'ом, а реестр исходных значений возвращал disable_ipv6=0. Функция оставлена
+# пустой для совместимости вызовов.
+node_harden_ipv6() { :; }
 
 node_services_apply() {
     # фоновые сервисы headless-VPS (доказанный список поколения старых скриптов)

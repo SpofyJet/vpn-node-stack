@@ -114,7 +114,9 @@ t "повторный apply: tcp_rmem/wmem остаются в плане (ср�
 ss() { printf 'tcp LISTEN 0 4096 *:22 *:*\ntcp LISTEN 0 4096 [::]:20443 [::]:*\nudp UNCONN 0 0 0.0.0.0:25000 0.0.0.0:*\ntcp LISTEN 0 4096 *:443 *:*\ntcp LISTEN 0 4096 127.0.0.1:40000 *:*\n'; }
 printf 'TCP_RESERVED_PORTS=30000-30010\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
 ( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem1g"; node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.rp" )
-t "reserved_ports: слушаемые 20443/25000 (tcp/udp) + TCP_RESERVED_PORTS; 22/443/40000 — нет" 'grep -qP "^net.ipv4.ip_local_reserved_ports\t30000-30010,20443,25000\t" "$OUT/plan.rp"'
+# 2026-09-25 (v1.2.0): UDP-сокет 25000 НЕ резервируется — у Xray это эфемерные сокеты исходящих потоков;
+# без контракта shieldnode — только TCP LISTEN (20443) + TCP_RESERVED_PORTS
+t "reserved_ports: TCP-слушатель 20443 + TCP_RESERVED_PORTS; UDP 25000, 22/443/40000 — нет" 'grep -qP "^net.ipv4.ip_local_reserved_ports\t20443,30000-30010\t" "$OUT/plan.rp"'
 printf 'TCP_PORT_RANGE=32768 60999\n' > "$OUT/node.conf"; NODE_CONFIG="$OUT/node.conf" node_load_config >/dev/null 2>&1
 ( export DRY_RUN=1 NODE_PROC_MEMINFO="$OUT/mem1g"; node_sysctl_plan_init; node_tcp_plan >/dev/null 2>&1; cp "$NODE_PLAN_FILE" "$OUT/plan.rp2" )
 t "reserved_ports: диапазон не расширен ниже 32768 -> ключ не пишется" '! grep -q ip_local_reserved_ports "$OUT/plan.rp2"'

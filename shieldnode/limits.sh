@@ -100,22 +100,21 @@ shield_limits_resolve() {
     # защищаемые порты = auto-detect (ssh+xray) + EXTRA из конфига
     local det_t det_u
     det_t="$(shield_detect_protected_ports)"
-    det_u=""
-    if command -v ss >/dev/null 2>&1; then
-        # 2026-09-23: у `ss -ulnp` есть колонка State (UNCONN) — $5 был Peer
-        # ('0.0.0.0:*'), мусор уходил в protected_udp и nft -c отвергал ruleset
-        # при ЛЮБОМ UDP-inbound xray. Local = первое поле вида адрес:порт.
-        det_u="$(shield_detect_vpn_listen udp)"
-    fi
-    # 2026-09-24 (v1.1.5): keep-last-good и для UDP (раньше не было вовсе — apply во время
-    # рестарта xray оставлял protected_udp пустым до следующего apply)
-    local ustate="$SHIELD_STATE_DIR/protected-ports-udp.txt"
-    if [ -n "$det_u" ]; then
-        echo "$det_u" > "$ustate" 2>/dev/null || true
+    # 2026-09-25 (v1.2.0): UDP-инбаунды — из shield_detect_inbounds (конфиг Xray через API), а
+    # НЕ все UNCONN-сокеты ядра: там же эфемерные исходящие сокеты каждого UDP-потока клиента
+    # (DIAGNOSIS P0-1). keep-last-good — только если детектор не нашёл ядро вовсе (none): при
+    # api/heuristic пустой UDP — это «UDP-инбаундов нет», а не «ядро лежит». Файл состояния
+    # сменил имя (.v2): файл v1.3.0 мог содержать эфемерные порты — не воскрешаем.
+    shield_detect_inbounds
+    local det_u="$SH_IB_UDP"
+    local ustate="$SHIELD_STATE_DIR/protected-ports-udp.v2.txt"
+    if [ "$SH_IB_SOURCE" != none ]; then
+        printf '%s\n' "$det_u" > "$ustate" 2>/dev/null || true
     elif [ -s "$ustate" ]; then
         det_u="$(cat "$ustate")"
-        log warn "limits" "xray/remnanode не слушает UDP — keep-last-good: $det_u"
+        log warn "limits" "VPN-ядро не запущено — UDP-инбаунды из последнего состояния: $det_u"
     fi
+    log info "limits" "инбаунды (${SH_IB_SOURCE}): tcp=[${SH_IB_TCP}] udp=[${SH_IB_UDP}] api-ноды=[${SH_IB_API_PORT}]"
     det_u="$det_u $(shield_detect_ufw_ports udp)"   # 2026-09-24 (v1.1.6): после keep-last-good
     local extra_t extra_u
     extra_t="$(shield_conf_get PROTECTED_TCP_EXTRA "")"
@@ -184,12 +183,31 @@ shield_limits_resolve() {
 
     # IPv6-флаг (читалка из детекта); node мог отключить IPv6 (HARDEN_IPV6=1) —
     # тогда v6-правила не генерируем: трафика нет, ruleset компактнее
+    # 2026-09-25 (v1.2.0): IPv6 на ноде выключен ОБЯЗАТЕЛЬНО (node: ipv6.disable=1 + sysctl).
+    # v6-правил лимитов больше нет: любой IPv6-пакет режет fail-safe в начале prerouting
+    # (и на выходе/транзите) — даже если IPv6 вернулся (DIAGNOSIS P1-4). Прежде при
+    # ipv6_disabled=1 не генерировалось НИ ОДНОГО v6-правила, и вернувшийся IPv6 шёл мимо.
     export SH_F_IPV6=0
-    [ -r /proc/net/if_inet6 ] && SH_F_IPV6=1
-    if [ "$SH_F_IPV6" = "1" ] && [ -f /etc/node-profile.d/stack.conf ] \
-        && grep -q '^ipv6_disabled=1' /etc/node-profile.d/stack.conf 2>/dev/null; then
-        SH_F_IPV6=0
-        log info "limits" "node отключил IPv6 (stack.conf: ipv6_disabled=1) — v6-правила пропущены"
+
+    # 2026-09-25 (v1.2.0): API ноды (remnanode) — только панели: TRUSTED_IPS (v4) + источники
+    # UFW «allow from X to any port <порт>». Не известно ни одного — порт не ограничиваем
+    # (не отрезаем панель), health/guard громко предупреждают (DIAGNOSIS P0-2).
+    shield_detect_inbounds
+    export SH_F_NODE_API_PORT="${SH_IB_API_PORT:-}" SH_F_NODE_API_ALLOW_V4="" SH_F_NODE_API_PORT_SET=""
+    if [ -n "$SH_F_NODE_API_PORT" ]; then
+        local a allow=""
+        for a in $(shield_conf_get TRUSTED_IPS "") $(shield_detect_ufw_sources tcp "$SH_F_NODE_API_PORT"); do
+            case "$a" in *:*) continue ;; esac
+            shield_valid_cidr "$a" || continue
+            case " $allow " in *" $a "*) ;; *) allow="$allow $a" ;; esac
+        done
+        SH_F_NODE_API_ALLOW_V4="${allow# }"
+        if [ -n "$SH_F_NODE_API_ALLOW_V4" ]; then
+            SH_F_NODE_API_PORT_SET="$SH_F_NODE_API_PORT"
+            log info "limits" "API ноды :$SH_F_NODE_API_PORT — только с [$SH_F_NODE_API_ALLOW_V4]"
+        else
+            log warn "limits" "API ноды :$SH_F_NODE_API_PORT доступен ВСЕМ: IP панели неизвестен. Задай его: sudo vpn-node → Безопасность → Доверенные IP (или TRUSTED_IPS=\"<IP панели>\" в /etc/shieldnode/config.conf)"
+        fi
     fi
 
     # admin IP сессии (whitelist, §20) — только если не loopback

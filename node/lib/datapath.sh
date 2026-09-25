@@ -283,6 +283,29 @@ node_fq_tune_apply() {
 # ("Qdisc not found ... NLM_F_CREATE") — тогда replace тем же fq с новыми
 # параметрами (тип qdisc не меняется). rc!=0, если хоть один fq не обновлён.
 rc=0
+# 2026-09-25 (v1.2.0): fq должен реально стоять на NIC. net.core.default_qdisc=fq действует только
+# на НОВЫЕ qdisc — после apply без reboot NIC оставался на fq_codel (лаба: «BBR + fq» в итоге, а на
+# enp5s0 fq_codel). Для физических NIC (есть /sys/class/net/<dev>/device):
+#  * корневой mq с дефолтным handle 0: — его дочерние («parent :1») неадресуемы ни change, ни
+#    replace («Failed to find specified qdisc»; virtio-net multiqueue, 6.8) — пересоздаём mq с
+#    handle 1:, ядро создаёт дочерние по default_qdisc (fq); не-fq дочерние под 1: -> fq;
+#  * одиночная очередь (fq_codel/pfifo_fast в корне) -> fq в корне.
+# Разовый сброс очередей NIC (как при boot).
+SYSNET="${SYSNET:-/sys/class/net}"
+if [ "$(cat "${DEFQ_FILE:-/proc/sys/net/core/default_qdisc}" 2>/dev/null)" = fq ]; then
+    for dev in $(ls "$SYSNET" 2>/dev/null); do
+        [ -e "$SYSNET/$dev/device" ] || continue
+        root="$(tc qdisc show dev "$dev" 2>/dev/null | awk '$4 == "root" || $3 == "root" {print $2, $3; exit}')"
+        case "$root" in
+            "mq 0:") tc qdisc replace dev "$dev" root handle 1: mq 2>/dev/null || rc=1 ;;
+            "fq "*|"mq "*|"noqueue "*|"") : ;;
+            *) tc qdisc replace dev "$dev" root fq 2>/dev/null || rc=1 ;;
+        esac
+        # дочерние под адресуемым mq, которые не fq -> fq
+        tc qdisc show dev "$dev" 2>/dev/null | awk '$1 == "qdisc" && $2 != "fq" && $2 != "mq" { for (i = 1; i <= NF; i++) if ($i == "parent" && $(i + 1) !~ /^:/) print $(i + 1) }' \
+            | while read -r par; do tc qdisc replace dev "$dev" parent "$par" fq 2>/dev/null || true; done
+    done
+fi
 while read -r kind dev parent handle; do
     [ -n "$dev" ] || continue
     case "$kind" in
@@ -341,10 +364,18 @@ TCEOF
             printf "%s\t%s\t%s\t%s\t%s\n", dev, where, l, f, b
         }')
         local frc=0
-        "$script" || frc=$?
         systemctl daemon-reload 2>/dev/null || true
         systemctl enable node-fq-tune.service >/dev/null 2>&1 || \
             log warn "datapath" "systemctl enable node-fq-tune.service не удался"
+        # 2026-09-25 (v1.2.0): запуск ЧЕРЕЗ юнит — его состояние = реальность. Обновление с v1.3.0:
+        # старый скрипт падал при boot на «mq 0:» (virtio multiqueue), новый apply запускал скрипт
+        # напрямую — fq стоял, а юнит оставался failed (`systemctl --failed`, мониторинг)
+        if [ -d /run/systemd/system ]; then
+            systemctl reset-failed node-fq-tune.service >/dev/null 2>&1 || true
+            systemctl restart node-fq-tune.service >/dev/null 2>&1 || frc=$?
+        else
+            "$script" || frc=$?
+        fi
         # 2026-09-24 (v1.1.5): «fq tuned» — только если tc реально принял параметры
         if [ "$frc" = 0 ]; then
             ok "datapath" "fq tuned: limit=$limit flow_limit=$fl buckets=$buckets"

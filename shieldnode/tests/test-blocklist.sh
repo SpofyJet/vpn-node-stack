@@ -60,7 +60,10 @@ done
 if [ "${args[0]:-}" = "list" ]; then
     case "${args[1]:-}" in
         table) [ -f "$NFT_DB/table" ] || exit 1; exit 0 ;;
-        set)   name="${args[-1]}"; [ -f "$NFT_DB/set_$name" ] || exit 1; exit 0 ;;
+        set)   name="${args[-1]}"; [ -f "$NFT_DB/set_$name" ] || exit 1
+               # v1.2.0: гарды updater'а смотрят, пуст ли живой набор
+               [ -s "$NFT_DB/set_$name" ] && printf '\t\telements = { %s }\n' "$(paste -sd, "$NFT_DB/set_$name" | sed 's/,/, /g')"
+               exit 0 ;;
         chain) [ -f "$NFT_DB/rules" ] || exit 1
                while IFS=$'\t' read -r h r; do printf '        %s # handle %s\n' "$r" "$h"; done < "$NFT_DB/rules"
                exit 0 ;;
@@ -203,6 +206,15 @@ before="$(sha256sum "$OUT/nftdb/set_custom_blocklist_v4")"
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT"
 after="$(sha256sum "$OUT/nftdb/set_custom_blocklist_v4")"
 t "custom: повторный запуск — no-op (hash-guard)" test "$before" = "$after"
+: > "$OUT/ops.custom"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" FAKE_NFT_OPS="$OUT/ops.custom" bash "$SHIELD_BLOCKLIST_SCRIPT" custom
+t "custom: no-op — nft не дёргался (ни flush, ни add set)" test ! -s "$OUT/ops.custom"
+# v1.2.0 (P1-3, прод E4 «custom set ПУСТ»): apply пересоздал таблицу с пустым набором, список не
+# менялся — гард по хешу раньше оставлял набор пустым до следующей правки custom.txt
+: > "$OUT/nftdb/set_custom_blocklist_v4"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom
+t "custom: тот же список, но живой набор пуст (после apply) → заполнен заново" bash -c "test \$(wc -l < '$OUT/nftdb/set_custom_blocklist_v4') = 3"
+t "apply удаляет метки .applied-*.sha256 перед запуском updater'а" grep -q 'rm -f .*\.applied-\*\.sha256' "$SHIELD_DIR/firewall.sh"
 
 # ================= 4) custom: min-check держит last-known-good =================
 cat > "$SHIELD_LISTS_DIR/custom.txt" <<EOF
@@ -465,7 +477,7 @@ t "crowdsec: гард интервала + FORCE-обход присутству
 
 # функционально: свежий lastok → пропуск; FORCE=1 → применение
 # (185.220.101.9 — не-bogon; 203.0.113.x/198.51.100.x — TEST-NET, bogon-фильтр отсекает)
-: > "$OUT/nftdb/set_crowdsec_blocklist_v4"
+echo "5.6.7.8/32" > "$OUT/nftdb/set_crowdsec_blocklist_v4"
 echo "185.220.101.9" > "$SHIELD_LISTS_DIR/crowdsec.txt"
 cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
 BL_LOCK_FILE=$OUT/blocklist.lock
@@ -481,7 +493,12 @@ rm -f "$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt"
 date +%s > "$SHIELD_BLOCKLIST_STATE/lastok-crowdsec.ts"
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec
 t "crowdsec: свежий lastok → fetch пропущен, set не тронут, fail-counter не бамплен" \
-    bash -c "test ! -s '$OUT/nftdb/set_crowdsec_blocklist_v4' && test ! -f '$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt'"
+    bash -c "grep -qx '5.6.7.8/32' '$OUT/nftdb/set_crowdsec_blocklist_v4' && test ! -f '$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt'"
+# v1.2.0 (P1-3): apply пересоздал таблицу — набор пуст; гард интервала НЕ должен оставлять его пустым
+: > "$OUT/nftdb/set_crowdsec_blocklist_v4"; date +%s > "$SHIELD_BLOCKLIST_STATE/lastok-crowdsec.ts"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec
+t "crowdsec: свежий lastok, но живой набор пуст (после apply) → заполнен" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+echo "5.6.7.8/32" > "$OUT/nftdb/set_crowdsec_blocklist_v4"
 FORCE=1 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec
 t "crowdsec: FORCE=1 обходит гард, локальный список применён" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
 t "crowdsec: last-good снапшот сохранён" bash -c "grep -qx '185.220.101.9/32' '$SHIELD_BLOCKLIST_STATE/last-good-crowdsec.txt'"
@@ -532,6 +549,51 @@ PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" c
 t "crowdsec-agent: community (CAPI, только с -a) применён в set" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4' && grep -qx '91.240.118.0/24' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
 t "crowdsec-agent: и локальные решения (SSH-брутфорс) тоже" bash -c "grep -qx '45.83.64.77/32' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
 t "crowdsec-agent: минимум для локальной БД = 0 (feed — 500)" grep -q '^BL_MIN_crowdsec="0"' "$SHIELD_BLOCKLIST_SCRIPT"
+
+# v1.2.0 (P1-3, прод E4 «crowdsec set EMPTY» + алерт): свежий демон, community-список ещё не
+# пришёл — cscli отвечает «null». Это не «нет источника»: без fail-counter/алерта, честный статус,
+# при «застрявшем» демоне (>10 мин, зарегистрирован) — один рестарт в час, максимум 3.
+mkdir -p "$OUT/bin-cs"
+printf '#!/bin/bash\ncase "$*" in "decisions list"*) echo null ;; "capi status") exit 0 ;; *) exit 1 ;; esac\n' > "$OUT/bin-cs/cscli"
+printf '#!/bin/bash\necho "$*" >> "%s/systemctl.calls"\ncase "$1" in is-active) exit 0 ;; show) echo 0 ;; esac\nexit 0\n' "$OUT" > "$OUT/bin-cs/systemctl"
+chmod +x "$OUT/bin-cs/"*
+echo "185.220.101.9/32" > "$OUT/nftdb/set_crowdsec_blocklist_v4"
+rm -f "$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt" "$SHIELD_BLOCKLIST_STATE/.alert-crowdsec" "$SHIELD_BLOCKLIST_STATE/cs-restarts" "$OUT/systemctl.calls"
+mv "$SHIELD_LISTS_DIR/crowdsec.txt" "$OUT/crowdsec.txt.saved"   # только ответ cscli, без локального списка
+rc=0; PATH="$OUT/bin-cs:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec || rc=$?
+t "crowdsec null: rc 0 (не сбой)" test "$rc" = 0
+t "crowdsec null: fail-counter не тронут" test ! -s "$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt"
+t "crowdsec null: статус «waiting» для health" grep -q '^waiting' "$SHIELD_BLOCKLIST_STATE/status-crowdsec"
+t "crowdsec null: set не тронут" grep -qx '185.220.101.9/32' "$OUT/nftdb/set_crowdsec_blocklist_v4"
+t "crowdsec null: застрявший демон перезапущен (1/3)" bash -c "grep -qx 'restart crowdsec' '$OUT/systemctl.calls' && test \$(wc -l < '$SHIELD_BLOCKLIST_STATE/cs-restarts') = 1"
+PATH="$OUT/bin-cs:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec || true
+t "crowdsec null: второй прогон в тот же час — без рестарта" test "$(grep -c 'restart crowdsec' "$OUT/systemctl.calls")" = 1
+printf '1\n2\n3\n' > "$SHIELD_BLOCKLIST_STATE/cs-restarts"
+PATH="$OUT/bin-cs:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec || true
+t "crowdsec null: после 3 рестартов — больше не трогаем" test "$(grep -c 'restart crowdsec' "$OUT/systemctl.calls")" = 1
+mv "$OUT/crowdsec.txt.saved" "$SHIELD_LISTS_DIR/crowdsec.txt"
+: > "$OUT/nftdb/set_crowdsec_blocklist_v4"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec
+t "crowdsec: решения пришли — статус и счётчик рестартов сброшены" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4' && test ! -e '$SHIELD_BLOCKLIST_STATE/status-crowdsec' && test ! -e '$SHIELD_BLOCKLIST_STATE/cs-restarts'"
+
+# ================= 10b) v1.2.0 (P0-2): --restore-last-good (boot/apply) =================
+# лаба: после reboot все блок-листы пусты 2-5 мин (сохранённый ruleset без элементов) — теперь
+# пустые наборы заполняются последним удачным снимком сразу, без сети
+printf '1.2.3.0/24\n5.6.7.8/32\n' > "$SHIELD_BLOCKLIST_STATE/last-good-crowdsec.txt"
+printf '9.9.9.9/32\n' > "$SHIELD_BLOCKLIST_STATE/last-good-custom.txt"
+: > "$OUT/nftdb/set_crowdsec_blocklist_v4"; echo "7.7.7.7/32" > "$OUT/nftdb/set_custom_blocklist_v4"
+cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+BL_ENABLED_crowdsec=1
+BL_ENABLED_custom=1
+BL_ENABLED_scanner=0
+EOF
+printf '4.4.4.4/32\n' > "$SHIELD_BLOCKLIST_STATE/last-good-scanner.txt"; : > "$OUT/nftdb/set_scanner_blocklist_v4"
+rc=0; PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" --restore-last-good || rc=$?
+t "restore: пустой crowdsec заполнен из снимка" bash -c "[ $rc = 0 ] && grep -qx '1.2.3.0/24' '$OUT/nftdb/set_crowdsec_blocklist_v4' && grep -qx '5.6.7.8/32' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+t "restore: непустой custom не тронут" bash -c "[ \"\$(cat '$OUT/nftdb/set_custom_blocklist_v4')\" = 7.7.7.7/32 ]"
+t "restore: выключенный scanner не восстанавливается" test ! -s "$OUT/nftdb/set_scanner_blocklist_v4"
+t "restore: boot-юнит эмитирован (после shieldnode.service, без сети)" bash -c "grep -q 'ExecStart=/usr/local/sbin/shieldnode-blocklist --restore-last-good' '$OUT/etc/systemd/system/shieldnode-blocklist-restore.service' && grep -qx 'After=shieldnode.service' '$OUT/etc/systemd/system/shieldnode-blocklist-restore.service' && ! grep -q network-online '$OUT/etc/systemd/system/shieldnode-blocklist-restore.service'"
 
 # ================= 11) spamhaus/cins: дефолты + парсинг Sxx- формата =================
 t "spamhaus/cins: URL запечены" bash -c "grep -q 'spamhaus.org/drop/drop.txt' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'cinsscore.com/list/ci-badguys.txt' '$SHIELD_BLOCKLIST_SCRIPT'"

@@ -44,6 +44,8 @@ exec "$REAL_NFT" "\$@"
 EOF
 chmod +x "$OUT/bin/"*
 export PATH="$OUT/bin:$PATH"
+# v1.2.0: IPv6-состояние хоста — фикстура (свежий netns теста имеет IPv6 включённым)
+mkdir -p "$OUT/proc"; echo "BOOT_IMAGE=/vmlinuz ro ipv6.disable=1" > "$OUT/proc/cmdline"; export SHIELD_PROC="$OUT/proc"
 
 # --- настоящая таблица: ruleset из генератора (dry-run печатает, ничего не пишет) ---
 bash "$SHIELD_DIR/main.sh" --dry-run apply > "$OUT/dry.out" 2>/dev/null

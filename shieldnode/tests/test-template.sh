@@ -195,7 +195,7 @@ t "persist: net.netfilter.* в security-sysctl плане НЕТ (владеле
 
 echo
 # базовый цикл = 23 (22 + antispoof_v6); +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 27
-t "counters: 27 именованных счётчиков объявлены (23 базовых + spamhaus/cins/amp/icmp)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 27"
+t "counters: 29 именованных счётчиков (23 базовых + spamhaus/cins/amp/icmp + ipv6_failsafe/nodeapi v1.2.0)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 29"
 t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
 # 2026-09-24 (v1.1.4): backlog #4 — лимит стал per-source (meter по saddr); литерал глобальной

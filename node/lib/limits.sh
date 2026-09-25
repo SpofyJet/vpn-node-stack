@@ -16,7 +16,10 @@ node_limits_detect_units() {
     local units=() u
     while read -r u; do
         [ -z "$u" ] && continue
-        if systemctl cat "$u" 2>/dev/null | grep -qiE 'xray|remnanode'; then
+        # 2026-09-25 (v1.2.0): юниты самого стека не трогаем (у shieldnode-ports «Xray» в
+        # Description — node ставил ему drop-in); совпадение — только по ExecStart
+        case "$u" in shieldnode*|node-*) continue ;; esac
+        if systemctl cat "$u" 2>/dev/null | grep -E '^[[:space:]]*ExecStart' | grep -qiE 'xray|remnanode'; then
             units+=("$u")
         fi
     done < <(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
@@ -48,6 +51,15 @@ node_limits_persist() {
         } | node_persist "$d"
         n=$((n + 1))
     done < <(node_limits_detect_units)
+    # drop-in'ы node на юнитах, которые больше не выбраны (v1.2.0: shieldnode-ports) — убрать
+    local f base
+    for f in /etc/systemd/system/*.service.d/10-node-limits.conf; do
+        [ -f "$f" ] || continue
+        base="$(basename "$(dirname "$f")")"; base="${base%.d}"
+        node_limits_detect_units | grep -qxF "$base" && continue
+        backup "$f"; rm -f "$f"; rmdir "$(dirname "$f")" 2>/dev/null || true
+        log info "limits" "убран drop-in node с юнита $base (больше не xray/remnanode)"
+    done
     [ "$n" -eq 0 ] && warn "limits" "systemd-unit'ы xray/remnanode не найдены (docker-only?). Drop-in не создан; примени LimitNOFILE вручную в compose/unit контейнера."
     # daemon-reload в chroot/контейнере без systemd падает — это не повод
     # ронять весь apply (drop-in'ы подхватятся при первом же boot/reload)

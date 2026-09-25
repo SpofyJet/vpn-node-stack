@@ -39,12 +39,6 @@ _h_set_elems() { # <set> -> элементы через пробел (много
     nft -n list set inet shieldnode "$1" 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")}
         f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
 }
-# порты VPN-ядра (SHIELD_VPN_PROC_RE, v1.1.6), слушающие НЕ только loopback (API 127.0.0.1:... снаружи недоступен)
-_h_listen() { # <t|u>
-    { ss -"$1"lnp 2>/dev/null || true; } | awk -v re="$SHIELD_VPN_PROC_RE" '$0 ~ re { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
-        a = $i; n = split(a, x, ":"); p = x[n]; sub(/:[0-9]+$/, "", a)
-        if (a !~ /^(127\.|\[::1\]|::1$)/) print p; break } }' | sort -un | tr '\n' ' ' | sed 's/ $//'
-}
 
 shield_health() {
     _H_PASS=0; _H_WARN=0; _H_FAIL=0
@@ -73,7 +67,9 @@ shield_health() {
 
     # порядок: accept'ы до первого drop
     local d est lo wl
-    d="$(awk '!f && / drop( |$)/ {print NR; f = 1}' <<<"$pre")"; d="${d:-999999}"
+    # 2026-09-25 (v1.2.0): IPv6 fail-safe и ограничение API ноды стоят ДО established/whitelist
+    # намеренно — в «первый drop» не считаются
+    d="$(awk '!f && / drop( |$)/ && !/c_drops_ipv6_failsafe|c_drops_nodeapi/ {print NR; f = 1}' <<<"$pre")"; d="${d:-999999}"
     est="$(awk '!f && /ct state established,related accept/ {print NR; f = 1}' <<<"$pre")"
     lo="$(awk '!f && /iifname "lo" accept/ {print NR; f = 1}' <<<"$pre")"
     wl="$(awk '!f && /@whitelist_v4 accept/ {print NR; f = 1}' <<<"$pre")"
@@ -85,6 +81,32 @@ shield_health() {
     fi
     if [ -n "$wl" ] && [ "$wl" -lt "$d" ]; then _hc PASS "whitelist accept — до первого drop"; else _hc FAIL "whitelist accept отсутствует или ПОСЛЕ drop — TRUSTED_IPS/админ могут попасть под бан"; fi
 
+    # 2026-09-25 (v1.2.0): IPv6 fail-safe (IPv6 на ноде выключен обязательно) и API ноды
+    if grep -q 'meta nfproto ipv6 .*c_drops_ipv6_failsafe.* drop' <<<"$pre"; then _hc PASS "IPv6 fail-safe: любой IPv6-пакет отбрасывается"
+    else _hc FAIL "нет IPv6 fail-safe в prerouting — повтори применение фаервола"; fi
+    # 2026-09-25 (v1.2.0, P1-4): сам IPv6 на хосте — выключен в ядре или на каждом интерфейсе
+    local p6="${SHIELD_PROC:-/proc}" v6on="" g6=""
+    if grep -qw 'ipv6.disable=1' "$p6/cmdline" 2>/dev/null || [ ! -d "$p6/sys/net/ipv6" ]; then
+        _hc PASS "IPv6 выключен в ядре (ipv6.disable=1)"
+    else
+        local fi6
+        for fi6 in "$p6"/sys/net/ipv6/conf/*/disable_ipv6; do
+            [ -f "$fi6" ] || continue
+            [ "$(cat "$fi6" 2>/dev/null)" = 1 ] || { fi6="${fi6%/disable_ipv6}"; v6on="$v6on ${fi6##*/}"; }
+        done
+        g6="$(awk '$4 == "00" && $6 != "lo" {print $6}' "$p6/net/if_inet6" 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+        if [ -n "$g6" ]; then _hc FAIL "на интерфейсах есть глобальный IPv6-адрес ($g6) — IPv6 должен быть выключен: sudo vpn-node → «Применить оптимизацию» и reboot"
+        elif [ -n "$v6on" ]; then _hc FAIL "IPv6 включён на:$v6on — sudo vpn-node → «Применить оптимизацию» (выключит сразу) и reboot"
+        else _hc WARN "IPv6 выключен через sysctl, но ядро загружено без ipv6.disable=1 — перезагрузи сервер (sudo reboot)"; fi
+    fi
+    local apiport apiallow
+    apiport="$(_h_set_elems node_api_port)"; apiallow="$(_h_set_elems node_api_allow_v4)"
+    SH_IB_DONE=0; shield_detect_inbounds
+    if [ -n "${SH_IB_API_PORT:-}" ]; then
+        if [ -n "$apiport" ] && [ -n "$apiallow" ]; then _hc PASS "API ноды :$SH_IB_API_PORT — только с [$apiallow]"
+        else _hc WARN "API ноды :$SH_IB_API_PORT открыт ВСЕМ — укажи IP панели: sudo vpn-node → Безопасность → Доверенные IP"; fi
+    fi
+
     # SSH: реальные порты (SSH_PORT пуст = авто-детект) в защитных правилах
     local p sp
     if [ "$(shield_conf_get ENABLE_SSH_PROTECTION 1)" = "1" ]; then
@@ -94,7 +116,21 @@ shield_health() {
         for p in $sp; do
             if grep -q "tcp dport $p ct state new" <<<"$pre"; then _hc PASS "SSH $p: rate/conn-limit активны ($( [ -n "$(shield_conf_get SSH_PORT "")" ] && echo 'SSH_PORT' || echo 'авто-детект'))"
             else _hc FAIL "SSH $p: защитных правил нет (порт сменился после apply?) — повтори apply"; fi
+            # 2026-09-25 (v1.2.0): бывшие проверки guard — теперь здесь (guard = health)
+            if command -v ss >/dev/null 2>&1 && ! ss -Htln 2>/dev/null | awk -v p=":$p" '{ a = $4; if (substr(a, length(a) - length(p) + 1) == p) f = 1 } END { exit !f }'; then
+                _hc WARN "SSH не слушает порт $p — проверь sshd, иначе потеряешь доступ"
+            fi
         done
+    fi
+    local admin; admin="$(shield_detect_admin_ip 2>/dev/null || true)"
+    case "$admin" in ''|*:*) ;;
+        *) nft get element inet shieldnode whitelist_v4 "{ $admin }" >/dev/null 2>&1 \
+               && _hc PASS "IP SSH-сессии $admin в белом списке" \
+               || _hc WARN "IP SSH-сессии $admin не в белом списке — его могут задеть лимиты SSH (guard → «Доверенные IP» или повтори apply)" ;;
+    esac
+    if [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        local cc cm; cc="$(cat /proc/sys/net/netfilter/nf_conntrack_count)"; cm="$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+        [ "$cm" -gt 0 ] && [ $((cc * 100 / cm)) -ge 80 ] && _hc WARN "таблица соединений заполнена на $((cc * 100 / cm))% — при 100% новые клиенты не подключатся"
     fi
     if [ "$(shield_conf_get ENABLE_ABUSE_LIMITING 1)" = "1" ]; then
         if grep -q "tcp dport @protected_tcp" <<<"$pre" && grep -q "udp dport @protected_udp" <<<"$pre"; then _hc PASS "abuse-лимиты tcp/udp ссылаются на protected_tcp/protected_udp"
@@ -121,16 +157,19 @@ shield_health() {
         if [ -n "$miss" ]; then _hc WARN "открыты в UFW, но НЕ в protected_*:$miss — повтори apply"
         else _hc PASS "все порты, открытые в UFW, под защитой (tcp: ${ut:--}; udp: ${uu:--})"; fi
     fi
-    if command -v ss >/dev/null 2>&1; then
-        lt="$(_h_listen t)"; lu="$(_h_listen u)"
-        for p in $lt; do _h_port_in "$p" "$pt" || { _hc WARN "xray/remnanode слушает $p/tcp снаружи, но порта нет в protected_tcp — без abuse-лимитов; повтори apply"; bad=1; }; done
-        for p in $lu; do _h_port_in "$p" "$pu" || { _hc WARN "xray/remnanode слушает $p/udp снаружи, но порта нет в protected_udp — без abuse-лимитов; повтори apply"; bad=1; }; done
-        if [ -z "$lt$lu" ]; then _hc INFO "внешних слушающих сокетов xray/remnanode не найдено (не запущен? нет root для ss -p?)"
-        elif [ "$bad" = 0 ]; then _hc PASS "все внешние порты xray/remnanode под защитой (tcp: ${lt:--}; udp: ${lu:--})"; fi
-    fi
+    # 2026-09-25 (v1.2.0): реальные инбаунды — тем же детектором, что apply/ports-sync (конфиг
+    # Xray через API). Эфемерные UDP-сокеты исходящих потоков — НЕ слушатели (DIAGNOSIS P0-1).
+    SH_IB_DONE=0; shield_detect_inbounds
+    lt="$SH_IB_TCP${SH_IB_API_PORT:+ $SH_IB_API_PORT}"; lu="$SH_IB_UDP"
+    for p in $lt; do _h_port_in "$p" "$pt" || { _hc WARN "инбаунд $p/tcp не в protected_tcp — без abuse-лимитов (подхватится автоматически за ≤1 мин; иначе: sudo vpn-node → «Применить фаервол»)"; bad=1; }; done
+    for p in $lu; do _h_port_in "$p" "$pu" || { _hc WARN "инбаунд $p/udp не в protected_udp — без abuse-лимитов (подхватится автоматически за ≤1 мин)"; bad=1; }; done
+    case "$SH_IB_SOURCE" in
+        none) _hc INFO "VPN-ядро сейчас ничего не слушает (remnanode не запущен или панель ещё не прислала конфиг) — защищены последние известные порты" ;;
+        *)    [ "$bad" = 0 ] && _hc PASS "все инбаунды под защитой (источник: $([ "$SH_IB_SOURCE" = api ] && echo 'конфиг Xray' || echo 'эвристика'); tcp: ${lt:--}; udp: ${lu:--})" ;;
+    esac
 
     # блоклисты: ENABLE_* <-> сет+drop-правило; наполненность; свежесть; алерты
-    local bl_on st now name flag def set want has_set has_rule cnt lg age_h iv alert
+    local bl_on st now name flag def set want has_set has_rule cnt lg age_h iv alert waiting
     bl_on="$(shield_conf_get ENABLE_BLOCKLISTS 1)"
     st="${SHIELD_BLOCKLIST_STATE:-/var/lib/shieldnode/blocklists}"; now="$(date +%s)"
     while IFS=: read -r name flag def set; do
@@ -150,7 +189,8 @@ shield_health() {
             lg="$st/last-good-$name.txt"
             [ -f "$lg" ] && age_h=$(( (now - $(stat -c %Y "$lg" 2>/dev/null || echo "$now")) / 3600 ))
             alert=""; [ -f "$st/.alert-$name" ] && alert="$(cat "$st/.alert-$name" 2>/dev/null)"
-        else alert=""; fi
+            waiting=0; grep -q '^waiting' "$st/status-$name" 2>/dev/null && waiting=1
+        else alert=""; waiting=0; fi
         if [ "${cnt:-0}" -eq 0 ] && [ -n "${lg:-}" ] && [ -f "$lg" ] && [ ! -s "$lg" ] && [ -z "$alert" ]; then
             # 2026-09-25 (v1.1.7): последнее УСПЕШНОЕ обновление дало 0 записей — пустой set корректен
             # (custom без IP в custom.txt, свежий crowdsec без решений). Раньше — ложный WARN «ПУСТ».
@@ -159,6 +199,9 @@ shield_health() {
             else
                 _hc PASS "$name: пуст — источник сейчас не содержит записей (обновление успешно)"
             fi
+        elif [ "${cnt:-0}" -eq 0 ] && [ "$waiting" = 1 ]; then
+            # 2026-09-25 (v1.2.0, P1-3): cscli ответил «0 решений» — это не сбой фида
+            _hc INFO "$name: CrowdSec работает, но community-список ещё не пришёл (обычно до 2 ч после установки) — ждём"
         elif [ "${cnt:-0}" -eq 0 ]; then
             local last="нет данных"; [ -n "$age_h" ] && last="${age_h}ч назад"
             _hc WARN "$name: set ПУСТ — updater ещё не отработал или фид недоступен (последний успех: $last)"
@@ -174,7 +217,8 @@ shield_health() {
                 else iv="$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)"; fi
             fi
             [[ "$iv" =~ ^[0-9]+$ ]] || iv=360
-            if [ -z "$age_h" ]; then _hc WARN "$name: успешных обновлений ещё не было (last-good нет)"
+            if [ "$waiting" = 1 ]; then :
+            elif [ -z "$age_h" ]; then _hc WARN "$name: успешных обновлений ещё не было (last-good нет)"
             elif [ $((age_h * 60)) -gt $((iv * 2 + 60)) ]; then _hc WARN "$name: последнее успешное обновление ${age_h}ч назад (> 2 интервалов по ${iv} мин) — проверь таймер/сеть"; fi
         fi
     done <<<"$SHIELD_HEALTH_LISTS"

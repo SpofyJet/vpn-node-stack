@@ -136,6 +136,39 @@ FAKE_TC_LOG=/tmp/node-dp-test/tc.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin
 t "fq: root-инстанс изменён (limit/buckets)" bash -c "grep -q 'dev eth0 root fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc.log"
 t "fq: mq-child изменён через parent/handle" bash -c "grep -q 'dev eth0 parent 1:1 handle 10: fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc.log"
 
+# --- v1.2.0: fq должен реально стоять на физических NIC (лаба: после apply без reboot — fq_codel;
+# дочерние под «mq 0:» неадресуемы). eth0 — multiqueue (mq 0: + fq_codel), eth1 — одна очередь
+# (fq_codel в корне), veth0 — виртуальный (не трогаем) ---
+mkdir -p /tmp/node-dp-test/sys/eth0/device /tmp/node-dp-test/sys/eth1/device /tmp/node-dp-test/sys/veth0
+cat > "$BIN/tc" <<'EOF'
+#!/bin/bash
+st=/tmp/node-dp-test/tc.state
+[ -f "$st" ] || printf 'eth0 root mq 0:\neth0 :1 fq_codel 0:\neth1 root fq_codel 0:\nveth0 root noqueue 0:\n' > "$st"
+show() { awk -v d="$1" '$1 == d || d == "" { if ($2 == "root") printf "qdisc %s %s %sroot\n", $3, $4, (d == "" ? "dev " $1 " " : ""); else printf "qdisc %s %s %sparent %s limit 10000p\n", $3, $4, (d == "" ? "dev " $1 " " : ""), $2 }' "$st"; }
+if [ "$1 $2" = "qdisc show" ]; then show "${4:-}"; exit 0; fi
+echo "$*" >> "$FAKE_TC_LOG"
+case "$*" in
+  "qdisc replace dev eth0 root handle 1: mq") printf 'eth0 root mq 1:\neth0 1:1 fq_codel 0:\neth1 root fq_codel 0:\nveth0 root noqueue 0:\n' > "$st" ;;
+  "qdisc replace dev eth0 parent 1:1 fq"*) sed -i 's/^eth0 1:1 fq_codel 0:/eth0 1:1 fq 8001:/' "$st" ;;
+  "qdisc replace dev eth1 root fq"*) sed -i 's/^eth1 root fq_codel 0:/eth1 root fq 8002:/' "$st" ;;
+  *"parent :1"*) exit 2 ;;
+  "qdisc change"*) exit 2 ;;
+  *) : ;;
+esac
+exit 0
+EOF
+rm -f /tmp/node-dp-test/tc.state /tmp/node-dp-test/tc2.log; echo fq > /tmp/node-dp-test/dq
+rc2=0; SYSNET=/tmp/node-dp-test/sys DEFQ_FILE=/tmp/node-dp-test/dq FAKE_TC_LOG=/tmp/node-dp-test/tc2.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin/node-fq-tune.sh" || rc2=$?
+t "fq: eth0 mq 0: -> пересоздан с handle 1:" grep -qx 'qdisc replace dev eth0 root handle 1: mq' /tmp/node-dp-test/tc2.log
+t "fq: eth0 дочерний fq_codel под 1:1 -> fq" grep -q 'qdisc replace dev eth0 parent 1:1 fq' /tmp/node-dp-test/tc2.log
+t "fq: eth1 (одна очередь, fq_codel в корне) -> fq" grep -q '^qdisc replace dev eth1 root fq' /tmp/node-dp-test/tc2.log
+t "fq: виртуальный veth0 не тронут" bash -c "! grep -q veth0 /tmp/node-dp-test/tc2.log"
+t "fq: итог — fq на всех физических, rc 0" bash -c "[ $rc2 = 0 ] && grep -q '^eth0 1:1 fq ' /tmp/node-dp-test/tc.state && grep -q '^eth1 root fq ' /tmp/node-dp-test/tc.state"
+t "fq: затем параметры fq применены (limit 100000)" grep -q 'fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc2.log
+echo cubic > /tmp/node-dp-test/dq; rm -f /tmp/node-dp-test/tc.state /tmp/node-dp-test/tc3.log
+SYSNET=/tmp/node-dp-test/sys DEFQ_FILE=/tmp/node-dp-test/dq FAKE_TC_LOG=/tmp/node-dp-test/tc3.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin/node-fq-tune.sh" || true
+t "fq: default_qdisc не fq — qdisc NIC не меняются" bash -c "! grep -q 'replace dev eth' /tmp/node-dp-test/tc3.log 2>/dev/null"
+
 # --- fq tune: ENABLE_FQ_TUNE=0 гасит эмиссию ---
 sed -i 's/^ENABLE_FQ_TUNE=.*/ENABLE_FQ_TUNE=0/' "$CONFIG_CACHE"
 rm -rf "$OUT"

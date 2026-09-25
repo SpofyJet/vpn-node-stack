@@ -94,6 +94,7 @@ node_sysctl_restore_dropped() {
     while read -r k; do
         [ -n "$k" ] || continue
         awk -F'\t' -v k="$k" '$1 == k { f = 1 } END { exit !f }' "$NODE_PLAN_FILE" 2>/dev/null && continue
+        case "$k" in net.ipv6.conf.*.disable_ipv6) continue ;; esac   # v1.2.0: инвариант (lib/ipv6.sh)
         kre="${k//./\\.}"
         grep -rqsE "^${kre}[[:space:]]*=" /etc/sysctl.d/99-z[01234]-node-*.conf 2>/dev/null && continue
         # 2026-09-24 (v1.1.7): пустое исходное — тоже значение (ip_local_reserved_ports «» до node)
@@ -155,6 +156,7 @@ node_sysctl_orig_record() {
     mkdir -p "$NODE_STATE_DIR"; touch "$reg"
     while IFS=$'\t' read -r k v _f; do
         [ -n "$k" ] || continue
+        case "$k" in net.ipv6.conf.*.disable_ipv6) continue ;; esac   # v1.2.0: откатывать нечего
         if awk -F'\t' -v k="$k" '$1==k{f=1} END{exit !f}' "$reg"; then continue; fi
         if [ -f "$owner" ] && grep -qxF -- "$k" "$owner"; then continue; fi
         v="$(sysctl -n "$k" 2>/dev/null)" || continue

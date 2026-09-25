@@ -94,6 +94,13 @@ export PATH="$OUT/bin:$PATH"
 
 source "$SHIELD_DIR/detect.sh"
 source "$SHIELD_DIR/guard.sh"
+# v1.2.0 (E5): раздел «проблемы» берётся из health/verify — подменяем их фикстурой
+# (сами health/verify покрыты test-health / test-ports-sync)
+HEALTH_FIX="$OUT/health.txt"; VERIFY_FIX="$OUT/verify.txt"
+printf '  [PASS] table inet shieldnode присутствует\n  health: FAIL=0 WARN=0 PASS=1\n' > "$HEALTH_FIX"
+printf '  ✔ prerouting: 40 правил\n' > "$VERIFY_FIX"
+_g_health() { cat "$HEALTH_FIX"; }
+_g_verify() { cat "$VERIFY_FIX"; }
 
 fails=0
 t() { local name="$1"; shift
@@ -149,14 +156,28 @@ t "дельта: SYN-флуд +100" grep -qE "Флуд соединениями 
 t "дельта: сканеры +0 (не менялись)" grep -qE "Сканеры интернета +42 +\+0" "$OUT/guard2.txt"
 t "дельта: итого +110" grep -qE "Итого +123 615 +\+110" "$OUT/guard2.txt"
 
-# ---------- 4. проблемы — понятным языком ----------
-printf 'loopback scanner' > "$OUT/nftdb/flags"
-FAKE_TIMER=0 shield_guard > "$OUT/guard3.txt" 2>&1
-t "проблема: IP админа не в белом списке — с подсказкой" grep -q "ваш IP 203.0.113.10 не в белом списке" "$OUT/guard3.txt"
-t "проблема: таймер блок-листов остановлен — с командой" grep -q "автообновление блок-листов остановлено" "$OUT/guard3.txt"
-printf 'admin-wl' > "$OUT/nftdb/flags"
+# ---------- 4. проблемы — ровно то, что нашёл health (прод E5: «проблем нет» при WARN=12) ----------
+cat > "$HEALTH_FIX" <<'EOF'
+  [PASS] table inet shieldnode присутствует
+  [WARN] инбаунд 8443/tcp не в protected_tcp — нужен apply
+  [WARN] shieldnode-blocklist.timer НЕ активен — блоклисты не обновляются
+  [FAIL] SSH 22: защитных правил нет (порт сменился после apply?) — повтори apply
+  [INFO] последний apply: 2026-09-25
+  health: FAIL=1 WARN=2 PASS=1
+EOF
+shield_guard > "$OUT/guard3.txt" 2>&1
+t "health WARN=2 FAIL=1 -> НЕТ «Проблем не найдено»" bash -c "! grep -q 'Проблем не найдено' '$OUT/guard3.txt'"
+t "проблемы: оба WARN health показаны" bash -c "grep -q 'инбаунд 8443/tcp не в protected_tcp' '$OUT/guard3.txt' && grep -q 'blocklist.timer НЕ активен' '$OUT/guard3.txt'"
+t "проблемы: FAIL помечен ✘" grep -q "✘ SSH 22: защитных правил нет" "$OUT/guard3.txt"
+t "проблемы: INFO/PASS не выводятся как проблемы" bash -c "! grep -q 'последний apply' '$OUT/guard3.txt'"
+printf '  [PASS] ok\n  health: FAIL=0 WARN=0 PASS=1\n' > "$HEALTH_FIX"
+printf '  ✔ prerouting: 40 правил\n  ✘ нет IPv6 fail-safe в prerouting\n' > "$VERIFY_FIX"
 shield_guard > "$OUT/guard4.txt" 2>&1
-t "проблема: нет loopback-accept" grep -q "нет правила loopback-accept" "$OUT/guard4.txt"
+t "verify ✘ -> проблема (даже если health чист)" grep -q "✘ нет IPv6 fail-safe в prerouting" "$OUT/guard4.txt"
+printf '' > "$HEALTH_FIX"; printf '' > "$VERIFY_FIX"
+shield_guard > "$OUT/guard5.txt" 2>&1
+t "health не выполнился -> не «Проблем не найдено», а просьба запустить проверку" bash -c "grep -q 'полная проверка не выполнилась' '$OUT/guard5.txt' && ! grep -q 'Проблем не найдено' '$OUT/guard5.txt'"
+printf '  [PASS] ok\n  health: FAIL=0 WARN=0 PASS=1\n' > "$HEALTH_FIX"; printf '  ✔ ok\n' > "$VERIFY_FIX"
 
 # ---------- 5. технический вид ----------
 SHIELD_GUARD_MODE=raw shield_guard > "$OUT/guard-raw.txt" 2>&1

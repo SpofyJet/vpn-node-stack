@@ -3,7 +3,7 @@
 # Modes: apply (default) | status | rollback [id] | detect | uninstall
 set -euo pipefail
 
-NODE_VERSION="1.1.8"
+NODE_VERSION="1.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NODE_DIR="$SCRIPT_DIR"
 export NODE_STATE_DIR="/var/lib/node"
@@ -19,7 +19,7 @@ export DRY_RUN
 
 usage() {
     cat <<'EOF'
-node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.1.8
+node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.2.0
 
 Использование: node [опции] <команда> [аргумент]
 
@@ -58,7 +58,7 @@ done
 
 for arg in "${POSITIONAL[@]}"; do
     case "$arg" in
-        apply|status|detect|uninstall|rollback|rt-reapply) MODE="$arg" ;;
+        apply|status|detect|uninstall|rollback|rt-reapply|reserve-ports) MODE="$arg" ;;
         [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ROLLBACK_ID="$arg" ;;
         *) echo "unknown argument: '$arg'" >&2; usage >&2; exit 64 ;;
     esac
@@ -141,6 +141,18 @@ case "$MODE" in
         # shellcheck source=uninstall.sh
         source "$NODE_DIR/uninstall.sh"
         node_uninstall
+        ;;
+    reserve-ports)
+        # 2026-09-25 (v1.2.0): внутренний режим (зовёт shieldnode ports-sync при смене инбаундов):
+        # пересчёт ip_local_reserved_ports. Параллельный apply держит lock — пропуск, apply
+        # посчитает то же самое сам.
+        exec 9>>"$NODE_LOCK"   # fd держим открытым до конца команды — иначе lock снимется сразу
+        if ! flock -n 9; then log info "main" "reserve-ports: идёт apply — пропуск"; exit 0; fi
+        # shellcheck source=lib/sysctl.sh
+        source "$NODE_DIR/lib/sysctl.sh"
+        # shellcheck source=lib/tcp.sh
+        source "$NODE_DIR/lib/tcp.sh"
+        node_reserve_ports_sync
         ;;
     rt-reapply)
         # внутренний режим (вызывается node-rt-tweaks.service при boot):

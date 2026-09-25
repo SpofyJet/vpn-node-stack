@@ -5,7 +5,7 @@
 #   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)"
 # Дальше — одной командой (ярлык ставится после установки):
 #   sudo vpn-node                      # меню
-#   sudo vpn-node apply | status | rollback | emergency on|off | guard | uninstall
+#   sudo vpn-node apply | status | rollback | emergency on|off | guard | diag | uninstall
 #
 # 2026-09-24 (v1.2.0): интерактивное меню (установка, статус, меню безопасности, оптимизация)
 # при запуске БЕЗ аргументов в терминале; ярлык /usr/local/sbin/vpn-node. С аргументами и без
@@ -18,7 +18,7 @@
 #   4. Порядок: СНАЧАЛА фаервол [1/2 shieldnode], ЗАТЕМ оптимизация [2/2 node].
 #      Худший сценарий при сбое — «нода защищена, но не оптимизирована»,
 #      а не открытая нода без фаервола. Откат идёт в обратном порядке.
-#   5. Пост-проверка: таблица inet shieldnode реально существует в nft.
+#   5. Пост-проверка: таблица inet shieldnode существует и проходит `shieldnode verify` (v1.4.0).
 #
 # Какой код исполняется (v1.1.3):
 #   apply           — качает снапшот и ЗАМЕНЯЕТ установленное дерево (обновление), затем apply;
@@ -30,7 +30,7 @@
 #   VPN_STACK_REF=v1.2.0   VPN_STACK_REPO=Owner/name   VPN_STACK_TARBALL_URL=https://...
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 REPO="${VPN_STACK_REPO:-SpofyJet/vpn-node-stack}"
 RAW_BASE="${VPN_STACK_RAW_BASE:-https://raw.githubusercontent.com/$REPO/main}"
 # 2026-09-24 (v1.1.3): VPN_STACK_REF — воспроизводимая установка (тег/ветка/коммит).
@@ -80,7 +80,7 @@ stack_main() {
     done
     case "$CMD" in
         apply|status|detect|rollback|uninstall|install|emergency|guard) : ;;
-        *) die "неизвестная команда '$CMD' (ожидалось: menu|apply|status|detect|rollback|emergency|guard|uninstall)" ;;
+        *) die "неизвестная команда '$CMD' (ожидалось: menu|apply|status|detect|rollback|emergency|guard|diag|uninstall)" ;;
     esac
     # --verbose — только установщику (стеки его не знают: shieldnode отвечает exit 64)
     if [ "$verbose" = 1 ]; then
@@ -270,7 +270,14 @@ stack_main() {
             if [ "$dry" -eq 1 ]; then
                 say "==> dry-run: пост-проверка nft пропущена (фаервол намеренно не применялся)"
             elif command -v nft >/dev/null 2>&1 && nft list table inet shieldnode >/dev/null 2>&1; then
-                vsay "==> фаервол: таблица inet shieldnode активна"
+                # 2026-09-25 (v1.4.0, E8): «таблица есть» ещё не «фаервол работает» — полная проверка
+                # (хуки, число правил, IPv6 fail-safe, наборы, IP SSH-сессии в белом списке)
+                if [ -f "$SHIELD_DIR/lib/ports.sh" ] && ! _vout="$(bash "$SHIELD_DIR/main.sh" verify 2>&1)"; then
+                    printf 'ОШИБКА: фаервол применён НЕ полностью:\n%s\n' "$(grep '✘' <<<"$_vout")" >&2
+                    printf '       Повтори: sudo vpn-node apply; лог: /var/log/shieldnode.log; диагностика: sudo vpn-node diag\n' >&2
+                    exit 1
+                fi
+                vsay "==> фаервол: таблица inet shieldnode активна, проверка verify пройдена"
             else
                 printf 'ОШИБКА: ФАЕРВОЛ НЕ АКТИВЕН — таблицы inet shieldnode в nft нет.\n' >&2
                 printf '       Лог: /var/log/shieldnode.log; диагностика: bash %s/install.sh status\n' "$SHIELD_DIR" >&2
@@ -350,7 +357,9 @@ print_summary() {
     pt="$(set_elems protected_tcp)"; pu="$(set_elems protected_udp)"
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
     qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
-    v6="включён"; [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" = 1 ] && v6="выключен"
+    if grep -qw 'ipv6.disable=1' /proc/cmdline 2>/dev/null; then v6="выключен (в ядре)"
+    elif [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" = 1 ]; then v6="выключен (sysctl; в ядре — после перезагрузки)"
+    else v6="${C_R}ВКЛЮЧЁН — повтори установку${C_0}"; fi
     if systemctl is-active --quiet crowdsec.service 2>/dev/null; then cs="${C_G}работает${C_0}"
     elif [ "$(conf_get "$SHIELD_CONF" ENABLE_CROWDSEC_LIST)" = 0 ]; then cs="${C_D}выключен${C_0}"
     else cs="${C_Y}не запущен${C_0} (журнал: /var/log/shieldnode.log)"; fi
@@ -359,9 +368,11 @@ print_summary() {
     kv "Защита" "TCP ${C_B}${pt:-—}${C_0}   UDP ${C_B}${pu:-—}${C_0}"
     kv "CrowdSec" "$cs"
     kv "Сеть" "${cc^^} + $qd · IPv6 $v6"
-    if [ -f /run/node/reboot-required ]; then
+    if [ -f /run/node/reboot-required ] || [ -f /run/node/reboot-required-ipv6 ]; then
         echo
-        printf '  %s⚠ Установлено новое ядро (XanMod) — оно заработает после перезагрузки.%s\n' "$C_Y" "$C_0"
+        [ -f /run/node/reboot-required ] && printf '  %s⚠ Установлено новое ядро (XanMod) — оно заработает после перезагрузки.%s\n' "$C_Y" "$C_0"
+        # 2026-09-25 (v1.4.0, P1-4): ipv6.disable=1 в cmdline ядра — после перезагрузки
+        [ -f /run/node/reboot-required-ipv6 ] && printf '  %s⚠ IPv6 выключен через sysctl; полностью (в ядре) — после перезагрузки.%s\n' "$C_Y" "$C_0"
         if [ -t 0 ] && [ "${VPN_STACK_NO_REBOOT:-0}" != 1 ]; then
             if confirm "Перезагрузить сейчас? VPN-клиенты отключатся на 1-2 минуты" n; then
                 say "  Перезагрузка… После неё снова: sudo vpn-node"
@@ -678,30 +689,39 @@ menu_security() {
 
 # ---------- меню оптимизации (node) ----------
 menu_node() {
-    local v6
     while :; do
         header
-        v6="$(conf_get "$NODE_CONF" HARDEN_IPV6)"; [ -n "$v6" ] || v6=1
         printf '  %sОптимизация (node)%s\n\n' "$C_B" "$C_0"
         item 1 "Статус оптимизации"
         item 2 "Применить оптимизацию"
         item 3 "План изменений (ничего не меняет)"
-        if [ "$v6" = 1 ]; then item 4 "IPv6: ${C_D}выключен${C_0} — включить"; else item 4 "IPv6: ${C_G}включён${C_0} — выключить"; fi
-        item 5 "Откатить оптимизацию"
+        item 4 "Откатить оптимизацию"
+        # 2026-09-25 (v1.4.0, P1-5): XanMod — по запросу (замена ядра — риск загрузки облачной VM)
+        if uname -r | grep -qi xanmod; then item 5 "Ядро XanMod: ${C_G}активно${C_0} ($(uname -r))"
+        elif [ "$(conf_get "$NODE_CONF" ENABLE_XANMOD)" = 1 ]; then item 5 "Ядро XanMod: ${C_Y}установлено, ждёт перезагрузки${C_0}"
+        else item 5 "Ядро XanMod: ${C_D}не используется${C_0} — установить"; fi
         item 0 "Назад"
+        # 2026-09-25 (v1.4.0): IPv6 на нодах выключен всегда (требование стека) — переключателя нет
+        printf '\n  %sIPv6: выключен всегда (ядро ipv6.disable=1 + sysctl + фаервол)%s\n' "$C_D" "$C_0"
         echo
         ask "  Выбор: "
         case "$REPLY" in
             1) echo; run_tool node status || true; pause ;;
             2) echo; run_tool node apply || true; pause ;;
             3) echo; run_tool node apply --dry-run || true; pause ;;
-            4) echo
-               if [ "$v6" = 1 ]; then confirm "Включить IPv6 (прокси получит v6-вход и выход)?" y || continue; conf_set "$NODE_CONF" HARDEN_IPV6 0
-               else confirm "Выключить IPv6 на ноде?" y || continue; conf_set "$NODE_CONF" HARDEN_IPV6 1; fi
-               # порядок: node меняет IPv6, затем shieldnode перестраивает v6-правила
-               run_tool node apply && run_tool shieldnode apply || true
+            5) echo
+               if uname -r | grep -qi xanmod; then say "  XanMod уже активно. Удаление: sudo bash /opt/vpn-node-stack/node/install.sh rollback и README"; pause; continue; fi
+               printf '  XanMod — ядро с BBRv3. Штатное ядро %s тоже работает (BBR v1 + fq).\n' "$(uname -r)"
+               printf '  Риск: новое ядро на облачной VM может не загрузиться (драйверы провайдера);\n'
+               printf '  штатное ядро остаётся в GRUB запасным. Нужна перезагрузка.\n'
+               confirm "Установить XanMod?" n || continue
+               conf_set "$NODE_CONF" ENABLE_XANMOD 1
+               run_tool node apply || true
+               if [ -f /run/node/reboot-required ] && confirm "Перезагрузить сейчас? VPN-клиенты отключатся на 1-2 минуты" n; then
+                   systemctl reboot 2>/dev/null || reboot; exit 0
+               fi
                pause ;;
-            5) echo; confirm "Откатить оптимизацию node к исходному состоянию?" n && run_tool node rollback || true; pause ;;
+            4) echo; confirm "Откатить оптимизацию node к исходному состоянию?" n && run_tool node rollback || true; pause ;;
             0|q|"") return 0 ;;
             *) ;;
         esac
@@ -717,7 +737,7 @@ menu_main() {
         header
         printf '  На этой ноде стек ещё не установлен. Установка займёт 1-3 минуты:\n'
         printf '   %s1.%s фаервол shieldnode — защита SSH и VPN-портов, блок-листы, CrowdSec\n' "$C_B" "$C_0"
-        printf '   %s2.%s оптимизация node — BBR, буферы, conntrack, лимиты (ядро XanMod)\n' "$C_B" "$C_0"
+        printf '   %s2.%s оптимизация node — BBR, буферы, conntrack, лимиты (штатное ядро; XanMod — по желанию)\n' "$C_B" "$C_0"
         printf '   %sSSH не прервётся: ваш IP попадёт в белый список, при ошибке — автооткат.%s\n\n' "$C_D" "$C_0"
         if confirm "Установить сейчас?" y; then run_stack apply || true; pause; fi
     fi
@@ -755,9 +775,163 @@ menu_main() {
     done
 }
 
+# ---------- diag: обезличенный архив диагностики (v1.4.0, Phase 2) ----------
+# `sudo vpn-node diag` — ТОЛЬКО чтение. Собирает всё, что нужно для разбора проблем фаервола/
+# портов/IPv6/загрузки, и вычищает секреты ДО упаковки: SECRET_KEY/пароли/токены, UUID, ключи,
+# IPv4 (заменяются стабильными метками ip-<хеш> со случайной солью архива: одинаковые адреса
+# остаются одинаковыми, но восстановить их нельзя), IPv6. Конфиг Xray не собирается вовсе.
+# После очистки — проверка на утечки (UUID, SECRET_KEY из .env remnanode); найдено — архив не создаётся.
+stack_diag() {
+    [ "$(id -u)" -eq 0 ] || die "diag требует root: sudo vpn-node diag"
+    command -v python3 >/dev/null 2>&1 || die "diag: нужен python3"
+    local d out ts host_tag rdir="${VPN_STACK_DIAG_DIR:-/root}"
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    d="$(mktemp -d /tmp/vpn-node-diag.XXXXXX)"; chmod 0700 "$d"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$d'" EXIT
+    host_tag="$(hostname 2>/dev/null | sha256sum | cut -c1-8)"
+    say "  Собираю диагностику (1-2 минуты, ничего не меняется)…"
+    _dg() { # _dg <файл> <команда...> — вывод команды с таймаутом, ошибки — в тот же файл
+        local f="$d/$1"; shift
+        { printf '$ %s\n' "$*"; timeout 30 "$@" 2>&1 || printf '[rc=%s]\n' "$?"; echo; } >> "$f"
+    }
+    _dsh() { local f="$d/$1"; shift; { printf '$ %s\n' "$1"; timeout 30 bash -c "$1" 2>&1 || printf '[rc=%s]\n' "$?"; echo; } >> "$f"; }
+
+    # 00 — общее
+    _dsh 00-meta.txt "echo installer=$VERSION; date -u; uptime; cat /etc/os-release | grep -E '^(PRETTY_NAME|VERSION_ID)='"
+    _dsh 00-meta.txt "for f in $WORK_DIR/node/VERSION $WORK_DIR/shieldnode/VERSION; do [ -f \$f ] && echo \$f: \$(cat \$f); done; grep -E '^(version|updated)=' /etc/node-profile.d/stack.conf 2>/dev/null"
+    _dsh 00-meta.txt "nproc; free -m; df -h / /boot 2>/dev/null"
+    # 01 — фаервол: ruleset без элементов наборов (-t), размеры наборов, счётчики
+    _dg 01-nft-ruleset.txt nft -t list ruleset
+    _dsh 01-nft-sets.txt "nft list sets inet 2>/dev/null | awk '/set /{print \$2}' | sort -u | while read -r s; do n=\$(nft -j list set inet shieldnode \$s 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(len(x[\"set\"].get(\"elem\",[])) for x in d[\"nftables\"] if \"set\" in x))' 2>/dev/null); echo \"\$s \${n:-?}\"; done"
+    _dsh 01-nft-sets.txt "for s in protected_tcp protected_udp node_api_port ssh_ports; do nft list set inet shieldnode \$s 2>/dev/null | grep -E 'elements|set '; done"
+    _dg 01-nft-counters.txt nft list counters
+    _dsh 01-nft-tables.txt "nft list tables"
+    # 02 — сокеты и порты
+    _dg 02-sockets.txt ss -tulpnH
+    _dsh 02-sockets.txt "ss -uapnH | head -300"
+    _dsh 02-sockets.txt "echo ip_local_port_range=\$(cat /proc/sys/net/ipv4/ip_local_port_range); echo ip_local_reserved_ports=\$(cat /proc/sys/net/ipv4/ip_local_reserved_ports)"
+    _dsh 02-sockets.txt "ss -uapnH | grep -c rw-core; ss -ulpnH | grep -c rw-core"
+    # 03 — IPv6
+    _dsh 03-ipv6.txt "cat /proc/cmdline"
+    _dsh 03-ipv6.txt "[ -d /proc/sys/net/ipv6 ] && grep -H . /proc/sys/net/ipv6/conf/*/disable_ipv6 || echo 'стека IPv6 нет (ipv6.disable=1)'"
+    _dsh 03-ipv6.txt "ip -6 addr 2>&1; ip -6 route 2>&1"
+    _dsh 03-ipv6.txt "ls -la /etc/systemd/network/ 2>/dev/null; cat /etc/systemd/network/*.d/*.conf 2>/dev/null; cat /etc/sysctl.d/99-zz-vpn-ipv6-off.conf 2>/dev/null"
+    # 04 — юниты, порядок загрузки
+    _dsh 04-units.txt "systemctl --no-pager list-units --all 'shieldnode*' 'node-*' crowdsec.service docker.service ufw.service nftables.service ssh.service 2>&1"
+    _dsh 04-units.txt "systemctl --no-pager list-timers --all 'shieldnode*' 2>&1"
+    _dsh 04-units.txt "for u in shieldnode shieldnode-ports docker ufw nftables ssh systemd-networkd crowdsec; do echo \"== \$u\"; systemctl show \$u -p ActiveState,SubState,UnitFileState,After,Before,Wants,Requires,DefaultDependencies,ActiveEnterTimestampMonotonic 2>&1; done"
+    _dsh 04-units.txt "systemctl cat shieldnode.service shieldnode-ports.service shieldnode-blocklist.service shieldnode-blocklist.timer node-rt-tweaks.service 2>&1"
+    _dsh 04-boot.txt "systemd-analyze 2>&1; systemd-analyze critical-chain shieldnode.service docker.service 2>&1 | head -40"
+    _dsh 04-boot.txt "journalctl -b -o short-monotonic --no-pager -u shieldnode -u shieldnode-ports -u ufw -u docker -u ssh -u systemd-networkd -u nftables 2>&1 | head -200"
+    _dsh 04-boot.txt "journalctl -k -b -o short-monotonic --no-pager 2>&1 | grep -iE 'link is up|link becomes ready|renamed|nf_tables' | head -40"
+    # 05 — UFW и CrowdSec
+    _dsh 05-ufw.txt "ufw status verbose 2>&1"
+    _dsh 05-ufw.txt "grep -E '^### tuple' /etc/ufw/user.rules 2>&1"
+    _dsh 05-crowdsec.txt "cscli version 2>&1 | head -5; cscli capi status 2>&1 | tail -5"
+    _dsh 05-crowdsec.txt "cscli decisions list -a --limit 0 -o json 2>/dev/null | python3 -c 'import json,sys,collections; d=json.load(sys.stdin) or []; c=collections.Counter(x.get(\"origin\") for a in d for x in (a.get(\"decisions\") or [])); print(dict(c))' 2>&1"
+    _dsh 05-crowdsec.txt "systemctl show crowdsec -p ActiveEnterTimestamp,NRestarts 2>&1; ls -la /var/lib/shieldnode/blocklists/ 2>&1; cat /var/lib/shieldnode/blocklists/status-* /var/lib/shieldnode/blocklists/cs-restarts 2>/dev/null"
+    # 06 — sysctl: файлы стека и исходные значения
+    _dsh 06-sysctl.txt "grep -H . /etc/sysctl.d/99-z*.conf 2>&1"
+    _dsh 06-sysctl.txt "[ -f /var/lib/node/sysctl-orig.tsv ] && while IFS=\$'\\t' read -r k v; do printf '%s\\torig=%s\\tnow=%s\\n' \"\$k\" \"\$v\" \"\$(sysctl -n \$k 2>/dev/null | tr '\\t' ' ')\"; done < /var/lib/node/sysctl-orig.tsv"
+    _dsh 06-sysctl.txt "sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count net.core.somaxconn fs.file-max 2>&1"
+    # 07 — Docker / remnanode (без env: там SECRET_KEY)
+    _dsh 07-docker.txt "docker ps -a --format '{{.Names}}\\t{{.Image}}\\t{{.Status}}' 2>&1"
+    _dsh 07-docker.txt "docker inspect remnanode --format 'network={{.HostConfig.NetworkMode}} restart={{.HostConfig.RestartPolicy.Name}} ulimits={{json .HostConfig.Ulimits}}' 2>&1"
+    _dsh 07-docker.txt "docker exec remnanode sh -c 'ulimit -n; ulimit -u' 2>&1"
+    _dsh 07-docker.txt "for p in \$(pgrep -x rw-core) \$(pgrep -x xray); do grep -E 'open files|processes' /proc/\$p/limits; done"
+    _dsh 07-docker.txt "cat /etc/docker/daemon.json 2>&1"
+    # 08 — ядро и GRUB
+    _dsh 08-kernel.txt "uname -a; cat /proc/cmdline; grep -E '^GRUB_(DEFAULT|CMDLINE)' /etc/default/grub; cat /etc/default/grub.d/*.cfg 2>/dev/null; ls /boot | grep -E 'vmlinuz|initrd'"
+    _dsh 08-kernel.txt "dpkg -l 'linux-image*' 2>/dev/null | awk '/^ii/{print \$2, \$3}'; modinfo -F version tcp_bbr 2>&1; lsmod | grep -E 'tcp_bbr|sch_fq|nf_conntrack' "
+    # 09 — проверки стеков и журналы (журналы стеков без секретов по контракту)
+    [ -f "$WORK_DIR/shieldnode/main.sh" ] && { _dsh 09-health.txt "bash $WORK_DIR/shieldnode/main.sh status"; _dsh 09-health.txt "bash $WORK_DIR/shieldnode/main.sh verify"; }
+    [ -f "$WORK_DIR/node/main.sh" ] && _dsh 09-node-status.txt "bash $WORK_DIR/node/main.sh status"
+    _dsh 09-logs.txt "tail -n 300 /var/log/shieldnode.log 2>&1"
+    _dsh 09-logs.txt "tail -n 200 /var/log/node.log 2>&1"
+    _dsh 09-logs.txt "tail -n 100 /var/log/vpn-node-setup.log 2>&1"
+    _dsh 09-tree.txt "cd $WORK_DIR 2>/dev/null && find . -type f -printf '%m %p\\n' | sort | head -400"
+
+    # --- очистка секретов ---
+    local secret=""
+    [ -f /opt/remnanode/.env ] && secret="$(sed -n 's/^SECRET_KEY=//p' /opt/remnanode/.env | tr -d '"'"'" | head -1)"
+    if ! DIAG_SECRET="$secret" python3 - "$d" <<'PY'
+import os, re, sys, hashlib, secrets, ipaddress
+root = sys.argv[1]
+salt = secrets.token_bytes(16)
+secret = os.environ.get("DIAG_SECRET", "")
+def iptok(m):
+    s = m.group(0)
+    try:
+        ip = ipaddress.IPv4Address(s)
+    except Exception:
+        return s
+    if s in ("0.0.0.0", "255.255.255.255") or ip.is_loopback or s.startswith("255."):
+        return s
+    kind = "priv" if ip.is_private or ip in ipaddress.IPv4Network("100.64.0.0/10") else "ip"
+    return "%s-%s" % (kind, hashlib.sha256(salt + s.encode()).hexdigest()[:8])
+def v6tok(m):
+    s = m.group(0)
+    if s in ("::", "::1") or s.count(":") < 2:
+        return s
+    try:
+        ip = ipaddress.IPv6Address(s.split("%")[0])
+    except Exception:
+        return s
+    return ("v6ll-" if ip.is_link_local else "v6-") + hashlib.sha256(salt + s.encode()).hexdigest()[:8]
+rules = [
+    (re.compile(r'(?i)((?:secret[_-]?key|password|passwd|token|api[_-]?key|private[_-]?key|jwt)["\']?\s*[:=]\s*)("[^"]*"|\'[^\']*\'|\S+)'), r'\1<redacted>'),
+    (re.compile(r'(?i)(authorization:\s*)(\S+\s+)?\S+'), r'\1<redacted>'),
+    (re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I), '<uuid>'),
+    (re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*'), '<jwt>'),
+    # ключи (base64/base64url, x25519 и т.п.): длинный токен, где есть и цифры, и ОБА регистра;
+    # hex-хеши и пути (без смешения регистров) не трогаем
+    (re.compile(r'(?<![\w/.])[A-Za-z0-9+/_-]{32,}={0,2}'),
+     lambda m: '<key>' if (re.search(r'\d', m.group(0)) and re.search(r'[a-z]', m.group(0))
+                           and re.search(r'[A-Z]', m.group(0)) and m.group(0).count('/') < 3) else m.group(0)),
+]
+ipv4 = re.compile(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])')
+ipv6 = re.compile(r'(?<![\w:])(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}(?:%\w+)?(?![\w:])|(?<![\w:])(?:[0-9a-fA-F]{0,4}:){1,6}:[0-9a-fA-F]{0,4}(?![\w:])')
+for dp, _, fs in os.walk(root):
+    for fn in fs:
+        p = os.path.join(dp, fn)
+        t = open(p, errors="replace").read()
+        if secret:
+            t = t.replace(secret, "<redacted>")
+        for rx, rep in rules:
+            t = rx.sub(rep, t)
+        t = ipv4.sub(iptok, t)
+        t = ipv6.sub(v6tok, t)
+        open(p, "w").write(t)
+# проверка утечек
+bad = []
+uu = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I)
+for dp, _, fs in os.walk(root):
+    for fn in fs:
+        t = open(os.path.join(dp, fn), errors="replace").read()
+        if uu.search(t) or (secret and secret in t) or ipv4.search(t) and any(
+                not (x.startswith("0.") or x.startswith("127.") or x.startswith("255.")) for x in ipv4.findall(t)):
+            bad.append(fn)
+if bad:
+    print("утечка после очистки в: " + ", ".join(sorted(set(bad))), file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        die "diag: очистка не прошла проверку — архив НЕ создан (сообщи об этом разработчику)"
+    fi
+    out="$rdir/vpn-node-diag-$host_tag-$ts.tar.gz"
+    ( umask 077; tar -C "$d" -czf "$out" . ) || die "diag: не удалось создать $out"
+    chmod 0600 "$out"
+    say "  ✔ Диагностика: $out ($(du -h "$out" | cut -f1))"
+    say "    Секреты, UUID, ключи и IP-адреса заменены метками; конфиг Xray не собирался."
+    say "    Перед отправкой можно посмотреть: tar -xzf $out -C /tmp/diag-check"
+}
+
 # ---------- точка входа ----------
 # Меню: явная команда `menu`, либо без аргументов в терминале (VPN_STACK_MENU=1/0 — принудительно).
-if [ "${1:-}" = menu ] || { [ $# -eq 0 ] && [ "${VPN_STACK_MENU:-}" != 0 ] && { [ "${VPN_STACK_MENU:-}" = 1 ] || { [ -t 0 ] && [ -t 1 ]; }; }; }; then
+if [ "${1:-}" = diag ]; then
+    stack_diag
+elif [ "${1:-}" = menu ] || { [ $# -eq 0 ] && [ "${VPN_STACK_MENU:-}" != 0 ] && { [ "${VPN_STACK_MENU:-}" = 1 ] || { [ -t 0 ] && [ -t 1 ]; }; }; }; then
     menu_main
 else
     stack_main "$@"

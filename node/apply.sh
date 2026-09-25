@@ -26,13 +26,13 @@ node_contract_write() {
         echo "mss_clamp=$(node_conf_get ENABLE_MSS_CLAMP 0)"
         echo "docker_integration=$(node_conf_get INTEGRATION_DOCKER 0)"
         echo "bbr=$(node_bbr_active && echo active || echo inactive)"
-        echo "xanmod_requested=$(node_conf_get ENABLE_XANMOD 1)"
+        echo "xanmod_requested=$(node_conf_get ENABLE_XANMOD 0)"
         echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0)"
         echo "tcp_buf_tune=$(node_conf_get ENABLE_TCP_BUF_TUNE 1) eee_off=$(node_conf_get ENABLE_EEE_OFF 0)"
         echo "datapath=$(node_conf_get ENABLE_DATAPATH 1),fq_tune:$(node_conf_get ENABLE_FQ_TUNE 1),busy_poll:$(node_conf_get ENABLE_BUSY_POLL 0)"
         echo "nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)"
         echo "irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
-        echo "ipv6_disabled=$(node_conf_get HARDEN_IPV6 1)"
+        echo "ipv6_disabled=1 ipv6_kernel_off=$(node_ipv6_kernel_off && echo 1 || echo 0)"
         echo "hardening=bg:$(node_conf_get HARDEN_BG_SERVICES 1),unattended:$(node_conf_get HARDEN_UNATTENDED 1),packagekit:$(node_conf_get HARDEN_PACKAGEKIT 1),irqbalance:$(node_conf_get HARDEN_IRQBALANCE 1),rpcbind:$(node_conf_get HARDEN_RPCBIND 1),kdump:$(node_conf_get HARDEN_KDUMP 1),mta:$(node_conf_get HARDEN_MTA 0),snapd:$(node_conf_get HARDEN_SNAPD 0),thp:$(node_conf_get HARDEN_THP 1),sched_none:$(node_conf_get HARDEN_SCHED_NONE 1),noatime:$(node_conf_get HARDEN_NOATIME 1),low_latency_nic=$(node_conf_get ENABLE_LOW_LATENCY_NIC 0)"
         echo "owner_keys=$NODE_STATE_DIR/owner-keys.txt"
         echo "diagnostics=${NODE_LAST_SNAPSHOT:-none}"
@@ -56,7 +56,8 @@ node_apply() {
     source "$NODE_DIR/lib/udp.sh";       node_udp_plan
     source "$NODE_DIR/lib/network.sh";   node_network_plan
     source "$NODE_DIR/lib/limits.sh";    node_limits_plan
-    source "$NODE_DIR/lib/services.sh";  node_services_plan; node_harden_ipv6
+    source "$NODE_DIR/lib/services.sh";  node_services_plan
+    source "$NODE_DIR/lib/ipv6.sh"
     source "$NODE_DIR/lib/storage.sh";   node_storage_plan
     source "$NODE_DIR/lib/nic.sh"        # node_nic_* (диагностика обязательна §12)
     source "$NODE_DIR/lib/irq.sh"        # node_irq_*
@@ -89,6 +90,7 @@ node_apply() {
     node_sysctl_write
     node_sysctl_apply
     node_step_run sysctl_restore_dropped   node_sysctl_restore_dropped    # 2026-09-24 (v1.1.7)
+    node_step_run ipv6_enforce             node_ipv6_enforce              # 2026-09-25 (v1.2.0): инвариант
     node_step_run conntrack_persist        node_conntrack_persist
     node_step_run conntrack_apply          node_conntrack_apply
     node_step_run services_apply           node_services_apply   # irqbalance выключаем ДО ручной IRQ-affinity
@@ -158,7 +160,7 @@ node_self_test() {
     local k v exp
     while IFS=$'\t' read -r k v f; do
         case "$k" in
-            net.netfilter.nf_conntrack_max|net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.ipv6.conf.all.disable_ipv6|net.core.netdev_budget)
+            net.netfilter.nf_conntrack_max|net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.core.netdev_budget)
                 exp="$(sysctl -n "$k" 2>/dev/null)"
                 if [ "$exp" != "$v" ]; then warn "selftest" "FAIL: $k=$exp ожидалось $v"; fails=$((fails+1)); fi
                 ;;

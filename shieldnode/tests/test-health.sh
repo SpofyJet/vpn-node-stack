@@ -20,7 +20,12 @@ OUT=/tmp/shieldnode-test-health
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/state" "$OUT/elems" "$OUT/bl"
 export SHIELD_DIR SHIELD_VERSION=test SHIELD_STATE_DIR="$OUT/state" SHIELD_LOG="$OUT/log" SHIELD_EXCLUDE="$OUT/none" SHIELD_UFW_DIR="$OUT/no-ufw"
 export SHIELD_BLOCKLIST_STATE="$OUT/bl" LIVE="$OUT/live.nft" ELEMS="$OUT/elems" CNTS="$OUT/counters"
+# детектор инбаундов (v1.2.0): без API хоста, фиксированный эфемерный диапазон, без паузы замеров
+mkdir -p "$OUT/sys/net/ipv4"; echo "10240 65535" > "$OUT/sys/net/ipv4/ip_local_port_range"; : > "$OUT/sys/net/ipv4/ip_local_reserved_ports"
+export SHIELD_XRAY_LSI_FILE=/nonexistent SHIELD_PROC_SYS="$OUT/sys" SHIELD_DETECT_STABLE_DELAY=0 SHIELD_REMNANODE_DIR="$OUT/no-rn"
 : > "$SHIELD_LOG"; : > "$CNTS"; unset SSH_CONNECTION
+# v1.2.0: IPv6 хоста — фикстура /proc (хост теста не читаем)
+mkdir -p "$OUT/proc/net"; echo "BOOT_IMAGE=/vmlinuz ro ipv6.disable=1" > "$OUT/proc/cmdline"; export SHIELD_PROC="$OUT/proc"
 
 cat > "$OUT/bin/nft" <<'EOF'
 #!/bin/bash
@@ -49,6 +54,7 @@ case "$*" in
      'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("xray",pid=7,fd=7))' \
      'LISTEN 0 4096 127.0.0.1:10085 0.0.0.0:* users:(("xray",pid=7,fd=8))' ;;
   "-ulnp") [ -n "${SS_UDP:-}" ] && printf '%s\n' 'State Recv-Q Send-Q Local Peer Process' "UNCONN 0 0 0.0.0.0:${SS_UDP} 0.0.0.0:* users:((\"xray\",pid=7,fd=9))" ;;
+  "-Htln") printf '%s\n' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*' ;;
   "-tulnp") printf '%s\n' 'Netid State Recv-Q Send-Q Local Peer Process' 'tcp LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("xray",pid=7,fd=7))' ;;
 esac; exit 0
 EOF
@@ -80,7 +86,7 @@ gen ''; healthy; H
 t "здоровая нода: FAIL=0 WARN=0"                         '[ "$(sumf)" = "health: FAIL=0 WARN=0" ]'
 t "порядок: established/lo/whitelist до первого drop"    'has "[PASS] established/related accept — до первого drop" && has "[PASS] loopback accept" && has "[PASS] whitelist accept"'
 t "SSH 22 (SSH_PORT пуст -> авто-детект) под защитой"    'has "[PASS] SSH 22: rate/conn-limit активны (авто-детект)"'
-t "внешний xray 443/tcp под защитой, loopback 10085 игнорируется" 'has "все внешние порты xray/remnanode под защитой (tcp: 443;" && ! has "10085"'
+t "внешний xray 443/tcp под защитой, loopback 10085 игнорируется" 'has "все инбаунды под защитой (источник: эвристика; tcp: 443;" && ! has "10085"'
 t "блоклисты: записи + пояснение про MIN до схлопывания" 'has "[PASS] scanner: 2 записей" && has "MIN проверяет updater"'
 t "tor выключен и отсутствует — PASS; crowdsec (дефолт ВКЛ, v1.1.6) — есть записи" 'has "[PASS] tor: выключен и отсутствует" && has "[PASS] crowdsec: 2 записей"'
 t "последний apply, дропы 45, abuse-сеты, журнал"       'has "последний apply: 2026-09-23T10:00:00Z" && has "дропов с последнего apply: 45 пакетов" && has "abuse-сеты сейчас: ssh=0"'
@@ -117,12 +123,34 @@ gen ''; healthy; : > "$ELEMS/scanner_blocklist_v4"; touch -d '3 days ago' "$OUT/
 date -u +%FT%TZ > "$OUT/bl/.alert-spamhaus"; rm -f "$OUT/bl/last-good-cins.txt"; H
 t "custom не проверяется на свежесть (hash-guard, неизменный контент — норма)" '! grep -q "custom: последнее успешное" "$OUT/h.txt"'
 
+# v1.2.0 (P1-3): crowdsec «ждём первый community-список» — INFO, не WARN «set ПУСТ»/«нет last-good»
+gen ''; healthy; rm -f "$OUT/bl/.alert-"*; : > "$ELEMS/crowdsec_blocklist_v4"; rm -f "$OUT/bl/last-good-crowdsec.txt"; echo "waiting 1" > "$OUT/bl/status-crowdsec"; H
+t "crowdsec ждёт community-список -> INFO, FAIL=0 WARN=0" 'has "[INFO] crowdsec: CrowdSec работает, но community-список ещё не пришёл" && [ "$(sumf)" = "health: FAIL=0 WARN=0" ]'
+rm -f "$OUT/bl/status-crowdsec"; H
+t "без статуса waiting тот же пустой crowdsec -> WARN (негативный контроль)" 'has "[WARN] crowdsec: set ПУСТ"'
+# бывшие проверки guard (guard теперь = health): SSH не слушает
+gen 'SSH_PORT=2201\n'; healthy; H
+t "SSH_PORT=2201 не слушает -> WARN «SSH не слушает»" 'has "[WARN] SSH не слушает порт 2201"'
+
+# v1.2.0 (P1-4, прод E6): IPv6 хоста
+gen ''; healthy; rm -f "$OUT/bl/.alert-"*
+echo "BOOT_IMAGE=/vmlinuz ro" > "$OUT/proc/cmdline"
+for i in all default lo enp5s0; do mkdir -p "$OUT/proc/sys/net/ipv6/conf/$i"; echo 1 > "$OUT/proc/sys/net/ipv6/conf/$i/disable_ipv6"; done
+echo 0 > "$OUT/proc/sys/net/ipv6/conf/enp5s0/disable_ipv6"; H
+t "IPv6: enp5s0 disable_ipv6=0 (networkd после reboot) -> FAIL" 'has "[FAIL] IPv6 включён на: enp5s0"'
+echo "20010db8000000000000000000000001 02 40 00 00 enp5s0" > "$OUT/proc/net/if_inet6"; H
+t "IPv6: глобальный адрес -> FAIL" 'has "[FAIL] на интерфейсах есть глобальный IPv6-адрес (enp5s0 )"'
+rm -f "$OUT/proc/net/if_inet6"; echo 1 > "$OUT/proc/sys/net/ipv6/conf/enp5s0/disable_ipv6"; H
+t "IPv6: всё выключено sysctl, cmdline без ipv6.disable=1 -> WARN «перезагрузи»" 'has "[WARN] IPv6 выключен через sysctl, но ядро загружено без ipv6.disable=1"'
+echo "BOOT_IMAGE=/vmlinuz ro ipv6.disable=1" > "$OUT/proc/cmdline"; rm -rf "$OUT/proc/sys"; H
+t "IPv6: ipv6.disable=1 -> PASS" 'has "[PASS] IPv6 выключен в ядре"'
+
 # ---------- 5. порты: EXTRA, внешний UDP xray, интервалы ----------
 gen ''; cfg 'PROTECTED_TCP_EXTRA=9443\nPROTECTED_UDP_EXTRA=5353\n'; healthy; SS_UDP=8443 H
 t "EXTRA 9443/5353 отсутствуют в сетах -> FAIL"          'has "[FAIL] PROTECTED_TCP_EXTRA 9443 — НЕТ" && has "[FAIL] PROTECTED_UDP_EXTRA 5353 — НЕТ"'
-t "xray слушает 8443/udp вне protected_udp -> WARN"      'has "[WARN] xray/remnanode слушает 8443/udp снаружи"'
+t "xray слушает 8443/udp вне protected_udp -> WARN"      'has "[WARN] инбаунд 8443/udp не в protected_udp"'
 printf '22\n443\n8000-9500\n' > "$ELEMS/protected_tcp"; printf '5000-6000\n8443\n' > "$ELEMS/protected_udp"; SS_UDP=8443 H
-t "интервалы set: 9443 in 8000-9500, 5353 in 5000-6000 -> PASS" 'has "[PASS] PROTECTED_TCP_EXTRA 9443" && has "[PASS] PROTECTED_UDP_EXTRA 5353" && ! has "8443/udp снаружи"'
+t "интервалы set: 9443 in 8000-9500, 5353 in 5000-6000 -> PASS" 'has "[PASS] PROTECTED_TCP_EXTRA 9443" && has "[PASS] PROTECTED_UDP_EXTRA 5353" && ! has "инбаунд 8443/udp"'
 rm -f "$ELEMS/protected_tcp" "$ELEMS/protected_udp"
 
 # ---------- 6. SSH: SSH_PORT задан, а в таблице правила для другого порта ----------

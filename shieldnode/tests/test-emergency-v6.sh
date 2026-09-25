@@ -1,5 +1,5 @@
 #!/bin/bash
-# shieldnode — тест: emergency-режим, паритет IPv4/IPv6 на настоящем nft (backlog #6).
+# shieldnode — тест: emergency-режим на настоящем nft: IPv4 — только SSH/whitelist, IPv6 — ничего (v1.2.0).
 # 2026-09-23 (v1.1.4): emergency-ruleset резал только `ip protocol tcp|udp` —
 # по IPv6 любой TCP/UDP-порт оставался открыт; admin v6 резолвился, но в
 # ruleset не попадал (whitelist_v6 отсутствовал).
@@ -83,11 +83,13 @@ P="ip netns exec $C python3 $OUT/probe.py"
 t "v4: tcp 22 (SSH) открыт"              "$P 10.78.0.1 tcp 22"
 t "v4: tcp 8443 закрыт"                  "! $P 10.78.0.1 tcp 8443"
 t "v4: udp 5353 закрыт"                  "! $P 10.78.0.1 udp 5353"
-t "v6: tcp 22 (SSH) открыт"              "$P fd78::1 tcp 22 fd78::2"
-t "v6: tcp 8443 закрыт (паритет с v4)"   "! $P fd78::1 tcp 8443 fd78::2"
-t "v6: udp 5353 закрыт (паритет с v4)"   "! $P fd78::1 udp 5353 fd78::2"
-t "v6: admin из whitelist_v6 проходит"   "$P fd78::1 tcp 8443 fd78::a"
-t "v6: ICMPv6 (ND/echo) не сломан"       "ip netns exec $C ping -6 -c1 -W2 fd78::1"
+# 2026-09-25 (v1.2.0): IPv6 на ноде выключен ОБЯЗАТЕЛЬНО — в аварийном режиме IPv6 не проходит
+# вовсе (fail-safe), включая SSH и адрес из whitelist_v6 (прежде тест требовал «паритет v4/v6»)
+t "v6: tcp 22 (SSH) — закрыт (IPv6 fail-safe)"      "! $P fd78::1 tcp 22 fd78::2"
+t "v6: tcp 8443 закрыт"                            "! $P fd78::1 tcp 8443 fd78::2"
+t "v6: udp 5353 закрыт"                            "! $P fd78::1 udp 5353 fd78::2"
+t "v6: даже адрес из whitelist_v6 не проходит"      "! $P fd78::1 tcp 8443 fd78::a"
+t "v6: ICMPv6 echo не проходит"                     "! ip netns exec $C ping -6 -c1 -W2 fd78::1"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: emergency-v6 (all checks)"; else echo "FAILED: $fails checks"; exit 1; fi

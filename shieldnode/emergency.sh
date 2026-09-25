@@ -34,6 +34,8 @@ EOF
         type filter hook prerouting priority -150; policy accept;
         # loopback ПЕРВЫМ: без него emergency режет lo → мёртвый локальный DNS
         iifname "lo" accept
+        # 2026-09-25 (v1.2.0): IPv6 fail-safe и в аварийном режиме (IPv6 выключен обязательно)
+        meta nfproto ipv6 drop
         ct state established,related accept
         ip saddr @whitelist_v4 accept
         ip6 saddr @whitelist_v6 accept

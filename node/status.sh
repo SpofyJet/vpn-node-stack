@@ -13,13 +13,17 @@ node_status() {
     source "$NODE_DIR/lib/udp.sh";       node_udp_plan
     source "$NODE_DIR/lib/network.sh";   node_network_plan
     source "$NODE_DIR/lib/limits.sh";    node_limits_plan
-    source "$NODE_DIR/lib/services.sh";  node_harden_ipv6   # ipv6-ключи видны в сверке
+    source "$NODE_DIR/lib/ipv6.sh"
 
     echo "node v$NODE_VERSION status — $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     # 2026-09-23 (v1.1.4): ожидание reboot после XanMod — первым делом, заметно (stdout)
     if node_xanmod_reboot_pending; then
         node_reboot_notice "kernel: XanMod установлен ($(cut -f2 "$(node_xanmod_pending_file)" 2>/dev/null)), ОЖИДАЕТ REBOOT — активно $(uname -r). Выполни: sudo reboot" 1
     fi
+    # 2026-09-25 (v1.2.0, P1-4): IPv6 — инвариант стека
+    if node_ipv6_kernel_off; then echo "ipv6: выключен в ядре (ipv6.disable=1)"
+    elif node_ipv6_reboot_pending; then node_reboot_notice "IPv6: ipv6.disable=1 добавлен в GRUB, активируется после reboot (сейчас выключен через sysctl)" 1
+    else echo "ipv6: выключен через sysctl (ipv6.disable=1 в cmdline нет — повтори apply)"; fi
     echo "======================================================================"
     printf '%-46s %-14s %-14s %s\n' "parameter" "expected" "actual" "ok"
     echo "----------------------------------------------------------------------"

@@ -61,6 +61,11 @@ shield_contract_write() {
         echo "version=$SHIELD_VERSION"
         echo "table=inet/shieldnode"
         echo "conntrack_owner=no (node)"
+        # 2026-09-25 (v1.2.0): реальные порты для node (ip_local_reserved_ports) — DIAGNOSIS P0-1
+        echo "ssh_ports=${SH_F_SSH_PORTS:-}"
+        echo "inbound_tcp=${SH_IB_TCP:-}"
+        echo "inbound_udp=${SH_IB_UDP:-}"
+        echo "node_api_port=${SH_IB_API_PORT:-}"
         echo "updated=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     } >> "$tmp"
     chmod 0644 "$tmp"; mv "$tmp" "$conf"
@@ -223,6 +228,8 @@ shield_apply() {
     if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ] && [ "$(shield_crowdsec_resolve_mode)" = "agent" ]; then
         shield_crowdsec_agent_ensure || true
     fi
+    # таблица пересоздана с пустыми наборами — метки «уже применено» больше не правда (P1-3)
+    rm -f "${SHIELD_BLOCKLIST_STATE:-/var/lib/shieldnode/blocklists}"/.applied-*.sha256 2>/dev/null || true
     shield_blocklist_install
     shield_guard_link
     rm -f "$tmp"

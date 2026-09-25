@@ -17,6 +17,10 @@ SHIELD_GUARD_SNAPSHOT="${SHIELD_GUARD_SNAPSHOT:-$SHIELD_STATE_DIR/guard-snapshot
 guard_counters() { nft_counters; }
 guard_set_elems() { nft_set_elem_count "$1"; }
 
+# --- источники проблем: health и verify (отдельные функции — тест подменяет их) ---
+_g_health() { ( source "$SHIELD_DIR/ssh.sh"; source "$SHIELD_DIR/lib/crowdsec.sh"; source "$SHIELD_DIR/status.sh"; shield_health ) 2>/dev/null || true; }
+_g_verify() { ( source "$SHIELD_DIR/lib/ports.sh"; shield_verify ) 2>/dev/null || true; }
+
 # --- оформление: цвета только в терминале, без NO_COLOR ---
 _g_colors() {
     G_0="" G_B="" G_D="" G_G="" G_Y="" G_R="" G_C=""
@@ -174,45 +178,23 @@ _g_draw() {
         printf '  └─ обновлены %s%s\n\n' "$ago" "${nxt:+, $nxt}"
     fi
 
-    # 5) проблемы — только если есть
-    local probs="" svc f cnt
+    # 5) проблемы — 2026-09-25 (v1.2.0, E5): ЕДИНЫЙ источник — health (+ verify). Раньше guard
+    # проверял своё подмножество и писал «Проблем не найдено» при health WARN=12.
+    local probs="" f G_HEALTH="" admin_ip
     if [ "$G_FW" != "ABSENT" ]; then
-        systemctl is-enabled --quiet shieldnode.service 2>/dev/null \
-            || probs="${probs}фаервол не восстановится после перезагрузки — sudo vpn-node → «Обновить стек»"$'\n'
-        systemctl is-active --quiet shieldnode-blocklist.timer 2>/dev/null \
-            || probs="${probs}автообновление блок-листов остановлено — sudo vpn-node → «Обновить стек»"$'\n'
-        if [ -e "${SHIELD_UNIT_DIR:-/etc/systemd/system}/shieldnode-blocklist-crowdsec.timer" ] && ! systemctl is-active --quiet shieldnode-blocklist-crowdsec.timer 2>/dev/null; then
-            probs="${probs}автообновление CrowdSec остановлено — sudo vpn-node → «Обновить стек»"$'\n'
+        G_HEALTH="$(_g_health)"
+        probs="$(sed -n 's/^  \[\(FAIL\|WARN\)\] \(.*\)$/\1: \2/p' <<<"$G_HEALTH" | sed 's/^FAIL: /✘ /; s/^WARN: //')"
+        if [ -z "$(sed -n 's/^  health: \(FAIL=[0-9]* WARN=[0-9]*\).*/\1/p' <<<"$G_HEALTH")" ]; then
+            probs="${probs:+$probs$'\n'}полная проверка не выполнилась — запусти: sudo vpn-node → «Полная проверка»"
         fi
-        for f in "$SHIELD_STATE_DIR"/blocklists/.alert-*; do
-            [ -e "$f" ] || continue
-            probs="${probs}блок-лист «$(basename "$f" | sed 's/^\.alert-//')» не обновляется с $(cut -c1-16 "$f" 2>/dev/null | tr T ' ') — нет сети или источник недоступен (старый список продолжает работать)"$'\n'
-        done
-        # SSH слушает?
-        local ssh_port ss_out
-        ssh_port="$(shield_conf_get SSH_PORT "")"
-        [ -z "$ssh_port" ] && ssh_port="$(shield_detect_ssh_ports 2>/dev/null | awk '{print $1}')" || true
-        [ -z "$ssh_port" ] && ssh_port=22
-        ss_out=""; command -v ss >/dev/null 2>&1 && ss_out="$(ss -tlnp 2>/dev/null || true)"
-        grep -q ":$ssh_port " <<<"$ss_out" || probs="${probs}SSH не слушает порт $ssh_port — проверь sshd, иначе потеряешь доступ"$'\n'
-        # IP админа в белом списке? (nft get element — учитывает CIDR-диапазоны)
-        local admin_ip wl_set
+        if [ "$G_FW" = ACTIVE ]; then
+            local vout; vout="$(_g_verify)"
+            while IFS= read -r f; do
+                case "$f" in *✘*) probs="${probs:+$probs$'\n'}✘ ${f#*✘ }" ;; esac
+            done <<<"$vout"
+        fi
         admin_ip="$(shield_detect_admin_ip 2>/dev/null || true)"
-        if [ -n "$admin_ip" ]; then
-            wl_set=whitelist_v4; case "$admin_ip" in *:*) wl_set=whitelist_v6 ;; esac
-            if nft get element inet shieldnode "$wl_set" "{ $admin_ip }" >/dev/null 2>&1; then
-                G_ADMIN_OK="$admin_ip"
-            else
-                probs="${probs}ваш IP $admin_ip не в белом списке — его могут задеть лимиты SSH: пункт 3 (Доверенные IP) или повтори применение фаервола"$'\n'
-            fi
-        fi
-        # conntrack (владелец node) — предупреждаем при заполнении
-        if [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
-            local cc cm; cc="$(cat /proc/sys/net/netfilter/nf_conntrack_count)"; cm="$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
-            [ "$cm" -gt 0 ] && [ $((cc * 100 / cm)) -ge 80 ] && probs="${probs}таблица соединений заполнена на $((cc * 100 / cm))% — при 100% новые клиенты не подключатся"$'\n'
-        fi
-        local pr_out; pr_out="$(nft list chain inet shieldnode prerouting 2>/dev/null || true)"
-        grep -q 'iifname "lo" accept' <<<"$pr_out" || probs="${probs}нет правила loopback-accept — повтори применение фаервола"$'\n'
+        case "$admin_ip" in ''|*:*) ;; *) nft get element inet shieldnode whitelist_v4 "{ $admin_ip }" >/dev/null 2>&1 && G_ADMIN_OK="$admin_ip" ;; esac
     fi
     if [ -n "$probs" ]; then
         printf '  %s⚠ Требует внимания%s\n' "$G_Y" "$G_0"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # node — lib/kernel.sh: BBR + (опц.) XanMod-ядро. Требование: авто-BBR когда ядро
-# умеет; XanMod — ENABLE_XANMOD=1 (с 2026-09-24, v1.1.6 — ПО УМОЛЧАНИЮ, решение оператора).
+# умеет; XanMod — ENABLE_XANMOD=1 (с v1.2.0 — по запросу, DIAGNOSIS P1-5).
 # Никогда не ребутаем сами; откат ядра — restore grub-файла + purge (документирован).
 set -euo pipefail
 
@@ -115,7 +115,7 @@ node_xanmod_pkg() {
 # Безопасность: backup grub-файла, pin-файл apt, БЕЗ авто-ребута; после ребута
 # повторный `node apply` доведёт BBR (модуль в комплекте ядра).
 node_xanmod_install() {
-    [ "$(node_conf_get ENABLE_XANMOD 1)" = "1" ] || return 0
+    [ "$(node_conf_get ENABLE_XANMOD 0)" = "1" ] || return 0
     node_kernel_is_xanmod && { log info "kernel" "ядро уже XanMod ($(uname -r))"; return 0; }
     # 2026-09-24 (v1.1.6): ENABLE_XANMOD=1 стал дефолтом. Дефолт (ключа нет в node.conf) —
     # «мягкий»: где XanMod не нужен/невозможен — info/warn и пропуск, apply не падает
@@ -157,8 +157,10 @@ node_xanmod_install() {
     # 2026-09-24 (v1.1.6): источник XanMod уже настроен другим инструментом/вручную — не
     # дублируем (дубль источника = предупреждения apt) и НЕ перезаписываем чужой ключ
     local foreign="" own_repo=0 codename=""
+    # 2026-09-25 (v1.2.0, E7): `|| true` на ВЕСЬ конвейер — без чужого источника второй grep
+    # получает пустой ввод и выходит 1, pipefail+set -e обрывали шаг: XanMod не ставился нигде
     foreign="$( { grep -rlsE '^[^#]*deb(\[[^]]*\])?[[:space:]].*deb\.xanmod\.org' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true; } \
-        | grep -vxF "$XANMOD_REPO_LIST" | awk 'NR == 1')"
+        | grep -vxF "$XANMOD_REPO_LIST" | awk 'NR == 1' || true)"
     if [ -n "$foreign" ]; then
         log info "kernel" "источник XanMod уже настроен ($foreign) — используем его, свой не добавляем"
     else
