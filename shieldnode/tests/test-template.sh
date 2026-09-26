@@ -36,7 +36,8 @@ export SH_F_ENABLE_ANTISPOOF=0
 export SH_F_ENABLE_SSH_PROTECTION=1 SH_F_ENABLE_INVALID_DROP=1 SH_F_ENABLE_LOOPBACK=1
 export SH_F_ENABLE_ESTABLISHED=1 SH_F_ENABLE_ABUSE_LIMITING=1 SH_F_ENABLE_SYN_PROTECTION=1
 export SH_R_SSH_CONN_MAX=8 SH_R_SSH_NEW_RATE=10 SH_R_SSH_NEW_BURST=20
-export SH_R_TCP_NEW_RATE=300 SH_R_TCP_NEW_BURST=600 SH_R_TCP_SYN_RATE=50 SH_R_TCP_SYN_BURST=100
+export SH_R_TCP_NEW_RATE=40000 SH_R_TCP_NEW_BURST=60000 SH_R_TCP_SYN_RATE=2000 SH_R_TCP_SYN_BURST=3000
+export SH_R_TCP_SYN_BAN_RATE=0 SH_R_TCP_SYN_BAN_BURST=20000
 export SH_R_TCP_CONN_MAX=15000 SH_R_TCP_GLOBAL_CEIL=8000
 export SH_R_UDP_RATE=20000 SH_R_UDP_BURST=40000 SH_R_UDP_GLOBAL_CEIL=20000
 export SH_R_SSH_ABUSERS_TIMEOUT=3600 SH_R_SSH_ABUSERS_SIZE=65536
@@ -128,6 +129,15 @@ t "SYN_PROTECTION=0 убирает syn-meter, НЕ трогает new-rate/conn-
 SH_F_ENABLE_SYN_PROTECTION=1
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-synback.nft
 t "SYN_PROTECTION=1 возвращает syn-meter" bash -c "grep -q 'meter tcp_syn' /tmp/shieldnode-test/ruleset-synback.nft"
+t "транзит (daddr не нода) пропускается ДО API-ноды/whitelist/лимитов" bash -c "awk '/iif \"lo\" accept/{l=NR} /fib daddr type unicast accept/{f=NR} /tcp dport @node_api_port/{a=NR} END{exit !(l && f && a && l < f && f < a)}' '$RS'"
+# 2026-09-27 (v1.2.2): как старый shield 4.1.0 (CGNAT-safe) — по умолчанию per-IP лимиты НЕ банят никого
+t "по умолчанию нет ни одного авто-бана по частоте (add @tcp_abusers / add @udp_abusers)" bash -c "! grep -q 'add @tcp_abusers' '$RS' && ! grep -q 'add @udp_abusers' '$RS' && ! grep -q 'meter tcp_synflood' '$RS'"
+t "TCP: мягкий SYN-лимит 2000/с burst 3000 без бана" bash -c "grep -q 'meter tcp_syn { ip saddr limit rate over 2000/second burst 3000 packets } counter name c_drops_syn_limit_v4 drop' '$RS'"
+t "TCP: мягкий лимит новых 40000/мин burst 60000 без бана" bash -c "grep -q 'meter tcp_new { ip saddr limit rate over 40000/minute burst 60000 packets } counter name c_drops_newconn_limit_v4 drop' '$RS'"
+t "UDP: 20000/с burst 40000 без бана" bash -c "grep -q 'meter udp_rate { ip saddr limit rate over 20000/second burst 40000 packets } counter name c_drops_udp_limit_v4 drop' '$RS'"
+t "abuse-наборы остаются и их drop-правила (перенос банов, ручные баны)" bash -c "grep -q 'ip saddr @tcp_abusers counter name c_drops_tcp_abusers_v4 drop' '$RS' && grep -q 'ip saddr @udp_abusers counter name c_drops_udp_abusers_v4 drop' '$RS'"
+SH_R_TCP_SYN_BAN_RATE=20000 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-synban.nft
+t "опц. TCP_SYN_BAN_RATE=20000: ровно одно бан-правило, ДО мягкого лимита" bash -c "test \$(grep -c 'add @tcp_abusers ' /tmp/shieldnode-test/ruleset-synban.nft) = 1 && grep -q 'meter tcp_synflood { ip saddr limit rate over 20000/second burst 20000 packets } add @tcp_abusers' /tmp/shieldnode-test/ruleset-synban.nft && awk '/meter tcp_synflood /{f=NR} /meter tcp_syn \\{/{s=NR} END{exit !(f && s && f < s)}' /tmp/shieldnode-test/ruleset-synban.nft"
 
 # --- агрегаторские блоклисты: сеты + drop-правила ПОСЛЕ whitelist ---
 t "blocklist: наборы scanner/threat/custom (tor выключен)" bash -c "grep -q 'set scanner_blocklist_v4' '$RS' && grep -q 'set threat_blocklist_v4' '$RS' && grep -q 'set custom_blocklist_v4' '$RS' && ! grep -q 'set tor_exit_blocklist_v4' '$RS'"
@@ -197,7 +207,7 @@ t "persist: net.netfilter.* в security-sysctl плане НЕТ (владеле
 
 echo
 # базовый цикл = 23 (22 + antispoof_v6); +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 27
-t "counters: 29 именованных счётчиков (23 базовых + spamhaus/cins/amp/icmp + ipv6_failsafe/nodeapi v1.2.0)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 29"
+t "counters: 35 именованных счётчиков (23 базовых + spamhaus/cins/amp/icmp + ipv6_failsafe/nodeapi v1.2.0 + syn_limit/newconn_limit v1.2.1 + udp_limit v1.2.2)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 35"
 t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
 # 2026-09-24 (v1.1.4): backlog #4 — лимит стал per-source (meter по saddr); литерал глобальной

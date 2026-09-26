@@ -140,11 +140,12 @@ fx() { # <processed> <dropped> <ovf> <retrans> <out> <rcvbuf> <steal> <total> <m
     echo 1000 > "$OUT/sys/class/net/eth0/statistics/rx_packets"; echo 0 > "$OUT/sys/class/net/eth0/statistics/rx_dropped"
     echo "$9" > "$OUT/sys/class/net/eth0/statistics/rx_missed_errors"; echo 0 > "$OUT/sys/class/net/eth0/statistics/tx_dropped"; }
 export NODE_SYS_ROOT="$OUT/sys"
+mkdir -p "$OUT/proc/sys/kernel/random"; echo "aaaaaaaa-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
 fx 1000 0 0 0 1000 0 0 10000 0; node_perf_snapshot > "$OUT/base.txt"
 t "снапшот: все ключевые счётчики" 'for k in softnet_dropped TcpExtListenOverflows TcpRetransSegs UdpRcvbufErrors cpu_steal nic_rx_missed_errors; do grep -q "^$k=" "$OUT/base.txt" || exit 1; done'
 fx 2000 0 0 10 2000 0 0 20000 0; node_perf_report "$OUT/base.txt" > "$OUT/r1"
 t "отчёт без нагрузки: «нет сигналов узкого места»" 'grep -q "нет сигналов" "$OUT/r1" && ! grep -q "LIMIT" "$OUT/r1"'
-fx 5000 7 3 200 3000 4 900 20000 11; node_perf_report "$OUT/base.txt" > "$OUT/r2"
+fx 5000 7 3 200 3000 4 900 20000 150; node_perf_report "$OUT/base.txt" > "$OUT/r2"
 t "отчёт: softnet backlog overflow"        'grep -q "LIMIT: softnet backlog" "$OUT/r2"'
 t "отчёт: accept-очередь"                  'grep -q "LIMIT: accept-очередь" "$OUT/r2"'
 t "отчёт: UDP receive buffer"              'grep -q "LIMIT: UDP receive buffer" "$OUT/r2"'
@@ -154,6 +155,20 @@ t "отчёт: steal 9% (900/10000) — гипервизор" 'grep -q "steal=9.
 fx 10 0 0 0 10 0 0 100 0; node_perf_report "$OUT/base.txt" > "$OUT/r3"
 t "отчёт: счётчики меньше baseline -> «был reboot»" 'grep -q "был reboot" "$OUT/r3"'
 t "отчёт без baseline — понятное сообщение" 'node_perf_report "$OUT/nope" | grep -q "baseline нет"'
+# v1.2.1 (живая нода): единичный дроп NIC за 13 мин — не «LIMIT»
+fx 2000 0 0 10 2000 0 0 20000 1; node_perf_report "$OUT/base.txt" > "$OUT/r4"
+t "v1.2.1: 1 дроп NIC — без LIMIT" '! grep -q "LIMIT: NIC" "$OUT/r4"'
+# v1.2.1 (лаба): squeeze 2.7% на ~270 пакетах за 18 с после apply — шум, не предел
+echo "aaaaaaaa-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
+printf '%08x 00000000 %08x\n' 1270 7 > "$OUT/proc/net/softnet_stat"; node_perf_report "$OUT/base.txt" > "$OUT/r6"
+t "v1.2.1: squeeze на малой выборке — без LIMIT" '! grep -q "LIMIT: NAPI" "$OUT/r6"'
+printf '%08x 00000000 %08x\n' 501000 5000 > "$OUT/proc/net/softnet_stat"; node_perf_report "$OUT/base.txt" > "$OUT/r7"
+t "v1.2.1: squeeze 1% на 500 000 пакетов — LIMIT есть" 'grep -q "LIMIT: NAPI" "$OUT/r7"'
+# v1.2.1 (живая нода): apply -> reboot -> status: счётчики нового boot уже больше baseline,
+# старый признак «меньше baseline» не срабатывал — squeeze=-0.392%. Теперь по boot_id.
+echo "bbbbbbbb-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
+fx 5000 0 0 10 5000 0 0 50000 0; node_perf_report "$OUT/base.txt" > "$OUT/r5"
+t "v1.2.1: после reboot (другой boot_id) — «был reboot», без отрицательных дельт" 'grep -q "был reboot" "$OUT/r5" && ! grep -q "squeeze=-" "$OUT/r5"'
 unset NODE_PROC_ROOT NODE_SYS_ROOT; export DRY_RUN=0
 
 # ---------- XPS по scaling.rst ----------

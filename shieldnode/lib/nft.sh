@@ -132,7 +132,7 @@ EOF
         # Счётчик = метаданные ядра, в userspace ничего не копируется, стоимость ~0.
         echo "    # --- drop-counters (zero-cost observability)"
         local __c
-        for __c in scanner_v4 scanner_v6 threat_v4 threat_v6 tor_v4 tor_v6 custom_v4 custom_v6 antispoof antispoof_v6 invalid temp_v4 temp_v6 ssh_abusers_v4 ssh_abusers_v6 tcp_abusers_v4 tcp_abusers_v6 udp_abusers_v4 udp_abusers_v6 syn_v4 syn_v6 global_tcp global_udp; do
+        for __c in scanner_v4 scanner_v6 threat_v4 threat_v6 tor_v4 tor_v6 custom_v4 custom_v6 antispoof antispoof_v6 invalid temp_v4 temp_v6 ssh_abusers_v4 ssh_abusers_v6 tcp_abusers_v4 tcp_abusers_v6 udp_abusers_v4 udp_abusers_v6 syn_v4 syn_v6 syn_limit_v4 syn_limit_v6 newconn_limit_v4 newconn_limit_v6 udp_limit_v4 udp_limit_v6 global_tcp global_udp; do
             echo "    counter c_drops_$__c { }"
         done
         # crowdsec/spamhaus/cins-counters — только при включённом фиде (правила тоже условные)
@@ -184,6 +184,11 @@ EOF
 EOF
         fi
         cat <<'EOF'
+        # 2026-09-27 (v1.2.1): транзит (адрес назначения — не нода: исходящие Docker-контейнеров в bridge,
+        # гости LXD/KVM) — не клиенты ноды, per-IP лимиты к нему не относятся. Лаба: хост с shieldnode
+        # забанил свою VM за 400 исходящих соединений на :443. На -150 DNAT ещё не случился — входящие
+        # к опубликованным портам Docker имеют адрес ноды (local) и проверяются дальше как раньше.
+        fib daddr type unicast accept
         # API ноды — только панель (TRUSTED_IPS + UFW «allow from» для этого порта); ДО whitelist:
         # сессия админа по SSH к API ноды доступа не даёт (DIAGNOSIS P0-2)
         tcp dport @node_api_port ip saddr != @node_api_allow_v4 counter name c_drops_nodeapi drop
@@ -320,20 +325,33 @@ EOF
             # ENABLE_SYN_PROTECTION: мастер-выключатель именно SYN-rate правила
             # (new-rate и conn-limit независимы и остаются при SYN_PROTECTION=0)
             if [ "${SH_F_ENABLE_SYN_PROTECTION:-1}" = "1" ]; then
+                # 2026-09-27 (v1.2.2): как в старом shield 4.1.0 (SHIELD_CGNAT_SAFE=1) — превышение per-IP лимитов
+                # НЕ банит IP, лишние пакеты просто отбрасываются: общий IP мобильного оператора / Wi-Fi
+                # (CGNAT, до ~200 абонентов) не выключается целиком. Бан за SYN-флуд — только по желанию
+                # (TCP_SYN_BAN_RATE > 0), по умолчанию выключен.
+                [ "$SH_R_TCP_SYN_BAN_RATE" -gt 0 ] && cat <<EOF
+        # опц. бан за SYN-флуд: > $SH_R_TCP_SYN_BAN_RATE SYN/с (burst $SH_R_TCP_SYN_BAN_BURST) с одного IP -> бан на ${SH_R_TCP_ABUSERS_TIMEOUT} с
+        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_synflood { ip saddr limit rate over $SH_R_TCP_SYN_BAN_RATE/second burst $SH_R_TCP_SYN_BAN_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v4 drop
+EOF
+                [ "$SH_R_TCP_SYN_BAN_RATE" -gt 0 ] && [ "$SH_F_IPV6" = "1" ] && cat <<EOF
+        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_synflood6 { ip6 saddr limit rate over $SH_R_TCP_SYN_BAN_RATE/second burst $SH_R_TCP_SYN_BAN_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v6 drop
+EOF
                 cat <<EOF
-        # TCP-политика (§23): SYN-флуд per-src > $SH_R_TCP_SYN_RATE/s burst $SH_R_TCP_SYN_BURST
-        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn { ip saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v4 drop
+        # мягкий лимит SYN > $SH_R_TCP_SYN_RATE/с (burst $SH_R_TCP_SYN_BURST) с одного IP: лишние SYN отбрасываются БЕЗ бана
+        # (старый shield: 2000/с; CGNAT 200 абонентов при reconnect-шторме ≈ 2000 SYN/с; флуд — 50k-500k/с)
+        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn { ip saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } counter name c_drops_syn_limit_v4 drop
 EOF
                 [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn6 { ip6 saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v6 drop
+        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn6 { ip6 saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } counter name c_drops_syn_limit_v6 drop
 EOF
             fi
             cat <<EOF
-        # TCP-политика: новые соединения per-src > $SH_R_TCP_NEW_RATE/min burst $SH_R_TCP_NEW_BURST
-        tcp dport @protected_tcp ct state new meter tcp_new { ip saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_tcp_abusers_v4 drop
+        # мягкий лимит новых соединений per-src > $SH_R_TCP_NEW_RATE/мин burst $SH_R_TCP_NEW_BURST — лишние отбрасываются, без бана
+        # (старый shield: 40000/мин burst 60000 — reconnect-шторм CGNAT 200 абонентов ≈ 10000/мин)
+        tcp dport @protected_tcp ct state new meter tcp_new { ip saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } counter name c_drops_newconn_limit_v4 drop
 EOF
             [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        tcp dport @protected_tcp ct state new meter tcp_new6 { ip6 saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } add @tcp_abusers_v6 { ip6 saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_tcp_abusers_v6 drop
+        tcp dport @protected_tcp ct state new meter tcp_new6 { ip6 saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } counter name c_drops_newconn_limit_v6 drop
 EOF
             cat <<EOF
         # TCP-политика: > $SH_R_TCP_CONN_MAX одновременных conntrack с одного src (CGNAT-лояльно)
@@ -354,11 +372,12 @@ EOF
 EOF
             [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @udp_abusers_v6 counter name c_drops_udp_abusers_v6 drop"
             cat <<EOF
-        # UDP-политика (§23): per-src > $SH_R_UDP_RATE/s burst $SH_R_UDP_BURST
-        udp dport @protected_udp meter udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } add @udp_abusers { ip saddr timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s } counter name c_drops_udp_abusers_v4 drop
+        # UDP-политика (§23, v1.2.2): per-src > $SH_R_UDP_RATE/s burst $SH_R_UDP_BURST — лишние пакеты отбрасываются
+        # БЕЗ бана (как старый shield, CGNAT-safe): стрим 4K за общим IP не выключает соседей на 15 мин
+        udp dport @protected_udp meter udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } counter name c_drops_udp_limit_v4 drop
 EOF
             [ "$SH_F_IPV6" = "1" ] && cat <<EOF
-        udp dport @protected_udp meter udp_rate6 { ip6 saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } add @udp_abusers_v6 { ip6 saddr timeout ${SH_R_UDP_ABUSERS_TIMEOUT}s } counter name c_drops_udp_abusers_v6 drop
+        udp dport @protected_udp meter udp_rate6 { ip6 saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } counter name c_drops_udp_limit_v6 drop
 EOF
             if [ "$SH_R_UDP_GLOBAL_CEIL" -gt 0 ]; then
                 cat <<EOF

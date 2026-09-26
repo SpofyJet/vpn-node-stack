@@ -98,6 +98,9 @@ node_softnet_value() {
 node_perf_snapshot() {
     local pr="${NODE_PROC_ROOT:-/proc}" sr="${NODE_SYS_ROOT:-/sys}" ifname k
     echo "ts=$(date +%s)"
+    # 2026-09-26 (v1.2.1): счётчики ядра обнуляются при загрузке — без boot_id дельты «с apply»
+    # после reboot выходили отрицательными (живая нода: squeeze=-0.392%)
+    echo "boot_id=$(tr -d '-' < "$pr/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)"
     if declare -F node_softnet_read >/dev/null 2>&1; then
         unset _NODE_SN_READ; node_softnet_read   # свежее чтение, не кэш плана
         echo "softnet_processed=$_NODE_SN_PROC"; echo "softnet_dropped=$_NODE_SN_DROP"; echo "softnet_squeeze=$_NODE_SN_SQZ"
@@ -131,6 +134,7 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
         function d(k) { return c[k] - b[k] }
         END {
             dt = d("ts"); if (dt <= 0) dt = 1
+            if (b["boot_id"] != "" && c["boot_id"] != "" && b["boot_id"] != c["boot_id"]) { print "perf: после apply был reboot — счётчики ядра обнулились; дельты появятся после следующего apply"; exit }
             if (d("softnet_processed") < 0 || d("cpu_total") < 0) { print "perf: счётчики меньше baseline — был reboot; повтори apply для нового baseline"; exit }
             ret = (d("TcpOutSegs") > 0) ? 100 * d("TcpRetransSegs") / d("TcpOutSegs") : 0
             sq  = (d("softnet_processed") > 0) ? 100 * d("softnet_squeeze") / d("softnet_processed") : 0
@@ -140,12 +144,15 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
                 dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, d("UdpRcvbufErrors"), st, si, d("nic_rx_dropped"), d("nic_rx_missed_errors")
             n = 0
             if (d("softnet_dropped") > 0)        { n++; print "  LIMIT: softnet backlog overflow — netdev_max_backlog (AUTO_SOFTNET_TUNE при следующем apply) / ENABLE_RPS" }
-            if (sq > 0.1)                        { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
+            # v1.2.1: как и автонастройка — только на выборке >= 100 000 пакетов (лаба: 7 событий из ~270 за 18 с)
+            if (sq > 0.1 && d("softnet_processed") >= 100000) { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
             if (d("TcpExtListenOverflows") > 0 || d("TcpExtListenDrops") > 0) { n++; print "  LIMIT: accept-очередь переполняется — somaxconn/tcp_max_syn_backlog или backlog inbound xray" }
             if (d("UdpRcvbufErrors") > 0)        { n++; print "  LIMIT: UDP receive buffer — rmem_default/udp_mem (QUIC/Hysteria2)" }
             if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
             if (st > 5)                          { n++; printf "  NOTE: CPU steal %.1f%% — конкуренция на гипервизоре; тюнинг хоста не поможет\n", st }
-            if (d("nic_rx_missed_errors") > 0 || d("nic_rx_dropped") > 0) { n++; print "  LIMIT: NIC дропает на приёме — NIC_RING_RX / ENABLE_NIC_OFFLOAD_OPT (кольца до max)" }
+            # v1.2.1: единичные дропы (живая нода: +1 за 13 мин) — не предел; > 0.1% пакетов или >= 100
+            nd = d("nic_rx_missed_errors") + d("nic_rx_dropped"); np = d("nic_rx_packets")
+            if (nd >= 100 || (np > 0 && 1000 * nd > np)) { n++; printf "  LIMIT: NIC дропает на приёме (%d пакетов) — NIC_RING_RX / ENABLE_NIC_OFFLOAD_OPT (кольца до max)\n", nd }
             if (n == 0) print "  нет сигналов узкого места на стороне хоста с момента apply"
         }' "$base" "$cur"
     rm -f "$cur"
@@ -199,7 +206,11 @@ node_datapath_plan() {
     pct="$(node_conf_get TCP_MEM_PCT 25)"
     [[ "$pct" =~ ^[0-9]+$ ]] || pct=25
     [ "$pct" -gt 0 ] && [ "$pct" -le 80 ] || pct=25
-    memp=$(( pages * pct / 100 ))
+    # 2026-09-26 (v1.2.1): кратно 256 страницам (1 МиБ). MemTotal «плавает» на десятки КБ между
+    # загрузками (живая нода: 250573 -> 250572 после reboot) — план менялся на 1 страницу, status
+    # показывал ложный ✗, а каждый apply переписывал sysctl-файл
+    memp=$(( pages * pct / 100 / 256 * 256 ))
+    [ "$memp" -ge 256 ] || memp=256
     node_sysctl_add "$f" net.ipv4.tcp_mem "$((memp*3/4)) $((memp*7/8)) $memp"
 
     # 2026-09-24 (v1.1.7): rmem_default/wmem_default — дефолтный буфер ВСЕХ не-TCP сокетов

@@ -275,10 +275,11 @@ shield_config_ensure() {
 # ENABLE_ABUSE_LIMITING=1
 # SSH_CONN_MAX=8
 # SSH_NEW_RATE=10        # новых SSH-коннектов/мин с одного IP, burst 20
-# TCP_NEW_RATE=300       # новых коннектов/мин с одного IP на защищённые TCP-порты
-# TCP_SYN_RATE=50        # SYN/с с одного IP
+# TCP_NEW_RATE=40000     # новых коннектов/мин с одного IP: лишние отбрасываются, IP не банится
+# TCP_SYN_RATE=2000      # SYN/с с одного IP: лишние отбрасываются, IP не банится
+# TCP_SYN_BAN_RATE=0     # >0 — банить IP за SYN-флуд выше этого (SYN/с); 0 = никогда не банить
 # TCP_CONN_MAX=15000     # conntrack-лимит с одного IP (CGNAT-лояльно)
-# UDP_RATE=20000         # UDP-пакетов/с с одного IP (Hysteria2: ~9.3k pps на
+# UDP_RATE=20000         # UDP-пакетов/с с одного IP, лишние отбрасываются без бана (Hysteria2: ~9.3k pps на
 # UDP_BURST=40000        #   100 Мбит/с; безопасный минимум после GRO-анализа —
 #                        #   легитимный QUIC коалесцируется и считается заниженно,
 #                        #   флуд с рандомных портов — по полному wire-pps)

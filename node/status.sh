@@ -36,7 +36,12 @@ node_status() {
         actual="$(sysctl -n "$k" 2>/dev/null || echo '?')"
         # 2026-09-24 (v1.1.5): многозначные ключи ядро печатает через TAB, план — через пробел
         actual="${actual//$'\t'/ }"
-        if [ "$actual" = "$v" ]; then st="✓"; else st="✗"; fi
+        if [ "$actual" = "$v" ]; then st="✓"
+        # 2026-09-26 (v1.2.1): tcp_mem считается от MemTotal, который «плавает» между загрузками —
+        # расхождение в пределах 1% по каждому числу не ошибка (значение применено при apply)
+        elif [ "$k" = net.ipv4.tcp_mem ] && awk -v a="$actual" -v e="$v" 'BEGIN { n = split(a, x, " "); m = split(e, y, " "); if (n != m) exit 1
+                for (i = 1; i <= n; i++) { dd = x[i] - y[i]; if (dd < 0) dd = -dd; if (y[i] == 0 || dd * 100 > y[i]) exit 1 } }'; then st="✓≈"
+        else st="✗"; fi
         printf '%-46s %-14s %-14s %s\n' "$k" "$v" "$actual" "$st"
     done < "$NODE_PLAN_FILE"
     echo "----------------------------------------------------------------------"

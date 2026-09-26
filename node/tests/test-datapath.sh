@@ -38,7 +38,7 @@ replan
 
 # ожидаемые значения из реального /proc/meminfo
 kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-pages=$(( kb / 4 )); memp=$(( pages * 25 / 100 ))
+pages=$(( kb / 4 )); memp=$(( pages * 25 / 100 / 256 * 256 ))   # v1.2.1: кратно 1 МиБ
 exp_tcp_mem="$((memp*3/4)) $((memp*7/8)) $memp"
 tier_mb=$(( kb / 1024 ))
 if [ "$tier_mb" -le 2048 ]; then exp_rd=262144
@@ -81,6 +81,10 @@ fi
 printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"; replan
 t "plan: tcp_max_tw_buckets=524288" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	524288' '$PLAN'"
 t "plan: tcp_mem по формуле 25% RAM" bash -c "grep -q \"net.ipv4.tcp_mem	$exp_tcp_mem\" '$PLAN'"
+# v1.2.1 (живая нода): MemTotal после reboot на 16 КБ меньше — план tcp_mem не должен меняться
+printf 'MemTotal:        4009152 kB\n' > /tmp/node-dp-test/mi1; printf 'MemTotal:        4009136 kB\n' > /tmp/node-dp-test/mi2
+tm() { ( NODE_PROC_MEMINFO="$1"; replan; awk -F'\t' '$1 == "net.ipv4.tcp_mem" {print $2}' "$PLAN" ) 2>/dev/null; }
+t "v1.2.1: tcp_mem не меняется от колебания MemTotal на 16 КБ" bash -c "[ \"$(tm /tmp/node-dp-test/mi1)\" = \"$(tm /tmp/node-dp-test/mi2)\" ] && [ -n \"$(tm /tmp/node-dp-test/mi1)\" ]"
 # 2026-09-24 (v1.1.7): ревизия тюнинга — rmem/wmem_default по умолчанию НЕ пишутся (дефолт ядра)
 t "plan: rmem_default/wmem_default по умолчанию не трогаются" bash -c "! grep -qE 'net.core.[rw]mem_default' '$PLAN'"
 t "plan: dirty_background_bytes=64MB" bash -c "grep -q 'vm.dirty_background_bytes	67108864' '$PLAN'"
@@ -110,7 +114,7 @@ replan
 t "оверрайд: NETDEV_BUDGET=900" bash -c "grep -q 'net.core.netdev_budget	900' '$PLAN'"
 t "оверрайд: usecs следует за budget 900 -> 6000" bash -c "grep -q 'net.core.netdev_budget_usecs	6000' '$PLAN'"
 t "оверрайд: TW_BUCKETS=1048576" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	1048576' '$PLAN'"
-m30=$(( pages * 30 / 100 ))
+m30=$(( pages * 30 / 100 / 256 * 256 ))   # v1.2.1: кратно 1 МиБ
 exp30="$((m30*3/4)) $((m30*7/8)) $m30"
 t "оверрайд: TCP_MEM_PCT=30 пересчитан" bash -c "grep -q \"net.ipv4.tcp_mem	$exp30\" '$PLAN'"
 
