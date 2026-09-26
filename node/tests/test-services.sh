@@ -139,19 +139,13 @@ node_services_rollback
 t "static: откат без enable (static нельзя включать)" bash -c "! grep -q 'enable apt-daily' '$CALLS' || true"
 t "static: снапшот очищен" bash -c "! test -f '$NODE_SVC_STATE'"
 
-# --- сценарий 6: ipv6-план ---
-# 2026-09-24 (v1.1.7, решение оператора): дефолт HARDEN_IPV6=1 (IPv6 выключен); включить — явный =0
+# --- сценарий 6: ipv6 ---
+# 2026-09-25 (v1.2.0): IPv6 — инвариант (lib/ipv6.sh, test-ipv6.sh), в плане sysctl его нет:
+# ключи плана откатываются rollback'ом, а IPv6 не должен включаться никогда
 source "$NODE_DIR/lib/sysctl.sh"
 node_sysctl_plan_init
-DRY_RUN=1 node_harden_ipv6   # DRY_RUN: probed-пропуск без чтения sysctl
-n_ipv6="$(grep -c 'disable_ipv6' "$NODE_PLAN_FILE" || true)"
-t "дефолт (HARDEN_IPV6=1): 3 ipv6-ключа в плане" bash -c "[ '$n_ipv6' -eq 3 ]"
-# явный =0: строка пользователя идёт в кэш ПЕРВОЙ (first-match)
-sed -i '1i HARDEN_IPV6=0' "$CONFIG_CACHE"
-node_sysctl_plan_init
 DRY_RUN=1 node_harden_ipv6
-t "явный HARDEN_IPV6=0: IPv6 не выключается — план без disable_ipv6" bash -c "! grep -q 'disable_ipv6' '$NODE_PLAN_FILE'"
-sed -i '1d' "$CONFIG_CACHE"
+t "v1.2.0: disable_ipv6 не в откатываемом плане" bash -c "! grep -q 'disable_ipv6' '$NODE_PLAN_FILE'"
 
 # --- сценарий 7: маска-если-выжил (static/dbus resurrection, урок v5.10.3) ---
 mkunit dbus-daemon.service static active

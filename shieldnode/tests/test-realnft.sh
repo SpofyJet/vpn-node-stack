@@ -44,6 +44,8 @@ exec "$REAL_NFT" "\$@"
 EOF
 chmod +x "$OUT/bin/"*
 export PATH="$OUT/bin:$PATH"
+# v1.2.0: IPv6-состояние хоста — фикстура (свежий netns теста имеет IPv6 включённым)
+mkdir -p "$OUT/proc"; echo "BOOT_IMAGE=/vmlinuz ro ipv6.disable=1" > "$OUT/proc/cmdline"; export SHIELD_PROC="$OUT/proc"
 
 # --- настоящая таблица: ruleset из генератора (dry-run печатает, ничего не пишет) ---
 bash "$SHIELD_DIR/main.sh" --dry-run apply > "$OUT/dry.out" 2>/dev/null
@@ -60,13 +62,14 @@ t "status: health без FAIL на свежем ruleset" "grep -q 'health: FAIL=
 # 2026-09-23 (v1.1.4): `nft list chains inet shieldnode` — синтаксическая ошибка (list chains
 # принимает только family); под set -e/pipefail status молча умирал после секции firewall
 t "status: доходит до конца (секция persist / ownership)" "grep -q -- '--- persist / ownership ---' $OUT/status.out"
-t "status: в секции firewall перечислены цепочки prerouting и input" "grep -q '^  chain prerouting' $OUT/status.out && grep -q '^  chain input' $OUT/status.out"
+t "status: в секции firewall перечислены цепочки prerouting и v6_output" "grep -q '^  chain prerouting' $OUT/status.out && grep -q '^  chain v6_output' $OUT/status.out"
 
 # 2026-09-24 (v1.1.4): первый guard (снапшота нет, prev_ts=0) печатал «дельта за
 # <секунды с 1970>s» — на живой ноде «дельта за 1790200980s»
 NO_COLOR=1 bash "$SHIELD_DIR/main.sh" guard > "$OUT/guard1.out" 2>&1 || true
-t "guard: первый запуск — сводка счётчиков без «дельта за Ns»" \
-  "grep -q 'счётчиков ненулевые ---' $OUT/guard1.out && ! grep -q 'дельта за' $OUT/guard1.out"
+# 2026-09-25 (v1.1.7): новый дашборд — первый запуск без «+N — за …», итог и группы есть
+t "guard: первый запуск — итог без «+N — за …» (снапшота ещё нет)" \
+  "grep -qE '(Итого|пока ничего — атак не было)' $OUT/guard1.out && ! grep -q '+N — за' $OUT/guard1.out && grep -q '● работает' $OUT/guard1.out"
 
 # --- updater: эмитим через shield_blocklist_install в tmpfs-пути ---
 (

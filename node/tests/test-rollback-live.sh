@@ -115,8 +115,10 @@ printf 'fs.file-max\nnet.ipv6.conf.all.disable_ipv6\nnet.netfilter.nf_conntrack_
     NODE_PLAN_FILE="$OUT/plan"; printf 'net.core.somaxconn\t65535\t/etc/sysctl.d/99-z0-node-base.conf\n' > "$NODE_PLAN_FILE"
     node_sysctl_restore_dropped
 ) > /dev/null 2>&1 || true
-t "выпавшие из плана ключи -> исходные: file-max, disable_ipv6, udp_timeout" \
-  "grep -qx fs.file-max=9223372036854775807 $OUT/kv && grep -qx net.ipv6.conf.all.disable_ipv6=0 $OUT/kv && grep -qx net.netfilter.nf_conntrack_udp_timeout=30 $OUT/kv"
+t "выпавшие из плана ключи -> исходные: file-max, udp_timeout" \
+  "grep -qx fs.file-max=9223372036854775807 $OUT/kv && grep -qx net.netfilter.nf_conntrack_udp_timeout=30 $OUT/kv"
+# v1.2.0 (P1-4): disable_ipv6 — инвариант стека; реестр v1.1.x хранит «0», но IPv6 не включаем
+t "v1.2.0: disable_ipv6 НЕ возвращён в 0 (IPv6 остаётся выключен)" "! grep -qx net.ipv6.conf.all.disable_ipv6=0 $OUT/kv && grep -qx net.ipv6.conf.all.disable_ipv6=1 $OUT/kv"
 t "ключ, оставшийся в плане, не трогается (somaxconn=65535)" "grep -qx net.core.somaxconn=65535 $OUT/kv"
 printf 'net.ipv4.ip_local_reserved_ports=20443\n' >> "$OUT/kv"
 printf 'net.ipv4.ip_local_reserved_ports\t\n' >> "$NODE_STATE_DIR/sysctl-orig.tsv"; echo net.ipv4.ip_local_reserved_ports >> "$NODE_STATE_DIR/owner-keys.txt"

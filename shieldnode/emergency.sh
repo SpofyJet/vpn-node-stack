@@ -34,6 +34,8 @@ EOF
         type filter hook prerouting priority -150; policy accept;
         # loopback ПЕРВЫМ: без него emergency режет lo → мёртвый локальный DNS
         iifname "lo" accept
+        # 2026-09-25 (v1.2.0): IPv6 fail-safe и в аварийном режиме (IPv6 выключен обязательно)
+        meta nfproto ipv6 drop
         ct state established,related accept
         ip saddr @whitelist_v4 accept
         ip6 saddr @whitelist_v6 accept
@@ -72,9 +74,10 @@ shield_emergency() {
             local tmp bdump
             tmp="$(mktemp /run/shieldnode-emerg.XXXXXX.nft)"
             shield_emergency_ruleset > "$tmp"
-            mkdir -p "$SHIELD_BACKUP_DIR" /run/shieldnode
+            mkdir -p /run/shieldnode; shield_backup_dir_prep   # 2026-09-24 (v1.1.6): 0700/0600
             bdump="$SHIELD_BACKUP_DIR/emergency-$(date '+%Y%m%d-%H%M%S').nft"
-            shield_table_dump "$bdump" || true
+            ( umask 077; shield_table_dump "$bdump" ) || true
+            shield_backup_prune
             if [ "${DRY_RUN:-0}" != "1" ]; then
                 # порядок: СНАЧАЛА проверка (таблица ещё жива), потом delete, потом apply.
                 # delete решает и meter EBUSY, и дубли правил при повторном `emergency on`.

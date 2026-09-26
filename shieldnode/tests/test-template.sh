@@ -96,7 +96,9 @@ t "SSH-правила для обоих портов" bash -c "grep -q 'dport 22
 t "ct count SSH_CONN_MAX/TCP_CONN_MAX" bash -c "grep -q 'ct count over 8' '$RS' && grep -q 'ct count over 15000' '$RS'"
 t "invalid-drop флаговые правила (§22)" bash -c "grep -q 'ct state invalid counter name c_drops_invalid drop' '$RS' && grep -q 'fin|syn|rst|ack' '$RS'"
 t "established accept" grep -q 'ct state established,related accept' "$RS"
-t "loopback chain input" grep -q 'iifname "lo" accept' "$RS"
+t "loopback accept в prerouting (iif — по индексу), отдельной цепочки input нет (v1.2.0)" bash -c "grep -q 'iif \"lo\" accept' '$RS' && ! grep -q 'chain input' '$RS'"
+t "горячий путь: IPv6 fail-safe, затем established — первые правила prerouting" bash -c "awk '/chain prerouting/{f=1; next} f && /^[[:space:]]*(meta|ct|iif|tcp|udp|ip )/{print; n++} n==2{exit}' '$RS' | tr -s ' ' | grep -c . | grep -qx 2 && awk '/chain prerouting/{f=1; next} f && /^[[:space:]]*(meta|ct|iif)/{print; exit}' '$RS' | grep -q 'meta nfproto ipv6'"
+t "v6_output: IPv4 принимается первым правилом" bash -c "awk '/chain v6_output/{f=1; next} f && /^[[:space:]]*meta nfproto/{print; exit}' '$RS' | grep -q 'meta nfproto ipv4 accept'"
 t "фигурные скобки сбалансированы" bash -c "test \$(grep -o '{' '$RS' | wc -l) = \$(grep -o '}' '$RS' | wc -l)"
 t "нет пустых elements = { }" bash -c "! grep -q 'elements = {  *}' '$RS'"
 t "нет sysctl/conntrack-вмешательства (вне комментариев)" bash -c "! grep -vE '^[[:space:]]*#' '$RS' | grep -Eiq 'sysctl|nf_conntrack'"
@@ -195,7 +197,7 @@ t "persist: net.netfilter.* в security-sysctl плане НЕТ (владеле
 
 echo
 # базовый цикл = 23 (22 + antispoof_v6); +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 27
-t "counters: 27 именованных счётчиков объявлены (23 базовых + spamhaus/cins/amp/icmp)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 27"
+t "counters: 29 именованных счётчиков (23 базовых + spamhaus/cins/amp/icmp + ipv6_failsafe/nodeapi v1.2.0)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 29"
 t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
 # 2026-09-24 (v1.1.4): backlog #4 — лимит стал per-source (meter по saddr); литерал глобальной

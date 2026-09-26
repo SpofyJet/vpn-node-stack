@@ -41,27 +41,75 @@ node_tcp_plan() {
     node_tcp_buf_plan "$rmem" "$wmem"
 }
 
-# node_tcp_reserved_ports_plan <port_range> — 2026-09-24 (v1.1.7): расширение эфемерного
-# диапазона ниже дефолтных 32768 (10240 — больше исходящих соединений Xray к одному
-# адресу:порту) делало эфемерными порты, на которых часто слушают inbound'ы (10443,
-# 20000+, Hysteria2). Исходящий сокет, занявший такой порт, ломает bind() inbound'а при
-# рестарте Xray (EADDRINUSE; для UDP — всегда). Резервируем порты, слушаемые СЕЙЧАС в
-# добавленной node полосе [lo, 32767], + TCP_RESERVED_PORTS оператора, объединяя с
-# исходным значением (ip-sysctl.rst: ip_local_reserved_ports). Порт нового inbound'а —
-# следующим apply либо заранее в TCP_RESERVED_PORTS.
-node_tcp_reserved_ports_plan() {
-    local lo base extra ports
-    lo="${1%%[[:space:]]*}"
-    [[ "$lo" =~ ^[0-9]+$ ]] && [ "$lo" -lt 32768 ] || return 0
+# node_reserved_ports_compute <lo> <hi> — 2026-09-25 (v1.2.0): значение ip_local_reserved_ports.
+# Эфемерный сокет (исходящий TCP/UDP любого процесса) не должен занять порт инбаунда: иначе при
+# рестарте Xray bind() инбаунда падает (EADDRINUSE). Резервируются РЕАЛЬНЫЕ порты — из контракта
+# shieldnode (stack.conf [shieldnode]: inbound_tcp/inbound_udp/node_api_port — детектор по
+# конфигу Xray, DIAGNOSIS P0-1), а без него — TCP-слушатели (LISTEN однозначен). UDP-сокеты из
+# `ss` НЕ берутся никогда: это эфемерные сокеты исходящих потоков (прежняя версия резервировала
+# их). Только порты внутри [lo, hi]; плюс исходное значение и TCP_RESERVED_PORTS.
+node_reserved_ports_compute() {
+    local lo="$1" hi="$2" base extra ports="" contract="${NODE_PROFILE_DIR:-/etc/node-profile.d}/stack.conf" x a b out=""
     base="$(node_sysctl_baseline net.ipv4.ip_local_reserved_ports)"
     extra="$(node_conf_get TCP_RESERVED_PORTS "")"
-    ports="$( { { ss -Hltnu 2>/dev/null || true; } | _ss_local_ports '' ; } \
-              | awk -v lo="$lo" '$1 ~ /^[0-9]+$/ && $1 >= lo && $1 < 32768' | sort -nu | paste -sd, -)"
-    ports="$(printf '%s,%s,%s' "$base" "$extra" "$ports" | tr -s ', ' ',,' | sed 's/^,*//; s/,*$//')"
+    if [ -r "$contract" ]; then
+        ports="$(awk -F= '/^\[/{s=($0=="[shieldnode]")} s && ($1=="inbound_tcp"||$1=="inbound_udp"||$1=="node_api_port") {print $2}' "$contract" | tr ',' ' ')"
+    fi
+    if [ -z "${ports// /}" ]; then
+        # локальный адрес — первое поле вида адрес:порт (набор колонок ss зависит от флагов/версии)
+        ports="$( { ss -Hltn 2>/dev/null || true; } | awk '/LISTEN/ { for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
+                    a = $i; n = split(a, x, ":"); p = x[n]; sub(/:[0-9]+$/, "", a)
+                    if (a !~ /^(127\.|\[::1\]$|::1$)/) print p; break } }' || true)"
+    fi
+    for x in $ports $(tr ',' ' ' <<<"$extra") $(tr ',' ' ' <<<"$base"); do
+        [[ "$x" =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]] || continue
+        a="${x%-*}"; b="${x#*-}"
+        # внутри эфемерного диапазона (или пересекает его); исходные/явные — как есть
+        if [ "$b" -ge "$lo" ] && [ "$a" -le "$hi" ] || grep -qw -- "$x" <<<"$(tr ',' ' ' <<<"$extra $base")"; then
+            out="$out $x"
+        fi
+    done
+    tr ' ' '\n' <<<"$out" | awk 'NF' | sort -u | sort -n | paste -sd, -
+}
+
+# node_tcp_reserved_ports_plan <port_range> — на apply (план sysctl-файла node)
+node_tcp_reserved_ports_plan() {
+    local lo hi ports
+    read -r lo hi <<<"$1"
+    [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || return 0
+    ports="$(node_reserved_ports_compute "$lo" "$hi")"
     [ -n "$ports" ] || return 0
     [[ "$ports" =~ ^[0-9,-]+$ ]] || { warn "tcp" "ip_local_reserved_ports: '$ports' — не список портов, пропуск"; return 0; }
     node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.ip_local_reserved_ports "$ports"
-    log info "tcp" "ip_local_reserved_ports=$ports (слушаемые в [$lo,32767] + исходные/TCP_RESERVED_PORTS)"
+    log info "tcp" "ip_local_reserved_ports=$ports (инбаунды/API ноды в эфемерном диапазоне [$lo,$hi] + исходные/TCP_RESERVED_PORTS)"
+}
+
+# node_reserve_ports_sync — 2026-09-25 (v1.2.0): runtime-пересчёт после смены инбаундов
+# (зовёт shieldnode ports-sync). Runtime + строка в sysctl-файле node (переживает reboot);
+# исходное значение — в реестр отката. Идемпотентно: без изменений — ничего не пишет.
+node_reserve_ports_sync() {
+    local lo hi want cur f="$NODE_SYSCTL_BASE" reg="$NODE_STATE_DIR/sysctl-orig.tsv" owner="$NODE_STATE_DIR/owner-keys.txt" tmp
+    read -r lo hi < <(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null)
+    [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || return 0
+    want="$(node_reserved_ports_compute "$lo" "$hi")"
+    cur="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+    # ядро печатает нормализованно (сортировка, слияние диапазонов) — сравниваем по множеству
+    _rp_expand() { tr ',' '\n' <<<"$1" | awk -F- 'NF{a=$1; b=(NF>1?$2:$1); for(i=a;i<=b;i++) print i}' | sort -u | paste -sd, -; }
+    [ "$(_rp_expand "$want")" = "$(_rp_expand "$cur")" ] && return 0
+    [[ "${want:-x}" =~ ^[0-9,-]+$ ]] || want=""
+    mkdir -p "$NODE_STATE_DIR"
+    if ! awk -F'\t' '$1=="net.ipv4.ip_local_reserved_ports"{f=1} END{exit !f}' "$reg" 2>/dev/null; then
+        printf 'net.ipv4.ip_local_reserved_ports\t%s\n' "$cur" >> "$reg"
+    fi
+    grep -qx 'net.ipv4.ip_local_reserved_ports' "$owner" 2>/dev/null || echo net.ipv4.ip_local_reserved_ports >> "$owner"
+    sysctl -qw "net.ipv4.ip_local_reserved_ports=$want" || { warn "tcp" "ip_local_reserved_ports=$want не применился"; return 1; }
+    if [ -f "$f" ]; then
+        tmp="$(mktemp "$f.XXXXXX")"
+        grep -v '^net\.ipv4\.ip_local_reserved_ports' "$f" > "$tmp" || true
+        [ -n "$want" ] && echo "net.ipv4.ip_local_reserved_ports = $want" >> "$tmp"
+        chmod 0644 "$tmp"; mv -f "$tmp" "$f"
+    fi
+    log info "tcp" "ip_local_reserved_ports: $cur -> $want (инбаунды изменились)"
 }
 
 # node_tcp_buf_plan <rmem_max> <wmem_max> — ENABLE_TCP_BUF_TUNE (v1.1.1 opt-in; с v1.1.7 дефолт 1).

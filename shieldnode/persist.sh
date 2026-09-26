@@ -91,9 +91,15 @@ shield_persist_service() {
 [Unit]
 Description=shieldnode firewall rules (nftables)
 Documentation=file:/etc/shieldnode/config.conf
-After=network-pre.target
+# 2026-09-25 (v1.2.0): правила — ДО настройки сети (было After=network-pre: интерфейс поднимался
+# ~5 с раньше таблицы, DIAGNOSIS P0-2) и ПОСЛЕ nftables.service (его /etc/nftables.conf делает
+# `flush ruleset` — запущенный позже, он стёр бы таблицу). До docker — remnanode стартует уже
+# под защитой.
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service nftables.service
+Before=network-pre.target docker.service shutdown.target
 Wants=network-pre.target
-Before=network.target
+Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
@@ -116,6 +122,35 @@ EOF
         # делает повторный apply атомарной заменой, не перерывом трафика).
         systemctl enable --now shieldnode.service >/dev/null 2>&1 \
             || log warn "persist" "systemctl enable --now shieldnode.service не удался"
+    fi
+    shield_persist_ports_service
+}
+
+# shield_persist_ports_service — 2026-09-25 (v1.2.0): ports-watch (DIAGNOSIS P0-2) — защищаемые
+# порты следуют за реальностью (remnanode запущен/перенастроен панелью, UFW, config) без apply.
+shield_persist_ports_service() {
+    shield_persist_stream /etc/systemd/system/shieldnode-ports.service 0644 <<EOF
+[Unit]
+Description=shieldnode: защищаемые порты следуют за инбаундами Xray/UFW (ports-watch)
+After=shieldnode.service docker.service
+Wants=shieldnode.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $SHIELD_DIR/main.sh ports-watch
+Restart=always
+RestartSec=10
+Nice=10
+# принципиально: только чтение состояния и правка наборов nft — ssh/docker/xray не трогаем
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        systemctl daemon-reload
+        systemctl enable shieldnode-ports.service >/dev/null 2>&1 || log warn "persist" "enable shieldnode-ports.service не удался"
+        # restart: подхватить новый код после обновления (служба только читает и правит наборы)
+        systemctl restart shieldnode-ports.service >/dev/null 2>&1 || log warn "persist" "restart shieldnode-ports.service не удался"
     fi
 }
 

@@ -14,6 +14,10 @@ LOG_LEVEL=info
 
 rm -rf /tmp/node-dp-test
 mkdir -p "$NODE_STATE_DIR" "$NODE_DIAG_DIR" "$NODE_PROFILE_DIR"
+# 2026-09-25 (v1.1.8): netdev_budget_usecs зависит от HZ ядра — фиксируем (1000, как Ubuntu generic)
+printf 'CONFIG_HZ=1000\n' > /tmp/node-dp-test/kconfig; export NODE_KERNEL_CONFIG=/tmp/node-dp-test/kconfig
+# v1.2.0: HZ считается и по /boot/config-* (все ядра, которые могут загрузиться) — фикстура, не /boot хоста
+mkdir -p /tmp/node-dp-test/boot; rm -f /tmp/node-dp-test/boot/*; export NODE_BOOT_DIR=/tmp/node-dp-test/boot
 
 source "$NODE_DIR/lib/common.sh"
 source "$NODE_DIR/config.sh"
@@ -34,7 +38,7 @@ replan
 
 # ожидаемые значения из реального /proc/meminfo
 kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-pages=$(( kb / 4 )); memp=$(( pages * 25 / 100 ))
+pages=$(( kb / 4 )); memp=$(( pages * 25 / 100 / 256 * 256 ))   # v1.2.1: кратно 1 МиБ
 exp_tcp_mem="$((memp*3/4)) $((memp*7/8)) $memp"
 tier_mb=$(( kb / 1024 ))
 if [ "$tier_mb" -le 2048 ]; then exp_rd=262144
@@ -42,9 +46,45 @@ elif [ "$tier_mb" -le 4096 ]; then exp_rd=2097152
 else exp_rd=8388608; fi
 
 t "plan: netdev_budget=600" bash -c "grep -q 'net.core.netdev_budget	600' '$PLAN'"
-t "plan: netdev_budget_usecs=4000 (v1.1.7: пропорционально budget, было 8000)" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+t "plan (HZ=1000): netdev_budget_usecs=4000 (4 jiffy, пропорционально budget 600)" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+# HZ=250 (XanMod): 4000 = 1 jiffy < минимума ядра 8000 (EINVAL на 6.18) -> ключ не пишем, дефолт ядра
+printf 'CONFIG_HZ=250\n' > "$NODE_KERNEL_CONFIG"; replan
+t "plan (HZ=250): netdev_budget_usecs НЕ пишется (дефолт ядра = минимум 8000 = 2 jiffy)" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN' && grep -q 'net.core.netdev_budget	600' '$PLAN'"
+printf 'CONFIG_HZ=100\n' > "$NODE_KERNEL_CONFIG"; replan
+t "plan (HZ=100): не пишется (минимум 20000)" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN'"
+: > "$NODE_KERNEL_CONFIG"; replan
+t "plan (HZ неизвестен): не пишется" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN'"
+# v1.2.0 (лаба): активно стоковое HZ=1000, но в /boot уже есть XanMod (HZ=250) — при его загрузке
+# 4000 давал EINVAL (systemd-sysctl.service failed). Значение должно быть валидным для обоих ядер.
+printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"; printf 'CONFIG_HZ=1000\n' > /tmp/node-dp-test/boot/config-6.8.0-139-generic
+printf 'CONFIG_HZ=250\n' > /tmp/node-dp-test/boot/config-6.18.54-x64v3-xanmod1; replan
+t "plan (стоковое активно, XanMod в /boot): 4000 не пишется (для HZ=250 это 1 jiffy)" bash -c "! grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+rm -f /tmp/node-dp-test/boot/config-6.18.54-x64v3-xanmod1; replan
+t "plan (только стоковое в /boot): 4000 как прежде" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+printf 'ENABLE_XANMOD=1\n' >> "$CONFIG_CACHE.x"; cat "$CONFIG_CACHE" >> "$CONFIG_CACHE.x"; cp "$CONFIG_CACHE" "$CONFIG_CACHE.orig"; mv "$CONFIG_CACHE.x" "$CONFIG_CACHE"; replan
+t "plan (XanMod запрошен, ещё не установлен): 4000 не пишется (план под HZ=250)" bash -c "! grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+mv "$CONFIG_CACHE.orig" "$CONFIG_CACHE"; rm -f /tmp/node-dp-test/boot/*; replan
+# живое ядро: план с НАСТОЯЩИМ /boot/config — значение должно приниматься ядром (4000 на 6.18/HZ=250
+# давал EINVAL и ронял apply). Ключ глобальный (не netns) — пишем на миг и сразу возвращаем исходное.
+if [ "$(id -u)" -eq 0 ] && [ -w /proc/sys/net/core/netdev_budget_usecs ]; then
+    ( unset NODE_KERNEL_CONFIG; replan; cp "$PLAN" /tmp/node-dp-test/plan.live )
+    live_v="$(awk -F'\t' '$1 == "net.core.netdev_budget_usecs" {print $2}' /tmp/node-dp-test/plan.live)"
+    if [ -n "$live_v" ]; then
+        orig_v="$(sysctl -n net.core.netdev_budget_usecs)"
+        if sysctl -qw "net.core.netdev_budget_usecs=$live_v" 2>/dev/null; then acc=1; else acc=0; fi
+        sysctl -qw "net.core.netdev_budget_usecs=$orig_v" 2>/dev/null || true
+        t "живое ядро $(uname -r): план netdev_budget_usecs=$live_v принимается" test "$acc" = 1
+    else
+        t "живое ядро $(uname -r): netdev_budget_usecs не пишется (дефолт ядра)" true
+    fi
+fi
+printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"; replan
 t "plan: tcp_max_tw_buckets=524288" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	524288' '$PLAN'"
 t "plan: tcp_mem по формуле 25% RAM" bash -c "grep -q \"net.ipv4.tcp_mem	$exp_tcp_mem\" '$PLAN'"
+# v1.2.1 (живая нода): MemTotal после reboot на 16 КБ меньше — план tcp_mem не должен меняться
+printf 'MemTotal:        4009152 kB\n' > /tmp/node-dp-test/mi1; printf 'MemTotal:        4009136 kB\n' > /tmp/node-dp-test/mi2
+tm() { ( NODE_PROC_MEMINFO="$1"; replan; awk -F'\t' '$1 == "net.ipv4.tcp_mem" {print $2}' "$PLAN" ) 2>/dev/null; }
+t "v1.2.1: tcp_mem не меняется от колебания MemTotal на 16 КБ" bash -c "[ \"$(tm /tmp/node-dp-test/mi1)\" = \"$(tm /tmp/node-dp-test/mi2)\" ] && [ -n \"$(tm /tmp/node-dp-test/mi1)\" ]"
 # 2026-09-24 (v1.1.7): ревизия тюнинга — rmem/wmem_default по умолчанию НЕ пишутся (дефолт ядра)
 t "plan: rmem_default/wmem_default по умолчанию не трогаются" bash -c "! grep -qE 'net.core.[rw]mem_default' '$PLAN'"
 t "plan: dirty_background_bytes=64MB" bash -c "grep -q 'vm.dirty_background_bytes	67108864' '$PLAN'"
@@ -74,7 +114,7 @@ replan
 t "оверрайд: NETDEV_BUDGET=900" bash -c "grep -q 'net.core.netdev_budget	900' '$PLAN'"
 t "оверрайд: usecs следует за budget 900 -> 6000" bash -c "grep -q 'net.core.netdev_budget_usecs	6000' '$PLAN'"
 t "оверрайд: TW_BUCKETS=1048576" bash -c "grep -q 'net.ipv4.tcp_max_tw_buckets	1048576' '$PLAN'"
-m30=$(( pages * 30 / 100 ))
+m30=$(( pages * 30 / 100 / 256 * 256 ))   # v1.2.1: кратно 1 МиБ
 exp30="$((m30*3/4)) $((m30*7/8)) $m30"
 t "оверрайд: TCP_MEM_PCT=30 пересчитан" bash -c "grep -q \"net.ipv4.tcp_mem	$exp30\" '$PLAN'"
 
@@ -111,6 +151,39 @@ t "fq: юнит ссылается на production-путь скрипта" grep
 FAKE_TC_LOG=/tmp/node-dp-test/tc.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin/node-fq-tune.sh"
 t "fq: root-инстанс изменён (limit/buckets)" bash -c "grep -q 'dev eth0 root fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc.log"
 t "fq: mq-child изменён через parent/handle" bash -c "grep -q 'dev eth0 parent 1:1 handle 10: fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc.log"
+
+# --- v1.2.0: fq должен реально стоять на физических NIC (лаба: после apply без reboot — fq_codel;
+# дочерние под «mq 0:» неадресуемы). eth0 — multiqueue (mq 0: + fq_codel), eth1 — одна очередь
+# (fq_codel в корне), veth0 — виртуальный (не трогаем) ---
+mkdir -p /tmp/node-dp-test/sys/eth0/device /tmp/node-dp-test/sys/eth1/device /tmp/node-dp-test/sys/veth0
+cat > "$BIN/tc" <<'EOF'
+#!/bin/bash
+st=/tmp/node-dp-test/tc.state
+[ -f "$st" ] || printf 'eth0 root mq 0:\neth0 :1 fq_codel 0:\neth1 root fq_codel 0:\nveth0 root noqueue 0:\n' > "$st"
+show() { awk -v d="$1" '$1 == d || d == "" { if ($2 == "root") printf "qdisc %s %s %sroot\n", $3, $4, (d == "" ? "dev " $1 " " : ""); else printf "qdisc %s %s %sparent %s limit 10000p\n", $3, $4, (d == "" ? "dev " $1 " " : ""), $2 }' "$st"; }
+if [ "$1 $2" = "qdisc show" ]; then show "${4:-}"; exit 0; fi
+echo "$*" >> "$FAKE_TC_LOG"
+case "$*" in
+  "qdisc replace dev eth0 root handle 1: mq") printf 'eth0 root mq 1:\neth0 1:1 fq_codel 0:\neth1 root fq_codel 0:\nveth0 root noqueue 0:\n' > "$st" ;;
+  "qdisc replace dev eth0 parent 1:1 fq"*) sed -i 's/^eth0 1:1 fq_codel 0:/eth0 1:1 fq 8001:/' "$st" ;;
+  "qdisc replace dev eth1 root fq"*) sed -i 's/^eth1 root fq_codel 0:/eth1 root fq 8002:/' "$st" ;;
+  *"parent :1"*) exit 2 ;;
+  "qdisc change"*) exit 2 ;;
+  *) : ;;
+esac
+exit 0
+EOF
+rm -f /tmp/node-dp-test/tc.state /tmp/node-dp-test/tc2.log; echo fq > /tmp/node-dp-test/dq
+rc2=0; SYSNET=/tmp/node-dp-test/sys DEFQ_FILE=/tmp/node-dp-test/dq FAKE_TC_LOG=/tmp/node-dp-test/tc2.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin/node-fq-tune.sh" || rc2=$?
+t "fq: eth0 mq 0: -> пересоздан с handle 1:" grep -qx 'qdisc replace dev eth0 root handle 1: mq' /tmp/node-dp-test/tc2.log
+t "fq: eth0 дочерний fq_codel под 1:1 -> fq" grep -q 'qdisc replace dev eth0 parent 1:1 fq' /tmp/node-dp-test/tc2.log
+t "fq: eth1 (одна очередь, fq_codel в корне) -> fq" grep -q '^qdisc replace dev eth1 root fq' /tmp/node-dp-test/tc2.log
+t "fq: виртуальный veth0 не тронут" bash -c "! grep -q veth0 /tmp/node-dp-test/tc2.log"
+t "fq: итог — fq на всех физических, rc 0" bash -c "[ $rc2 = 0 ] && grep -q '^eth0 1:1 fq ' /tmp/node-dp-test/tc.state && grep -q '^eth1 root fq ' /tmp/node-dp-test/tc.state"
+t "fq: затем параметры fq применены (limit 100000)" grep -q 'fq limit 100000 flow_limit 100 buckets 32768' /tmp/node-dp-test/tc2.log
+echo cubic > /tmp/node-dp-test/dq; rm -f /tmp/node-dp-test/tc.state /tmp/node-dp-test/tc3.log
+SYSNET=/tmp/node-dp-test/sys DEFQ_FILE=/tmp/node-dp-test/dq FAKE_TC_LOG=/tmp/node-dp-test/tc3.log PATH="$BIN:$PATH" bash "$OUT/usr/local/sbin/node-fq-tune.sh" || true
+t "fq: default_qdisc не fq — qdisc NIC не меняются" bash -c "! grep -q 'replace dev eth' /tmp/node-dp-test/tc3.log 2>/dev/null"
 
 # --- fq tune: ENABLE_FQ_TUNE=0 гасит эмиссию ---
 sed -i 's/^ENABLE_FQ_TUNE=.*/ENABLE_FQ_TUNE=0/' "$CONFIG_CACHE"

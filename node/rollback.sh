@@ -21,8 +21,11 @@ node_rollback() {
     # Раньше шаг 4 проверял `systemctl cat` уже после удаления — disable не делался:
     # «not-found active exited» и висячие симлинки в *.wants (живая нода);
     # node-fq-tune.service не отключался вовсе.
-    local u
-    for u in node-mss-clamp.service node-rt-tweaks.service node-fq-tune.service; do
+    local u fq_lim=""
+    # 2026-09-25 (v1.2.0): лимит fq, выставленный node, — до удаления скрипта (для шага 3a)
+    [ -f /usr/local/sbin/node-fq-tune.sh ] && fq_lim="$(sed -n 's/^LIM=\([0-9]*\)$/\1/p' /usr/local/sbin/node-fq-tune.sh | head -1)"
+    local had_kernel_cfg=0; [ -f /etc/default/grub.d/98-vpn-node-kernel.cfg ] && had_kernel_cfg=1
+    for u in node-mss-clamp.service node-rt-tweaks.service node-fq-tune.service node-kernel-confirm.service; do
         if systemctl cat "$u" >/dev/null 2>&1; then
             systemctl disable --now "$u" >/dev/null 2>&1 || true
         fi
@@ -91,6 +94,8 @@ node_rollback() {
         local rk rv skre stmp; restored=""; stmp="$(mktemp "$NODE_STATE_DIR/.sysctl-orig.XXXXXX")"
         while IFS=$'\t' read -r rk rv; do
             [ -n "$rk" ] || continue
+            # 2026-09-25 (v1.2.0, P1-4): IPv6 не включаем НИКОГДА (реестр v1.1.x мог хранить 0)
+            case "$rk" in net.ipv6.conf.*.disable_ipv6) continue ;; esac
             skre="${rk//./\\.}"
             # 2026-09-24 (v1.1.5): *_ratio (из реестра для bytes=0) — «управляется», пока
             # оставшиеся файлы node задают парный *_bytes (запись ratio обнулила бы его)
@@ -108,6 +113,7 @@ node_rollback() {
         local k v
         while read -r k; do
             [ -z "$k" ] && continue
+            case "$k" in net.ipv6.conf.*.disable_ipv6) continue ;; esac
             # уже восстановлен из реестра исходных значений (2a) или ещё в нём
             if grep -qxF -- "$k" <<<"$restored"; then continue; fi
             if [ -f "$sreg" ] && awk -F'\t' -v k="$k" '$1==k{f=1} END{exit !f}' "$sreg"; then continue; fi
@@ -130,6 +136,16 @@ node_rollback() {
     # 3. runtime-твики (ethtool/rings/offloads/txqueuelen/irq affinity) — явный откат
     node_rt_rollback
 
+    # 3a. 2026-09-25 (v1.2.0): qdisc'и, настроенные node (fq с limit=$fq_lim, корневой mq 1:),
+    # оставались до reboot (лаба: после rollback — cubic, но fq limit 100000 на NIC). Удаление
+    # корневого qdisc возвращает дефолт ядра по уже восстановленному net.core.default_qdisc.
+    if [ -n "$fq_lim" ] && command -v tc >/dev/null 2>&1; then
+        local dev
+        for dev in $(tc qdisc show 2>/dev/null | awk -v l="limit ${fq_lim}p" '$2 == "fq" && index($0, l) { for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }' | sort -u); do
+            tc qdisc del dev "$dev" root 2>/dev/null && log info "rollback" "qdisc $dev: возвращён дефолт ядра ($(sysctl -n net.core.default_qdisc 2>/dev/null))" || true
+        done
+    fi
+
     # 3a. состояния отключённых сервисов (hardening §17) — restore из снапшота
     # shellcheck source=lib/services.sh
     source "$NODE_DIR/lib/services.sh"
@@ -146,6 +162,13 @@ node_rollback() {
     rm -f /usr/local/sbin/node-rt-tweaks.sh /etc/udev/rules.d/99-node-rt-hotplug.rules
     udevadm control --reload >/dev/null 2>&1 || true
     nft delete table inet node_mss_clamp 2>/dev/null || true
+    # 2026-09-26 (v1.2.0): пробная загрузка XanMod (GRUB_DEFAULT=saved в grub.d) — файл снят по
+    # манифесту выше; пересобираем grub.cfg, чтобы он не ссылался на saved_entry
+    if [ "$had_kernel_cfg" = 1 ] && [ ! -f /etc/default/grub.d/98-vpn-node-kernel.cfg ]; then
+        command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1 || true
+        command -v grub-editenv >/dev/null 2>&1 && grub-editenv - unset saved_entry next_entry 2>/dev/null || true
+        log info "rollback" "GRUB: пробная загрузка XanMod снята (GRUB_DEFAULT по /etc/default/grub)"
+    fi
     # grub-файл (если XanMod-установка правила /etc/default/grub) — восстанавливаем
     local g; g="$(ls -1t /etc/default/grub.pre-node-* 2>/dev/null | head -1 || true)"
     if [ -n "$g" ] && [ -w /etc/default/grub ]; then

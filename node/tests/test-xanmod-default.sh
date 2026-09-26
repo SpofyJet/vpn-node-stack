@@ -1,10 +1,10 @@
 #!/bin/bash
-# node — тест: ENABLE_XANMOD=1 по умолчанию (решение оператора 2026-09-24, v1.1.6).
-# Дефолт (ключа нет в node.conf) — «мягкий»: неподдерживаемая платформа, ядро уже с
-# BBRv3 (tcp_bbr version 3), нет suite XanMod для дистрибутива (jammy — 404), сбой сети —
-# info/warn и пропуск, apply НЕ падает. Уже настроенный чужой источник XanMod не
-# дублируется (ключ другого инструмента не перезаписывается). Явный ENABLE_XANMOD=1
-# в node.conf — строгий режим как прежде (die/rc 1). Авто-reboot не вызывается.
+# node — тест: XanMod по запросу (v1.2.0, DIAGNOSIS P1-5 / прод E7).
+# v1.1.6–1.1.8: ENABLE_XANMOD=1 по умолчанию, но на чистой ноде шаг падал: проверка «чужого
+# источника» (grep | grep -v | awk) выходила 1 под pipefail, если источников XanMod нет, и
+# set -e обрывал установку. Старый тест этого не видел: вызов шёл в контексте `inst || rc=$?`,
+# где bash ОТКЛЮЧАЕТ errexit. Теперь каждый прогон — отдельный процесс bash с активным set -e,
+# как в настоящем apply. Дефолт ENABLE_XANMOD=0; явный =1 — строгий режим (ошибка шага).
 # Под root: `unshare -m`, tmpfs поверх /etc/apt, /etc/default, /run, /var/lib, /var/log.
 set -euo pipefail
 if [ "$(id -u)" -ne 0 ]; then echo "SKIP: нужен root"; exit 77; fi
@@ -13,7 +13,8 @@ if [ "${NODE_TEST_IN_NS:-0}" != "1" ]; then
     unshare -m true 2>/dev/null || { echo "SKIP: unshare -m недоступен"; exit 77; }
     NODE_TEST_IN_NS=1 exec unshare -m bash "$0" "$@"
 fi
-for d in /etc/apt /etc/default /run /var/lib /var/log; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
+# v1.2.0: пробная загрузка пишет юнит и скрипт и трогает GRUB — всё это тоже в песочнице
+for d in /etc/apt /etc/default /run /var/lib /var/log /usr/local/sbin /etc/systemd/system /boot; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
 NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 mkdir -p "$OUT/bin" "$OUT/state"
@@ -38,8 +39,17 @@ EOF
 printf '#!/bin/sh\necho "-----BEGIN PGP-----"\n' > "$OUT/bin/wget"
 printf '#!/bin/sh\ncat >/dev/null; echo KEY\n' > "$OUT/bin/gpg"
 printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/update-grub"
-printf '#!/bin/sh\necho "REBOOT $*" >> "%s/reboot.called"\nexit 0\n' "$OUT" > "$OUT/bin/systemctl"
-cp "$OUT/bin/systemctl" "$OUT/bin/reboot"
+printf '#!/bin/sh\ncase "$*" in *reboot*|*poweroff*) echo "REBOOT $*" >> "%s/reboot.called" ;; esac\nexit 0\n' "$OUT" > "$OUT/bin/systemctl"
+printf '#!/bin/sh\necho "REBOOT $*" >> "%s/reboot.called"\nexit 0\n' "$OUT" > "$OUT/bin/reboot"
+# GRUB-утилиты — заглушки с журналом (НИКОГДА не настоящие: хост теста загружается через GRUB)
+for g in grub-set-default grub-reboot grub-editenv; do printf '#!/bin/sh\necho "%s $*" >> "%s/grub.calls"\nexit 0\n' "$g" "$OUT" > "$OUT/bin/$g"; done
+mkdir -p "$OUT/efi"; export NODE_GRUB_CFG="$OUT/grub.cfg" NODE_EFIVARS="$OUT/efi"
+cat > "$OUT/grub.cfg" <<'GEOF'
+submenu 'Advanced options for Ubuntu' $menuentry_id_option 'gnulinux-advanced-UUID' {
+	menuentry 'Ubuntu, with Linux 6.18.54-x64v3-xanmod1' --class ubuntu $menuentry_id_option 'gnulinux-6.18.54-x64v3-xanmod1-advanced-UUID' {
+	menuentry 'Ubuntu, with Linux 6.18.54-x64v3-xanmod1 (recovery mode)' --class ubuntu $menuentry_id_option 'gnulinux-6.18.54-x64v3-xanmod1-recovery-UUID' {
+	menuentry 'Ubuntu, with Linux 6.8.0-60-generic' --class ubuntu $menuentry_id_option 'gnulinux-6.8.0-60-generic-advanced-UUID' {
+GEOF
 chmod +x "$OUT/bin"/*; export PATH="$OUT/bin:$PATH"
 
 fails=0
@@ -48,54 +58,61 @@ t() { local name="$1"; shift
 LIST=/etc/apt/sources.list.d/xanmod-kernel.list KEY=/etc/apt/keyrings/xanmod-archive-keyring.gpg
 fresh() { rm -rf /etc/apt/* /var/lib/node "$OUT/state"/*; mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings /etc/apt/preferences.d
           echo 'GRUB_DEFAULT=0' > /etc/default/grub; : > "$APTLOG"; }
-inst() { # inst <node.conf content> [env...] -> rc установки (в subshell: die не роняет тест)
+inst() { # inst <node.conf content> [env...] -> rc установки (ОТДЕЛЬНЫЙ процесс: errexit активен всегда)
     printf '%b' "$1" > "$OUT/node.conf"; shift
-    ( export NODE_CONFIG="$OUT/node.conf" "$@"
+    env NODE_CONFIG="$OUT/node.conf" "$@" bash -c '
       source "$NODE_DIR/lib/common.sh"; source "$NODE_DIR/config.sh"; node_load_config >/dev/null 2>&1
       source "$NODE_DIR/persist.sh"; source "$NODE_DIR/lib/cpu.sh"; source "$NODE_DIR/lib/kernel.sh"
-      node_xanmod_install ) > "$OUT/inst.out" 2>&1
+      node_xanmod_install; echo STEP-DONE' > "$OUT/inst.out" 2>&1
 }
-
 fresh; ( source "$NODE_DIR/lib/common.sh"; source "$NODE_DIR/config.sh"; NODE_CONFIG="$OUT/none" node_load_config >/dev/null 2>&1
          node_conf_get ENABLE_XANMOD 0 ) > "$OUT/def" 2>/dev/null || true
-t "дефолт: ENABLE_XANMOD=1 (node.defaults.conf)" "[ \"\$(cat $OUT/def)\" = 1 ]"
+t "дефолт: ENABLE_XANMOD=0 (node.defaults.conf, v1.2.0)" "[ \"\$(cat $OUT/def)\" = 0 ]"
 
 fresh; rc=0; inst '' || rc=$?
-t "дефолт, noble x86_64: XanMod ставится (repo со signed-by + apt install)" \
-  "[ $rc = 0 ] && grep -q 'signed-by=$KEY' $LIST && grep -q 'install -y --no-install-recommends linux-xanmod' $APTLOG"
-t "дефолт: авто-reboot НЕ вызывается" "[ ! -e $OUT/reboot.called ]"
+t "дефолт: XanMod не ставится (apt не вызывался, репо нет)" "[ $rc = 0 ] && [ ! -s $APTLOG ] && [ ! -e $LIST ]"
 
-fresh; rc=0; inst '' FAKE_ARCH=aarch64 || rc=$?
-t "дефолт, aarch64: пропуск без ошибки (rc 0), apt не вызывался" "[ $rc = 0 ] && [ ! -s $APTLOG ] && [ ! -e $LIST ]"
+# E7: чистая нода, НИ ОДНОГО источника XanMod — шаг должен дойти до конца
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "E7: явный =1, noble x86_64, источников XanMod нет — шаг не обрывается (STEP-DONE)" "[ $rc = 0 ] && grep -q STEP-DONE $OUT/inst.out"
+t "явный =1: XanMod ставится (repo со signed-by + apt install)" \
+  "grep -q 'signed-by=$KEY' $LIST && grep -q 'install -y --no-install-recommends linux-xanmod' $APTLOG"
+t "авто-reboot НЕ вызывается" "[ ! -e $OUT/reboot.called ]"
+
 fresh; rc=0; inst 'ENABLE_XANMOD=1\n' FAKE_ARCH=aarch64 || rc=$?
-t "явный ENABLE_XANMOD=1, aarch64: как прежде — ошибка" "[ $rc != 0 ]"
+t "явный =1, aarch64: ошибка шага" "[ $rc != 0 ] && [ ! -s $APTLOG ]"
 
-# 2026-09-24 (v1.1.7): мейнлайн НЕ содержит BBRv3 (torvalds/master tcp_bbr.c — v1, без
-# inflight_lo/версии); прежнее «ядро >= 6.15 -> BBRv3 уже есть» было ложным. Стоковое 6.16
-# (tcp_bbr без version) -> XanMod по-прежнему ставится; ядро с tcp_bbr version 3 -> пропуск.
-fresh; rc=0; inst '' FAKE_UNAME_R=6.16.2-generic || rc=$?
-t "дефолт, стоковое 6.16 (мейнлайн BBR = v1): XanMod ставится" "[ $rc = 0 ] && grep -q 'install -y' $APTLOG"
-fresh; rc=0; inst '' FAKE_UNAME_R=6.16.2-generic FAKE_BBR_VERSION=3 || rc=$?
-t "дефолт, ядро уже с BBRv3 (tcp_bbr version 3): пропуск, apt не вызывался" "[ $rc = 0 ] && [ ! -s $APTLOG ]"
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' FAKE_UNAME_R=6.16.2-generic || rc=$?
+t "явный =1, стоковое 6.16 (мейнлайн BBR = v1): ставится" "[ $rc = 0 ] && grep -q 'install -y' $APTLOG"
 gen() { ( export "$@"; source "$NODE_DIR/lib/common.sh"; source "$NODE_DIR/lib/kernel.sh"; node_bbr_generation ) 2>/dev/null; }
 export -f gen
 t "node_bbr_generation: стоковое 6.16 без версии модуля -> 1" "[ \"\$(gen FAKE_UNAME_R=6.16.2-generic)\" = 1 ]"
 t "node_bbr_generation: tcp_bbr version 3 (XanMod) -> 3" "[ \"\$(gen FAKE_UNAME_R=6.18.53-x64v3-xanmod1 FAKE_BBR_VERSION=3)\" = 3 ]"
 
-fresh; rc=0; inst '' FAKE_APT_UPDATE_RC=100 || rc=$?
-t "дефолт, нет suite/сети (apt update fail): rc 0, свой repo+ключ убраны" "[ $rc = 0 ] && [ ! -e $LIST ] && [ ! -e $KEY ]"
 fresh; rc=0; inst 'ENABLE_XANMOD=1\n' FAKE_APT_UPDATE_RC=100 || rc=$?
-t "явный ENABLE_XANMOD=1, apt update fail: как прежде — rc 1" "[ $rc = 1 ] && [ ! -e $LIST ]"
-fresh; rc=0; inst '' FAKE_APT_RC=100 || rc=$?
-t "дефолт, apt install fail: rc 0 (warn), apply не падает" "[ $rc = 0 ] && grep -q 'install' $APTLOG"
+t "явный =1, apt update fail: rc 1, свой repo+ключ убраны" "[ $rc = 1 ] && [ ! -e $LIST ] && [ ! -e $KEY ]"
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' FAKE_APT_RC=100 || rc=$?
+t "явный =1, apt install fail: ошибка шага (не молчим)" "[ $rc != 0 ] && grep -q 'install' $APTLOG"
 
 fresh; echo "deb [signed-by=$KEY] http://deb.xanmod.org noble main" > /etc/apt/sources.list.d/xanmod-release.list
-echo FOREIGN-KEY > "$KEY"; rc=0; inst '' || rc=$?
+echo FOREIGN-KEY > "$KEY"; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
 t "чужой источник XanMod уже есть: свой не добавлен, чужой ключ не перезаписан, пакет ставится" \
   "[ $rc = 0 ] && [ ! -e $LIST ] && [ \"\$(cat $KEY)\" = FOREIGN-KEY ] && grep -q 'install -y' $APTLOG"
 
-fresh; rc=0; inst 'ENABLE_XANMOD=0\n' || rc=$?
-t "ENABLE_XANMOD=0 в node.conf: выключено (apt не вызывался)" "[ $rc = 0 ] && [ ! -s $APTLOG ]"
+# ---------- v1.2.0 (лаба): Secure Boot, место в /boot, пробная загрузка ----------
+fresh; rm -f "$OUT/grub.calls"; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "пробная загрузка: по умолчанию остаётся текущее штатное ядро" "grep -qx 'grub-set-default gnulinux-advanced-UUID>gnulinux-6.8.0-60-generic-advanced-UUID' $OUT/grub.calls"
+t "пробная загрузка: XanMod — только следующая загрузка (grub-reboot), не recovery" "grep -qx 'grub-reboot gnulinux-advanced-UUID>gnulinux-6.18.54-x64v3-xanmod1-advanced-UUID' $OUT/grub.calls"
+t "пробная загрузка: GRUB_DEFAULT=saved в grub.d, юнит подтверждения создан" "grep -qx 'GRUB_DEFAULT=saved' /etc/default/grub.d/98-vpn-node-kernel.cfg && test -x /usr/local/sbin/node-kernel-confirm.sh && grep -q 'ExecStart=/usr/local/sbin/node-kernel-confirm.sh' /etc/systemd/system/node-kernel-confirm.service"
+t "пробная загрузка: скрипт подтверждения синтаксически валиден" "bash -n /usr/local/sbin/node-kernel-confirm.sh"
+t "авто-reboot НЕ вызывается и с пробной загрузкой" "[ ! -e $OUT/reboot.called ]"
+printf '\x06\x00\x00\x00\x01' > "$OUT/efi/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "Secure Boot включён: XanMod НЕ ставится (ошибка шага с объяснением), apt не вызывался" "[ $rc != 0 ] && [ ! -s $APTLOG ] && grep -q 'Secure Boot' $OUT/inst.out"
+printf '\x06\x00\x00\x00\x00' > "$OUT/efi/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "Secure Boot выключен (байт 0): XanMod ставится" "[ $rc = 0 ] && grep -q 'install -y' $APTLOG"
+rm -f "$OUT/efi/"*
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: xanmod-default (all checks)"; else echo "FAILED: $fails checks"; exit 1; fi

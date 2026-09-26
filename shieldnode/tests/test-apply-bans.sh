@@ -27,7 +27,8 @@ OUT=/tmp/shieldnode-test-bans
 rm -rf "$OUT"; mkdir -p "$OUT/bin"
 export SHIELD_LOCK=/run/shieldnode/shieldnode.lock
 unset SSH_CONNECTION
-printf 'SSH_PORT=22\n' > /etc/shieldnode/config.conf
+# ENABLE_CROWDSEC_LIST=0: с v1.1.6 включён по умолчанию — agent-шаг звал бы cscli ХОСТА (netns без сети)
+printf 'SSH_PORT=22\nENABLE_CROWDSEC_LIST=0\n' > /etc/shieldnode/config.conf
 
 # systemctl: протокол + состояние основного lock'а в момент старта updater'а
 cat > "$OUT/bin/systemctl" <<EOF

@@ -59,7 +59,13 @@ node_network_mss_clamp() {
     ifname="$(node_default_iface)"
     [ -z "$ifname" ] && { warn "network" "MSS clamp: нет default iface"; return 0; }
     mtu="$(cat "/sys/class/net/$ifname/mtu" 2>/dev/null || echo 1500)"
+    [[ "$mtu" =~ ^[0-9]{3,5}$ ]] || mtu=1500
     mss="$(node_conf_get MSS_CLAMP_MTU $((mtu - 40)))"
+    # 2026-09-24 (v1.1.8): значение идёт в $(( )) и в nft-правило — только число 536..9000
+    # (bash вычислял бы содержимое переменной как выражение: 'x[$(cmd)]' исполнил бы cmd)
+    if ! [[ "$mss" =~ ^[0-9]{3,4}$ ]] || [ "$mss" -lt 536 ] || [ "$mss" -gt 9000 ]; then
+        warn "network" "MSS_CLAMP_MTU='$mss' — не число 536..9000, берём $((mtu - 40))"; mss=$((mtu - 40))
+    fi
     # 2026-09-24 (v1.1.5): backlog #5 — IPv6-заголовок на 20 байт больше (40 vs 20):
     # для того же MTU v6-MSS = v4-MSS - 20 (mtu-60). Раньше v6 клампился v4-значением.
     # Поднимать MSS ядро само не даёт (nft_exthdr: только понижение) — проверено tcpdump.

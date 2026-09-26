@@ -77,7 +77,7 @@ shield_limits_resolve() {
     SH_F_BLOCK_TOR="$(shield_conf_get BLOCK_TOR 0)"
     SH_F_ENABLE_CUSTOM_LIST="$(shield_conf_get ENABLE_CUSTOM_LIST 1)"
     # crowdsec: opt-in (default 0) — без креденшелов консоли фид бессмысленен
-    SH_F_ENABLE_CROWDSEC_LIST="$(shield_conf_get ENABLE_CROWDSEC_LIST 0)"
+    SH_F_ENABLE_CROWDSEC_LIST="$(shield_conf_get ENABLE_CROWDSEC_LIST 1)"   # v1.1.6: дефолт 1
     # spamhaus/cins: бесплатные фиды без ключа — default 1 (worst-of-the-worst, ложных срабатываний почти нет)
     SH_F_ENABLE_SPAMHAUS_LIST="$(shield_conf_get ENABLE_SPAMHAUS_LIST 1)"
     SH_F_ENABLE_CINS_LIST="$(shield_conf_get ENABLE_CINS_LIST 1)"
@@ -100,22 +100,22 @@ shield_limits_resolve() {
     # защищаемые порты = auto-detect (ssh+xray) + EXTRA из конфига
     local det_t det_u
     det_t="$(shield_detect_protected_ports)"
-    det_u=""
-    if command -v ss >/dev/null 2>&1; then
-        # 2026-09-23: у `ss -ulnp` есть колонка State (UNCONN) — $5 был Peer
-        # ('0.0.0.0:*'), мусор уходил в protected_udp и nft -c отвергал ruleset
-        # при ЛЮБОМ UDP-inbound xray. Local = первое поле вида адрес:порт.
-        det_u="$(ss -ulnp 2>/dev/null | _ss_local_ports 'xray|remnanode' | sort -un | tr '\n' ' ' | sed 's/ $//' || true)"
-    fi
-    # 2026-09-24 (v1.1.5): keep-last-good и для UDP (раньше не было вовсе — apply во время
-    # рестарта xray оставлял protected_udp пустым до следующего apply)
-    local ustate="$SHIELD_STATE_DIR/protected-ports-udp.txt"
-    if [ -n "$det_u" ]; then
-        echo "$det_u" > "$ustate" 2>/dev/null || true
+    # 2026-09-25 (v1.2.0): UDP-инбаунды — из shield_detect_inbounds (конфиг Xray через API), а
+    # НЕ все UNCONN-сокеты ядра: там же эфемерные исходящие сокеты каждого UDP-потока клиента
+    # (DIAGNOSIS P0-1). keep-last-good — только если детектор не нашёл ядро вовсе (none): при
+    # api/heuristic пустой UDP — это «UDP-инбаундов нет», а не «ядро лежит». Файл состояния
+    # сменил имя (.v2): файл v1.3.0 мог содержать эфемерные порты — не воскрешаем.
+    shield_detect_inbounds
+    local det_u="$SH_IB_UDP"
+    local ustate="$SHIELD_STATE_DIR/protected-ports-udp.v2.txt"
+    if [ "$SH_IB_SOURCE" != none ]; then
+        printf '%s\n' "$det_u" > "$ustate" 2>/dev/null || true
     elif [ -s "$ustate" ]; then
         det_u="$(cat "$ustate")"
-        log warn "limits" "xray/remnanode не слушает UDP — keep-last-good: $det_u"
+        log warn "limits" "VPN-ядро не запущено — UDP-инбаунды из последнего состояния: $det_u"
     fi
+    log info "limits" "инбаунды (${SH_IB_SOURCE}): tcp=[${SH_IB_TCP}] udp=[${SH_IB_UDP}] api-ноды=[${SH_IB_API_PORT}]"
+    det_u="$det_u $(shield_detect_ufw_ports udp)"   # 2026-09-24 (v1.1.6): после keep-last-good
     local extra_t extra_u
     extra_t="$(shield_conf_get PROTECTED_TCP_EXTRA "")"
     extra_u="$(shield_conf_get PROTECTED_UDP_EXTRA "")"
@@ -136,8 +136,12 @@ shield_limits_resolve() {
             fi
             case "$op" in
                 PORT)  excl_ports_v4="$excl_ports_v4 $arg" ;;
-                IP)    case "$arg" in *:*) excl_v6="$excl_v6 $arg" ;; *) excl_v4="$excl_v4 $arg" ;; esac ;;
-                IP6)   excl_v6="$excl_v6 $arg" ;;
+                IP|IP6)
+                       # 2026-09-24 (v1.1.6): только валидный адрес/CIDR (см. shield_valid_cidr)
+                       if ! shield_valid_cidr "$arg"; then
+                           log warn "exclude" "не адрес/CIDR или маска шире /8 (v4) //16 (v6), пропущено: $line"; continue
+                       fi
+                       case "$arg" in *:*) excl_v6="$excl_v6 $arg" ;; *) excl_v4="$excl_v4 $arg" ;; esac ;;
                 *)     log warn "exclude" "неизвестная директива: $line" ;;
             esac
         done < "$SHIELD_EXCLUDE"
@@ -145,12 +149,16 @@ shield_limits_resolve() {
 
     # вычитаем exclude-порты из protected
     local p out_t="" out_u=""
+    # 2026-09-24 (v1.1.6): невалидный порт (опечатка в *_EXTRA) раньше уходил в nft и
+    # nft -c отвергал ВЕСЬ ruleset — теперь пропускается с warn
     for p in $det_t $extra_t; do
+        shield_port_valid "$p" || { log warn "limits" "protected tcp: '$p' — не порт/диапазон, пропущен"; continue; }
         case " $excl_ports_v4 " in *" $p "*) continue ;; esac
         case " $out_t " in *" $p "*) continue ;; esac
         out_t="$out_t $p"
     done
     for p in $det_u $extra_u; do
+        shield_port_valid "$p" || { log warn "limits" "protected udp: '$p' — не порт/диапазон, пропущен"; continue; }
         case " $excl_ports_v4 " in *" $p "*) continue ;; esac
         case " $out_u " in *" $p "*) continue ;; esac
         out_u="$out_u $p"
@@ -163,6 +171,8 @@ shield_limits_resolve() {
     trusted="$(shield_conf_get TRUSTED_IPS "")"
     local tip
     for tip in $trusted; do
+        # 2026-09-24 (v1.1.6): невалидный/слишком широкий адрес — warn и пропуск (не ломаем apply)
+        shield_valid_cidr "$tip" || { log warn "limits" "TRUSTED_IPS: '$tip' — не адрес/CIDR или маска шире /8 (v4) //16 (v6), пропущен"; continue; }
         case "$tip" in
             *:*) t_v6="$t_v6 $tip" ;;
             *)   t_v4="$t_v4 $tip" ;;
@@ -173,12 +183,31 @@ shield_limits_resolve() {
 
     # IPv6-флаг (читалка из детекта); node мог отключить IPv6 (HARDEN_IPV6=1) —
     # тогда v6-правила не генерируем: трафика нет, ruleset компактнее
+    # 2026-09-25 (v1.2.0): IPv6 на ноде выключен ОБЯЗАТЕЛЬНО (node: ipv6.disable=1 + sysctl).
+    # v6-правил лимитов больше нет: любой IPv6-пакет режет fail-safe в начале prerouting
+    # (и на выходе/транзите) — даже если IPv6 вернулся (DIAGNOSIS P1-4). Прежде при
+    # ipv6_disabled=1 не генерировалось НИ ОДНОГО v6-правила, и вернувшийся IPv6 шёл мимо.
     export SH_F_IPV6=0
-    [ -r /proc/net/if_inet6 ] && SH_F_IPV6=1
-    if [ "$SH_F_IPV6" = "1" ] && [ -f /etc/node-profile.d/stack.conf ] \
-        && grep -q '^ipv6_disabled=1' /etc/node-profile.d/stack.conf 2>/dev/null; then
-        SH_F_IPV6=0
-        log info "limits" "node отключил IPv6 (stack.conf: ipv6_disabled=1) — v6-правила пропущены"
+
+    # 2026-09-25 (v1.2.0): API ноды (remnanode) — только панели: TRUSTED_IPS (v4) + источники
+    # UFW «allow from X to any port <порт>». Не известно ни одного — порт не ограничиваем
+    # (не отрезаем панель), health/guard громко предупреждают (DIAGNOSIS P0-2).
+    shield_detect_inbounds
+    export SH_F_NODE_API_PORT="${SH_IB_API_PORT:-}" SH_F_NODE_API_ALLOW_V4="" SH_F_NODE_API_PORT_SET=""
+    if [ -n "$SH_F_NODE_API_PORT" ]; then
+        local a allow=""
+        for a in $(shield_conf_get TRUSTED_IPS "") $(shield_detect_ufw_sources tcp "$SH_F_NODE_API_PORT"); do
+            case "$a" in *:*) continue ;; esac
+            shield_valid_cidr "$a" || continue
+            case " $allow " in *" $a "*) ;; *) allow="$allow $a" ;; esac
+        done
+        SH_F_NODE_API_ALLOW_V4="${allow# }"
+        if [ -n "$SH_F_NODE_API_ALLOW_V4" ]; then
+            SH_F_NODE_API_PORT_SET="$SH_F_NODE_API_PORT"
+            log info "limits" "API ноды :$SH_F_NODE_API_PORT — только с [$SH_F_NODE_API_ALLOW_V4]"
+        else
+            log warn "limits" "API ноды :$SH_F_NODE_API_PORT доступен ВСЕМ: IP панели неизвестен. Задай его: sudo vpn-node → Безопасность → Доверенные IP (или TRUSTED_IPS=\"<IP панели>\" в /etc/shieldnode/config.conf)"
+        fi
     fi
 
     # admin IP сессии (whitelist, §20) — только если не loopback
@@ -292,6 +321,7 @@ Description=shieldnode cleanup timer
 
 [Timer]
 OnBootSec=5min
+OnActiveSec=5min
 OnUnitActiveSec=15min
 
 [Install]
@@ -299,7 +329,7 @@ WantedBy=timers.target
 EOF
     if [ "${DRY_RUN:-0}" != "1" ]; then
         systemctl daemon-reload
-        systemctl enable --now shieldnode-cleanup.timer
+        systemctl enable shieldnode-cleanup.timer && systemctl restart shieldnode-cleanup.timer   # v1.2.0: см. lib/blocklist.sh «активируем»
     fi
     ok "limits" "cleanup timer installed"
 }

@@ -24,7 +24,7 @@ esac
 EOF
 chmod +x "$OUT/bin/ss"
 export PATH="$OUT/bin:$PATH" SS_MODE_FILE="$OUT/mode" SHIELD_DIR SHIELD_STATE_DIR="$OUT/state" SHIELD_LOG="$OUT/log"
-export SHIELD_CONFIG="$OUT/c" SHIELD_EXCLUDE="$OUT/none" SSH_CONNECTION=""
+export SHIELD_CONFIG="$OUT/c" SHIELD_EXCLUDE="$OUT/none" SSH_CONNECTION="" SHIELD_UFW_DIR="$OUT/no-ufw"
 printf 'SSH_PORT=22\n' > "$OUT/c"; : > "$OUT/log"
 fails=0
 t() { local name="$1"; shift

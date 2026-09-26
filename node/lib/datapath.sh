@@ -1,7 +1,7 @@
 #!/bin/bash
 # node — lib/datapath.sh: datapath-pack 2 (порт ШАГ 7.12A/B старой ветки, v5.x).
 # Обоснования — из боевого лога старого скрипта:
-#   netdev_budget=600 (usecs пропорционально: 4000; v1.1.7 — было 8000): дефолтный
+#   netdev_budget=600 (usecs — v1.1.8: пропорционально budget в целых jiffy, >= 2 jiffy): дефолтный
 #     NAPI budget=300 пакетов/2ms — softirq не успевает выгребать RX-ring при 20k+ сессий;
 #   tcp_max_tw_buckets=524288: TIME_WAIT-потолок (дефолт 16-32k) — узкое
 #     место массовых коротких VPN-сессий;
@@ -48,6 +48,31 @@ node_softnet_read() {
     _NODE_SN_READ=1
 }
 # node_conf_user_set — в config.sh (v1.1.7: нужен и irq.sh в rt-reapply)
+
+# node_kernel_hz — CONFIG_HZ текущего ядра (пусто, если не определить). 2026-09-25 (v1.1.8)
+# node_kernel_hz_floor — 2026-09-26 (v1.2.0): НАИМЕНЬШИЙ HZ среди ядер, которые могут загрузиться:
+# текущее, все /boot/config-*, и XanMod (HZ=250), если он запрошен, но ещё не стоит. sysctl-файл
+# пишется ДО шага установки XanMod; значение под стоковое HZ=1000 (4000µs) XanMod отвергает при
+# boot — systemd-sysctl.service failed при первой загрузке нового ядра (лаба, 6.18.54-xanmod1).
+node_kernel_hz_floor() {
+    local cur v min="" f
+    cur="$(node_kernel_hz)"; [[ "$cur" =~ ^[0-9]+$ ]] && min="$cur"
+    for f in "${NODE_BOOT_DIR:-/boot}"/config-*; do
+        [ -r "$f" ] || continue
+        v="$(sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' "$f" | head -1)"
+        [[ "$v" =~ ^[0-9]+$ ]] && { [ -z "$min" ] || [ "$v" -lt "$min" ]; } && min="$v"
+    done
+    if [ "$(node_conf_get ENABLE_XANMOD 0)" = 1 ] && ! ls "${NODE_BOOT_DIR:-/boot}"/config-*xanmod* >/dev/null 2>&1; then
+        { [ -z "$min" ] || [ 250 -lt "$min" ]; } && min=250
+    fi
+    printf '%s' "$min"
+}
+node_kernel_hz() {
+    local f="${NODE_KERNEL_CONFIG:-/boot/config-$(uname -r)}" v=""
+    [ -r "$f" ] && v="$(sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' "$f" | head -1)"
+    [ -z "$v" ] && [ -r /proc/config.gz ] && v="$(zcat /proc/config.gz 2>/dev/null | sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' | head -1)"
+    printf '%s' "$v"
+}
 # node_softnet_value <ключ-конфига> <значение-плана> <drop|squeeze> — шаг вверх (x2)
 # ТОЛЬКО при доказанном насыщении и AUTO_SOFTNET_TUNE=1; иначе значение плана как есть.
 node_softnet_value() {
@@ -57,7 +82,10 @@ node_softnet_value() {
     case "$kind" in
         drop)    [ "${_NODE_SN_DROP:-0}" -gt 0 ] && v=$((v * 2)) ;;
         # squeeze > 0.1% processed: единичные исторические squeeze не в счёт
-        squeeze) [ $(( ${_NODE_SN_SQZ:-0} * 1000 )) -gt "${_NODE_SN_PROC:-0}" ] && [ "${_NODE_SN_SQZ:-0}" -gt 0 ] && v=$((v * 2)) ;;
+        # 2026-09-26 (v1.2.0): и не меньше 100 000 обработанных пакетов — на лабе после rollback решение
+        # принималось по 32 squeeze из 4558 пакетов (шум первых минут после boot): budget прыгал
+        # 600 <-> 1200 между apply (e2e критерий 7)
+        squeeze) [ "${_NODE_SN_PROC:-0}" -ge 100000 ] && [ $(( ${_NODE_SN_SQZ:-0} * 1000 )) -gt "${_NODE_SN_PROC:-0}" ] && [ "${_NODE_SN_SQZ:-0}" -gt 0 ] && v=$((v * 2)) ;;
     esac
     echo "$v"
 }
@@ -70,6 +98,9 @@ node_softnet_value() {
 node_perf_snapshot() {
     local pr="${NODE_PROC_ROOT:-/proc}" sr="${NODE_SYS_ROOT:-/sys}" ifname k
     echo "ts=$(date +%s)"
+    # 2026-09-26 (v1.2.1): счётчики ядра обнуляются при загрузке — без boot_id дельты «с apply»
+    # после reboot выходили отрицательными (живая нода: squeeze=-0.392%)
+    echo "boot_id=$(tr -d '-' < "$pr/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)"
     if declare -F node_softnet_read >/dev/null 2>&1; then
         unset _NODE_SN_READ; node_softnet_read   # свежее чтение, не кэш плана
         echo "softnet_processed=$_NODE_SN_PROC"; echo "softnet_dropped=$_NODE_SN_DROP"; echo "softnet_squeeze=$_NODE_SN_SQZ"
@@ -103,6 +134,7 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
         function d(k) { return c[k] - b[k] }
         END {
             dt = d("ts"); if (dt <= 0) dt = 1
+            if (b["boot_id"] != "" && c["boot_id"] != "" && b["boot_id"] != c["boot_id"]) { print "perf: после apply был reboot — счётчики ядра обнулились; дельты появятся после следующего apply"; exit }
             if (d("softnet_processed") < 0 || d("cpu_total") < 0) { print "perf: счётчики меньше baseline — был reboot; повтори apply для нового baseline"; exit }
             ret = (d("TcpOutSegs") > 0) ? 100 * d("TcpRetransSegs") / d("TcpOutSegs") : 0
             sq  = (d("softnet_processed") > 0) ? 100 * d("softnet_squeeze") / d("softnet_processed") : 0
@@ -112,12 +144,15 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
                 dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, d("UdpRcvbufErrors"), st, si, d("nic_rx_dropped"), d("nic_rx_missed_errors")
             n = 0
             if (d("softnet_dropped") > 0)        { n++; print "  LIMIT: softnet backlog overflow — netdev_max_backlog (AUTO_SOFTNET_TUNE при следующем apply) / ENABLE_RPS" }
-            if (sq > 0.1)                        { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
+            # v1.2.1: как и автонастройка — только на выборке >= 100 000 пакетов (лаба: 7 событий из ~270 за 18 с)
+            if (sq > 0.1 && d("softnet_processed") >= 100000) { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
             if (d("TcpExtListenOverflows") > 0 || d("TcpExtListenDrops") > 0) { n++; print "  LIMIT: accept-очередь переполняется — somaxconn/tcp_max_syn_backlog или backlog inbound xray" }
             if (d("UdpRcvbufErrors") > 0)        { n++; print "  LIMIT: UDP receive buffer — rmem_default/udp_mem (QUIC/Hysteria2)" }
             if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
             if (st > 5)                          { n++; printf "  NOTE: CPU steal %.1f%% — конкуренция на гипервизоре; тюнинг хоста не поможет\n", st }
-            if (d("nic_rx_missed_errors") > 0 || d("nic_rx_dropped") > 0) { n++; print "  LIMIT: NIC дропает на приёме — NIC_RING_RX / ENABLE_NIC_OFFLOAD_OPT (кольца до max)" }
+            # v1.2.1: единичные дропы (живая нода: +1 за 13 мин) — не предел; > 0.1% пакетов или >= 100
+            nd = d("nic_rx_missed_errors") + d("nic_rx_dropped"); np = d("nic_rx_packets")
+            if (nd >= 100 || (np > 0 && 1000 * nd > np)) { n++; printf "  LIMIT: NIC дропает на приёме (%d пакетов) — NIC_RING_RX / ENABLE_NIC_OFFLOAD_OPT (кольца до max)\n", nd }
             if (n == 0) print "  нет сигналов узкого места на стороне хоста с момента apply"
         }' "$base" "$cur"
     rm -f "$cur"
@@ -128,16 +163,39 @@ node_datapath_plan() {
     local f="$NODE_SYSCTL_DATAPATH"
 
     node_softnet_read
-    local nb; nb="$(node_softnet_value NETDEV_BUDGET "$(node_conf_get NETDEV_BUDGET 600)" squeeze)"
-    [ "$nb" != "$(node_conf_get NETDEV_BUDGET 600)" ] && log info "datapath" "softnet: time_squeeze=${_NODE_SN_SQZ}/${_NODE_SN_PROC} (>0.1%) — netdev_budget -> $nb (AUTO_SOFTNET_TUNE)"
+    # 2026-09-24 (v1.1.8): значение конфига идёт в $(( )) ниже — bash вычисляет содержимое
+    # переменной как выражение (NETDEV_BUDGET='x[$(cmd)]' исполнил бы cmd): только цифры
+    local nb; nb="$(node_conf_get NETDEV_BUDGET 600)"
+    [[ "$nb" =~ ^[0-9]{1,7}$ ]] || { warn "datapath" "NETDEV_BUDGET='$nb' — не число, берём 600"; nb=600; }
+    nb="$(node_softnet_value NETDEV_BUDGET "$nb" squeeze)"
+    node_conf_user_set NETDEV_BUDGET || [ "$nb" = 600 ] || log info "datapath" "softnet: time_squeeze=${_NODE_SN_SQZ}/${_NODE_SN_PROC} (>0.1%) — netdev_budget -> $nb (AUTO_SOFTNET_TUNE)"
     node_sysctl_add "$f" net.core.netdev_budget "$nb"
-    # 2026-09-24 (v1.1.7): usecs — пропорционально budget (дефолт ядра 2000µs на 300 пакетов):
-    # 600 -> 4000, после авто-удвоения по time_squeeze 1200 -> 8000. Прежние безусловные 8000
-    # при budget 600 давали softirq-циклы до 8мс (2 тика при HZ=250 у XanMod) — задержка
-    # Xray/real-time UDP на этом ядре CPU без выигрыша (packet-budget исчерпывается раньше).
-    local nbu; nbu="$(node_conf_get NETDEV_BUDGET_USECS "")"
-    [[ "$nbu" =~ ^[0-9]+$ ]] || nbu=$(( nb > 0 ? 2000 * nb / 300 : 4000 ))
-    node_sysctl_add "$f" net.core.netdev_budget_usecs "$nbu"
+    # 2026-09-25 (v1.1.8): usecs — В ЦЕЛЫХ JIFFY. net_rx_action считает лимит как
+    # jiffies + usecs_to_jiffies(usecs); дефолт ядра = 2 jiffy (hotdata.c: 2*USEC_PER_SEC/HZ),
+    # и с 6.x это же МИНИМУМ (sysctl_net_core.c: netdev_budget_usecs_min). Прежняя формула v1.1.7
+    # (2000µs на 300 пакетов -> 4000) исходила из HZ=1000: на XanMod (HZ=250) 4000 = 1 jiffy ->
+    # EINVAL на 6.18, sysctl -p ронял apply (живая нода). Теперь: пропорционально budget, но
+    # не меньше 2 jiffy и кратно jiffy; ключ пишем, только если это БОЛЬШЕ дефолта ядра.
+    # HZ неизвестен — не пишем вовсе (дефолт ядра всегда валиден). Явное значение < минимума — warn.
+    local nbu hz jus min want
+    hz="$(node_kernel_hz_floor)"   # v1.2.0: валидно для ВСЕХ ядер, которые могут загрузиться
+    nbu="$(node_conf_get NETDEV_BUDGET_USECS "")"
+    if [[ "$hz" =~ ^[0-9]+$ ]] && [ "$hz" -gt 0 ]; then
+        jus=$((1000000 / hz)); min=$((2 * jus))
+        if [ -n "$nbu" ]; then
+            if ! [[ "$nbu" =~ ^[0-9]{1,8}$ ]] || [ "$nbu" -lt "$min" ]; then
+                warn "datapath" "NETDEV_BUDGET_USECS='$nbu' — не число или < минимума ядра ${min}µs (2 jiffy при HZ=$hz): ключ не пишем"
+                nbu=""
+            fi
+        else
+            want=$(( 2000 * nb / 300 ))
+            want=$(( (want + jus - 1) / jus * jus ))            # вверх до целого jiffy
+            [ "$want" -gt "$min" ] && nbu="$want"              # == дефолт ядра — не трогаем
+        fi
+    elif [ -n "$nbu" ]; then
+        [[ "$nbu" =~ ^[0-9]{1,8}$ ]] && [ "$nbu" -ge 20000 ] || { warn "datapath" "HZ ядра не определён — NETDEV_BUDGET_USECS='$nbu' не пишем (минимум неизвестен)"; nbu=""; }
+    fi
+    [ -n "$nbu" ] && node_sysctl_add "$f" net.core.netdev_budget_usecs "$nbu"
     node_sysctl_add "$f" net.ipv4.tcp_max_tw_buckets "$(node_conf_get TCP_MAX_TW_BUCKETS 524288)"
 
     # tcp_mem: потолок ≈ TCP_MEM_PCT% RAM (страницы), pressure 75%/87.5% от него
@@ -148,7 +206,11 @@ node_datapath_plan() {
     pct="$(node_conf_get TCP_MEM_PCT 25)"
     [[ "$pct" =~ ^[0-9]+$ ]] || pct=25
     [ "$pct" -gt 0 ] && [ "$pct" -le 80 ] || pct=25
-    memp=$(( pages * pct / 100 ))
+    # 2026-09-26 (v1.2.1): кратно 256 страницам (1 МиБ). MemTotal «плавает» на десятки КБ между
+    # загрузками (живая нода: 250573 -> 250572 после reboot) — план менялся на 1 страницу, status
+    # показывал ложный ✗, а каждый apply переписывал sysctl-файл
+    memp=$(( pages * pct / 100 / 256 * 256 ))
+    [ "$memp" -ge 256 ] || memp=256
     node_sysctl_add "$f" net.ipv4.tcp_mem "$((memp*3/4)) $((memp*7/8)) $memp"
 
     # 2026-09-24 (v1.1.7): rmem_default/wmem_default — дефолтный буфер ВСЕХ не-TCP сокетов
@@ -189,7 +251,9 @@ node_datapath_plan() {
     # имела 45056, tier T1 32768 его ПОНИЖАЛ — меньше запаса для GFP_ATOMIC skb в softirq,
     # обратное задуманному. Базовое значение ниже tier — поднимаем, иначе ключ не пишем.
     local mfb; mfb="$(node_sysctl_baseline vm.min_free_kbytes)"
+    local mft="$mfk"
     mfk="$(node_conf_get VM_MIN_FREE_KBYTES "$mfk")"
+    [[ "$mfk" =~ ^[0-9]{1,9}$ ]] || { warn "datapath" "VM_MIN_FREE_KBYTES='$mfk' — не число, tier-значение $mft"; mfk="$mft"; }
     if node_conf_user_set VM_MIN_FREE_KBYTES || ! [[ "$mfb" =~ ^[0-9]+$ ]] || [ "$mfk" -gt "$mfb" ]; then
         node_sysctl_add "$NODE_SYSCTL_MEM" vm.min_free_kbytes "$mfk"
     fi
@@ -250,6 +314,29 @@ node_fq_tune_apply() {
 # ("Qdisc not found ... NLM_F_CREATE") — тогда replace тем же fq с новыми
 # параметрами (тип qdisc не меняется). rc!=0, если хоть один fq не обновлён.
 rc=0
+# 2026-09-25 (v1.2.0): fq должен реально стоять на NIC. net.core.default_qdisc=fq действует только
+# на НОВЫЕ qdisc — после apply без reboot NIC оставался на fq_codel (лаба: «BBR + fq» в итоге, а на
+# enp5s0 fq_codel). Для физических NIC (есть /sys/class/net/<dev>/device):
+#  * корневой mq с дефолтным handle 0: — его дочерние («parent :1») неадресуемы ни change, ни
+#    replace («Failed to find specified qdisc»; virtio-net multiqueue, 6.8) — пересоздаём mq с
+#    handle 1:, ядро создаёт дочерние по default_qdisc (fq); не-fq дочерние под 1: -> fq;
+#  * одиночная очередь (fq_codel/pfifo_fast в корне) -> fq в корне.
+# Разовый сброс очередей NIC (как при boot).
+SYSNET="${SYSNET:-/sys/class/net}"
+if [ "$(cat "${DEFQ_FILE:-/proc/sys/net/core/default_qdisc}" 2>/dev/null)" = fq ]; then
+    for dev in $(ls "$SYSNET" 2>/dev/null); do
+        [ -e "$SYSNET/$dev/device" ] || continue
+        root="$(tc qdisc show dev "$dev" 2>/dev/null | awk '$4 == "root" || $3 == "root" {print $2, $3; exit}')"
+        case "$root" in
+            "mq 0:") tc qdisc replace dev "$dev" root handle 1: mq 2>/dev/null || rc=1 ;;
+            "fq "*|"mq "*|"noqueue "*|"") : ;;
+            *) tc qdisc replace dev "$dev" root fq 2>/dev/null || rc=1 ;;
+        esac
+        # дочерние под адресуемым mq, которые не fq -> fq
+        tc qdisc show dev "$dev" 2>/dev/null | awk '$1 == "qdisc" && $2 != "fq" && $2 != "mq" { for (i = 1; i <= NF; i++) if ($i == "parent" && $(i + 1) !~ /^:/) print $(i + 1) }' \
+            | while read -r par; do tc qdisc replace dev "$dev" parent "$par" fq 2>/dev/null || true; done
+    done
+fi
 while read -r kind dev parent handle; do
     [ -n "$dev" ] || continue
     case "$kind" in
@@ -308,10 +395,20 @@ TCEOF
             printf "%s\t%s\t%s\t%s\t%s\n", dev, where, l, f, b
         }')
         local frc=0
-        "$script" || frc=$?
         systemctl daemon-reload 2>/dev/null || true
         systemctl enable node-fq-tune.service >/dev/null 2>&1 || \
             log warn "datapath" "systemctl enable node-fq-tune.service не удался"
+        # 2026-09-25 (v1.2.0): запуск ЧЕРЕЗ юнит — его состояние = реальность. Обновление с v1.3.0:
+        # старый скрипт падал при boot на «mq 0:» (virtio multiqueue), новый apply запускал скрипт
+        # напрямую — fq стоял, а юнит оставался failed (`systemctl --failed`, мониторинг)
+        local via_unit="${NODE_FQ_VIA_UNIT:-auto}"
+        [ "$via_unit" = auto ] && { [ -d /run/systemd/system ] && via_unit=1 || via_unit=0; }
+        if [ "$via_unit" = 1 ]; then
+            systemctl reset-failed node-fq-tune.service >/dev/null 2>&1 || true
+            systemctl restart node-fq-tune.service >/dev/null 2>&1 || frc=$?
+        else
+            "$script" || frc=$?
+        fi
         # 2026-09-24 (v1.1.5): «fq tuned» — только если tc реально принял параметры
         if [ "$frc" = 0 ]; then
             ok "datapath" "fq tuned: limit=$limit flow_limit=$fl buckets=$buckets"

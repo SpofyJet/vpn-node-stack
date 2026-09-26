@@ -20,6 +20,9 @@ SHIELD_BLOCKLIST_OVERRIDE=/etc/shieldnode/blocklist.conf
 shield_blocklist_kick() {
     [ "${SHIELD_BL_KICK:-0}" = "1" ] || return 0
     flock -u 9 2>/dev/null || true
+    # 2026-09-25 (v1.2.0, P0-2): таблица только что пересоздана — снимки сразу, сеть — в фоне
+    [ -x "${SHIELD_BLOCKLIST_SCRIPT:-/usr/local/sbin/shieldnode-blocklist}" ] && \
+        timeout 120 "${SHIELD_BLOCKLIST_SCRIPT:-/usr/local/sbin/shieldnode-blocklist}" --restore-last-good >/dev/null 2>&1 || true
     systemctl start --no-block shieldnode-blocklist.service 2>/dev/null || true
 }
 
@@ -57,9 +60,29 @@ shield_blocklist_install() {
         # локальный источник: updater читает cscli decisions (демон тянет CAPI сам)
         cs_endpoint="local://cscli-decisions"
     elif [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
-        log warn "blocklist" "ENABLE_CROWDSEC_LIST=1, но креды не заданы — будет agent-режим (нужен crowdsec-демон); либо задай CROWDSEC_INTEGRATION_ID/USER/PASSWORD для feed"
+        log info "blocklist" "crowdsec: креды не заданы — agent-режим (crowdsec-демон); для feed задай CROWDSEC_INTEGRATION_ID/USER/PASSWORD"
     fi
 
+    # 2026-09-24 (v1.1.6): значения конфига запекаются в root-скрипт внутри "...": URL/ID с
+    # " $ ` \ исполнялись бы таймером как код (или ломали updater). URL с такими символами —
+    # отбрасываем с warn; числа — только цифры, иначе дефолт.
+    _bl_safe() { # _bl_safe <имя> <значение>
+        case "$2" in
+            *[\"\$\`\\]*|*$'\n'*) log warn "blocklist" "$1: недопустимые символы (\" \$ \` \\) — значение отброшено" >&2; echo "" ;;
+            *) printf '%s\n' "$2" ;;
+        esac
+    }
+    _bl_num() { # _bl_num <имя> <значение> <дефолт>
+        if [[ "$2" =~ ^[0-9]+$ ]]; then echo "$2"; else log warn "blocklist" "$1='$2' — не число, берём $3" >&2; echo "$3"; fi
+    }
+    # интервал crowdsec: вычисляем ДО генерации updater'а — блок `{ ... } | persist` ниже
+    # исполняется в subshell, и переменная нужна ещё и таймеру agent-режима (2b)
+    local cs_interval
+    if [ "$cs_mode" = "agent" ]; then
+        cs_interval="$(_bl_num CROWDSEC_AGENT_INTERVAL_MIN "$(shield_conf_get CROWDSEC_AGENT_INTERVAL_MIN 30)" 30)"
+    else
+        cs_interval="$(_bl_num CROWDSEC_UPDATE_INTERVAL_MIN "$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)" 1440)"
+    fi
     # --- 1) updater-скрипт ---
     {
         cat <<'HEADER_EOF'
@@ -88,14 +111,17 @@ HEADER_EOF
         printf 'BL_ENABLED_crowdsec="%s"\n' "${SH_F_ENABLE_CROWDSEC_LIST:-0}"
         printf 'BL_ENABLED_spamhaus="%s"\n' "${SH_F_ENABLE_SPAMHAUS_LIST:-1}"
         printf 'BL_ENABLED_cins="%s"\n' "${SH_F_ENABLE_CINS_LIST:-1}"
-        printf 'BL_URLS_scanner="%s"\n' "$svc_scanner"
-        printf 'BL_URLS_threat="%s"\n' "$svc_threat"
-        printf 'BL_URLS_tor="%s"\n' "$svc_tor"
+        printf 'BL_URLS_scanner="%s"\n' "$(_bl_safe BLOCKLIST_SCANNER_URLS "$svc_scanner")"
+        printf 'BL_URLS_threat="%s"\n' "$(_bl_safe BLOCKLIST_THREAT_URLS "$svc_threat")"
+        printf 'BL_URLS_tor="%s"\n' "$(_bl_safe BLOCKLIST_TOR_URLS "$svc_tor")"
         # custom: локальный файл /etc/shieldnode/lists/custom.txt (оператор) +
         # опциональный центральный URL (BLOCKLIST_CUSTOM_URLS — например raw
         # custom.txt из операторского репо; синкается каждый тик таймера)
-        printf 'BL_URLS_custom="%s"\n' "$(shield_conf_get BLOCKLIST_CUSTOM_URLS "")"
-        printf 'BL_URLS_crowdsec="%s"\n' "$cs_endpoint"
+        # 2026-09-25 (v1.1.8): дефолт — список оператора; none/off/0 — только локальный файл
+        local cu; cu="$(shield_conf_get BLOCKLIST_CUSTOM_URLS "")"
+        case "$cu" in none|off|0|no) cu="" ;; esac
+        printf 'BL_URLS_custom="%s"\n' "$(_bl_safe BLOCKLIST_CUSTOM_URLS "$cu")"
+        printf 'BL_URLS_crowdsec="%s"\n' "$(_bl_safe CROWDSEC_INTEGRATION_ID "$cs_endpoint")"
         # spamhaus DROP/EDROP (v4) + dropv6 (v6): формат "S24-x.y.z.w/24 ; comment"
         # (префикс S<len>- и хвост после ';' срезаются парсером)
         printf 'BL_URLS_spamhaus="https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/dropv6.txt https://www.spamhaus.org/drop/edrop.txt"\n'
@@ -104,13 +130,21 @@ HEADER_EOF
         # креды crowdsec НЕ запекаются в updater (скрипт 0750, но читаем
         # группой) — они живут в /etc/shieldnode/crowdsec.creds (0600 root),
         # updater source'ит его при каждом тике (см. BODY)
-        printf 'BL_MIN_scanner="%s"\n' "$(shield_conf_get MIN_ENTRIES_SCANNER 1000)"
-        printf 'BL_MIN_threat="%s"\n' "$(shield_conf_get MIN_ENTRIES_THREAT 500)"
-        printf 'BL_MIN_tor="%s"\n' "$(shield_conf_get MIN_ENTRIES_TOR 100)"
-        printf 'BL_MIN_custom="%s"\n' "$(shield_conf_get MIN_ENTRIES_CUSTOM 0)"
-        printf 'BL_MIN_crowdsec="%s"\n' "$(shield_conf_get MIN_ENTRIES_CROWDSEC 500)"
-        printf 'BL_MIN_spamhaus="%s"\n' "$(shield_conf_get MIN_ENTRIES_SPAMHAUS 50)"
-        printf 'BL_MIN_cins="%s"\n' "$(shield_conf_get MIN_ENTRIES_CINS 2000)"
+        printf 'BL_MIN_scanner="%s"\n' "$(_bl_num MIN_ENTRIES_SCANNER "$(shield_conf_get MIN_ENTRIES_SCANNER 1000)" 1000)"
+        printf 'BL_MIN_threat="%s"\n' "$(_bl_num MIN_ENTRIES_THREAT "$(shield_conf_get MIN_ENTRIES_THREAT 500)" 500)"
+        printf 'BL_MIN_tor="%s"\n' "$(_bl_num MIN_ENTRIES_TOR "$(shield_conf_get MIN_ENTRIES_TOR 100)" 100)"
+        printf 'BL_MIN_custom="%s"\n' "$(_bl_num MIN_ENTRIES_CUSTOM "$(shield_conf_get MIN_ENTRIES_CUSTOM 0)" 0)"
+        # 2026-09-25 (v1.1.6): MIN — защита от оборванной ЗАГРУЗКИ (feed). В agent-режиме читается
+        # локальная БД: свежая установка несколько часов получает 0 community-записей (CAPI), а
+        # локальные решения (SSH-брутфорс, пойманный самим crowdsec) при MIN 500 отбрасывались,
+        # юнит висел failed. Для agent — свой минимум (дефолт 0); сбой cscli — по-прежнему ошибка.
+        if [ "$cs_mode" = "agent" ]; then
+            printf 'BL_MIN_crowdsec="%s"\n' "$(_bl_num MIN_ENTRIES_CROWDSEC_AGENT "$(shield_conf_get MIN_ENTRIES_CROWDSEC_AGENT 0)" 0)"
+        else
+            printf 'BL_MIN_crowdsec="%s"\n' "$(_bl_num MIN_ENTRIES_CROWDSEC "$(shield_conf_get MIN_ENTRIES_CROWDSEC 500)" 500)"
+        fi
+        printf 'BL_MIN_spamhaus="%s"\n' "$(_bl_num MIN_ENTRIES_SPAMHAUS "$(shield_conf_get MIN_ENTRIES_SPAMHAUS 50)" 50)"
+        printf 'BL_MIN_cins="%s"\n' "$(_bl_num MIN_ENTRIES_CINS "$(shield_conf_get MIN_ENTRIES_CINS 2000)" 2000)"
         printf 'BL_MAX_scanner=100000\nBL_MAX_threat=200000\nBL_MAX_tor=10000\nBL_MAX_custom=50000\nBL_MAX_crowdsec=400000\nBL_MAX_spamhaus=20000\nBL_MAX_cins=200000\n'
         # размер сетов (для tmp-сета при атомарном swap — должен совпадать с firewall)
         printf 'BL_SIZE_scanner="%s"\nBL_SIZE_threat="%s"\nBL_SIZE_tor="%s"\nBL_SIZE_custom="%s"\nBL_SIZE_crowdsec="%s"\nBL_SIZE_spamhaus="%s"\nBL_SIZE_cins="%s"\n' \
@@ -127,13 +161,11 @@ HEADER_EOF
         # agent — читаем ЛОКАЛЬНУЮ БД демона (демон сам тянет CAPI ~раз/2ч),
         # дефолт 30 мин без риска рейт-лимита. Ключи разведены: у feed своё,
         # у agent своё — иначе значение feed'а (1440) молча душило бы agent.
-        local cs_interval
-        if [ "$cs_mode" = "agent" ]; then
-            cs_interval="$(shield_conf_get CROWDSEC_AGENT_INTERVAL_MIN 30)"
-        else
-            cs_interval="$(shield_conf_get CROWDSEC_UPDATE_INTERVAL_MIN 1440)"
-        fi
-        printf 'BL_INTERVAL_crowdsec="%s"\n' "$cs_interval"
+        # 2026-09-25 (v1.1.6): interval-guard — только feed (лимит 429). В agent-режиме чтение локальное,
+        # частоту задаёт свой таймер (2b): guard по lastok (конец прошлого прогона) + OnUnitActiveSec
+        # (от НАЧАЛА прогона) пропускал каждый второй тик — фактически раз в 60 мин, ручной/после-apply
+        # запуск тоже пропускался.
+        if [ "$cs_mode" = "agent" ]; then printf 'BL_INTERVAL_crowdsec="0"\n'; else printf 'BL_INTERVAL_crowdsec="%s"\n' "$cs_interval"; fi
         cat <<'BODY_EOF'
 
 # операторские оверрайды (не перезаписываются apply)
@@ -174,10 +206,18 @@ if [ -n "${MAIN_LOCK_FILE:-}" ]; then
     # `exec 8>f 2>/dev/null` перенаправление stderr постоянное — ошибки терялись
     if { exec 8>"$MAIN_LOCK_FILE"; } 2>/dev/null; then
         flock -n 8 2>/dev/null || { bl_log info "main lock занят (apply/rollback) — пропуск тика"; exit 0; }
+        # 2026-09-26 (v1.2.0): НЕ держим основной lock на весь прогон — только на запись в nft
+        # (main_lock_take/drop). Загрузка фидов и чтение cscli идут без него: на лабе зависший
+        # `cscli decisions list` (120 с до таймаута) держал lock, и ports-watch пропускал новый
+        # инбаунд (e2e критерий 4)
+        flock -u 8 2>/dev/null || true
+        MAIN_LOCK_FD=8
     else
         bl_log info "main lock $MAIN_LOCK_FILE недоступен — тик без основного lock'а"
     fi
 fi
+main_lock_take() { [ -n "${MAIN_LOCK_FD:-}" ] || return 0; flock -w 60 8 2>/dev/null || { bl_log info "main lock занят > 60 с (apply?) — запись в nft пропущена"; return 1; }; }
+main_lock_drop() { [ -n "${MAIN_LOCK_FD:-}" ] || return 0; flock -u 8 2>/dev/null || true; }
 
 # flock: серия триггеров схлопывается в последовательные запуски; при занятом
 # lock'е >90с — пропуск тика (следующий применит), а не параллельный апдейт
@@ -212,6 +252,28 @@ for x in sorted(set(out)):
 PY_EOF
 }
 
+# cs_kick_if_stuck — 2026-09-25 (v1.2.0, P1-3): на лабе свежий crowdsec, зарегистрированный в
+# CAPI, держал 0 community-решений, пока демон не перезапустили (после рестарта — 15000).
+# Если демон работает > 10 мин, зарегистрирован, а решений 0 — один рестарт в час, не больше 3
+# подряд (счётчик сбрасывается, как только решения пришли).
+cs_kick_if_stuck() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet crowdsec 2>/dev/null || return 0
+    local f="$STATE_DIR/cs-restarts" now up_us since n last
+    now="$(date +%s)"
+    up_us="$(systemctl show crowdsec -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)"
+    since=$(( $(cut -d. -f1 /proc/uptime) - ${up_us:-0} / 1000000 ))
+    [ "$since" -ge 600 ] || return 0
+    timeout 30 cscli capi status >/dev/null 2>&1 || return 0
+    n=0; last=0
+    [ -f "$f" ] && { n="$(wc -l < "$f")"; last="$(tail -n1 "$f")"; }
+    [ "${n:-0}" -lt 3 ] || return 0
+    [ $(( now - ${last:-0} )) -ge 3600 ] || return 0
+    echo "$now" >> "$f"
+    bl_log warn "crowdsec: зарегистрирован, работает $((since / 60)) мин, а community-решений 0 — перезапуск демона ($((n + 1))/3)"
+    systemctl restart crowdsec >/dev/null 2>&1 || true
+}
+
 # --- обновление одного списка ---
 update_list() { # update_list <name>
     local name="$1" enabled urls min_entries max_entries minp4 minp6 interval_guard
@@ -230,7 +292,7 @@ update_list() { # update_list <name>
     case "$name" in tor) set_prefix="tor_exit_blocklist" ;; esac
     local set_v4="${set_prefix}_v4" set_v6="${set_prefix}_v6"
     local fail_counter="$STATE_DIR/fails-$name.cnt"
-    local tmp remote_ok=0 local_ok=0
+    local tmp remote_ok=0 local_ok=0 cs_empty=0
     tmp="$(mktemp -d /tmp/shieldnode-bl.XXXXXX)" || return 1
     : > "$tmp/all.raw"
 
@@ -244,7 +306,10 @@ update_list() { # update_list <name>
         local lastok_f="$STATE_DIR/lastok-$name.ts" now lastok
         now="$(date +%s)"
         lastok="$([ -f "$lastok_f" ] && cat "$lastok_f" || echo 0)"
-        if [ $(( now - lastok )) -lt $(( interval_guard * 60 )) ]; then
+        # 2026-09-25 (v1.2.0): пустой живой набор (apply только что пересоздал таблицу) — гард не
+        # действует, иначе список пустовал бы до конца интервала (DIAGNOSIS P1-3)
+        if [ $(( now - lastok )) -lt $(( interval_guard * 60 )) ] && \
+           nft list set $TABLE "$set_v4" 2>/dev/null | grep -q 'elements = '; then
             bl_log info "$name: interval-guard ${interval_guard}m не истёк — пропуск fetch (set не тронут)"
             rm -rf "$tmp"
             return 0
@@ -265,7 +330,18 @@ update_list() { # update_list <name>
                     bl_log warn "$name: agent-режим, но cscli не найден — пропущен"
                     continue
                 fi
-                cscli decisions list -t ban -o json > "$f" 2>/dev/null || curl_rc=$? ;;
+                # 2026-09-25 (v1.1.6): -a — БЕЗ него cscli отдаёт только ЛОКАЛЬНЫЕ решения, community
+                # blocklist (CAPI) не попадал в сет никогда; --limit 0 — дефолт 100 алертов обрезал список
+                timeout 120 cscli decisions list -a -t ban --limit 0 -o json > "$f" 2>/dev/null || curl_rc=$?
+                # 2026-09-25 (v1.2.0): «null»/«[]» — БД демона пока пуста (community-список ещё не
+                # пришёл). Это валидный ответ, не «нет источника»: раньше — bump_fail и алерт (P1-3).
+                local cs_body=""; [ "$curl_rc" -eq 0 ] && cs_body="$(head -c 64 "$f" 2>/dev/null | tr -d ' \t\r\n')"
+                if [ "$curl_rc" -eq 0 ] && { [ "$cs_body" = "null" ] || [ "$cs_body" = "[]" ] || [ ! -s "$f" ]; }; then
+                    : > "$f"; cs_empty=1; remote_ok=$((remote_ok + 1))
+                    date +%s > "$STATE_DIR/lastok-$name.ts"
+                    cs_kick_if_stuck
+                    continue
+                fi ;;
             https://admin.api.crowdsec.net/*)
                 if [ -z "${CROWDSEC_USER:-}" ] || [ -z "${CROWDSEC_PASSWORD:-}" ]; then
                     bl_log warn "$name: CROWDSEC_USER/CROWDSEC_PASSWORD не заданы — fetch пропущен"
@@ -314,6 +390,13 @@ update_list() { # update_list <name>
     fi
 
     # 3) всё недоступно и локального нет — keep last-known-good, bump fail counter
+    if [ ! -s "$tmp/all.raw" ] && [ "$cs_empty" = 1 ]; then
+        # БД crowdsec пуста — честный статус для health, set/алерты не трогаем
+        echo "waiting $(date +%s)" > "$STATE_DIR/status-$name"
+        bl_log info "$name: CrowdSec ещё не получил community-список (0 решений) — ждём, set не тронут"
+        rm -rf "$tmp"
+        return 0
+    fi
     if [ ! -s "$tmp/all.raw" ]; then
         bl_log warn "$name: нет ни одного источника — set не тронут"
         bump_fail "$name" "$fail_counter"
@@ -416,7 +499,13 @@ update_list() { # update_list <name>
     local cur_hash=""
     if [ "$name" = "custom" ]; then
         cur_hash=$(sha256sum "$tmp/parsed.list" 2>/dev/null | cut -d' ' -f1)
-        if [ -n "$cur_hash" ] && [ -f "$STATE_DIR/.applied-custom.sha256" ] && \
+        # 2026-09-25 (v1.2.0): «тот же контент» — ещё не значит «уже в nft»: apply пересоздаёт таблицу
+        # с ПУСТЫМИ наборами, и гард оставлял custom пустым до смены списка (DIAGNOSIS P1-3).
+        # Пропуск — только если в живом наборе есть элементы (или и список пуст).
+        local live_has=0
+        nft list set $TABLE "$set_v4" 2>/dev/null | grep -q 'elements = ' && live_has=1
+        [ -s "$tmp/parsed.list" ] || live_has=1
+        if [ -n "$cur_hash" ] && [ "$live_has" = 1 ] && [ -f "$STATE_DIR/.applied-custom.sha256" ] && \
            [ "$(cat "$STATE_DIR/.applied-custom.sha256" 2>/dev/null)" = "$cur_hash" ]; then
             rm -rf "$tmp"
             return 0
@@ -478,7 +567,11 @@ update_list() { # update_list <name>
             # 2026-09-24 (v1.1.4): пустой список — только flush (раньше висячая « }» =
             # синтакс-ошибка nft, служба падала на каждом тике с пустым custom.txt)
         } > "$tmp/legacy.nft"
-        nft -c -f "$tmp/legacy.nft" >/dev/null 2>"$tmp/legacy.err" && nft -f "$tmp/legacy.nft" 2>>"$tmp/legacy.err"
+        main_lock_take || { echo "main lock busy" > "$tmp/legacy.err"; return 1; }
+        local lrc=0
+        nft -c -f "$tmp/legacy.nft" >/dev/null 2>"$tmp/legacy.err" && nft -f "$tmp/legacy.nft" 2>>"$tmp/legacy.err" || lrc=1
+        main_lock_drop
+        return "$lrc"
     }
 
     if nft list set $TABLE "$set_v4" >/dev/null 2>&1; then
@@ -505,6 +598,8 @@ update_list() { # update_list <name>
 
     if [ "$rc" = "0" ]; then
         cp "$tmp/load.list" "$STATE_DIR/last-good-$name.txt" 2>/dev/null || true
+        rm -f "$STATE_DIR/status-$name"
+        [ "$name" = crowdsec ] && [ "$v4_count" -gt 0 ] && rm -f "$STATE_DIR/cs-restarts"
         if [ "$name" = "custom" ] && [ -n "$cur_hash" ] && [ "$v6_failed" = "0" ]; then
             echo "$cur_hash" > "$STATE_DIR/.applied-custom.sha256"
         fi
@@ -591,6 +686,36 @@ bump_fail() { # bump_fail <name> <counter-file>
     fi
 }
 
+# 2026-09-25 (v1.2.0, P0-2): --restore-last-good — ПУСТЫЕ наборы (boot: сохранённый ruleset без
+# элементов; apply: таблица пересоздана) сразу заполняются последним удачным снимком с диска, без
+# сети. На лабе после reboot все 6 блок-листов были пусты 2-5 мин (до таймера) + 6 ложных WARN.
+restore_last_good() {
+    local name enabled set lg n tmpf
+    for name in scanner threat tor custom crowdsec spamhaus cins; do
+        _v="BL_ENABLED_$name"; enabled="${!_v:-0}"; [ "$enabled" = 1 ] || continue
+        set="${name}_blocklist_v4"; [ "$name" = tor ] && set="tor_exit_blocklist_v4"
+        lg="$STATE_DIR/last-good-$name.txt"
+        [ -s "$lg" ] || continue
+        nft list set $TABLE "$set" >/dev/null 2>&1 || continue
+        nft list set $TABLE "$set" 2>/dev/null | grep -q 'elements = ' && continue
+        tmpf="$(mktemp /tmp/shieldnode-bl-restore.XXXXXX)"
+        awk -v setname="$set" '
+            NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet shieldnode %s { ", setname }
+            { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
+            END { if (NR > 0) print " }" }' "$lg" > "$tmpf"
+        n="$(wc -l < "$lg")"
+        main_lock_take || { rm -f "$tmpf"; continue; }
+        if nft -f "$tmpf" 2>/dev/null; then main_lock_drop; bl_log info "$name: восстановлен из последнего снимка ($n записей) — до обновления из сети"
+        else main_lock_drop; bl_log warn "$name: снимок $lg не загрузился — ждём обновления из сети"; fi
+        rm -f "$tmpf"
+    done
+    return 0
+}
+if [ "${1:-}" = "--restore-last-good" ]; then
+    restore_last_good
+    exit 0
+fi
+
 rc=0
 # аргументы = подмножество списков (systemd path-триггер зовёт с "custom");
 # без аргументов — все включённые
@@ -613,7 +738,7 @@ BODY_EOF
     # --- 1.5) crowdsec-креды feed-режима: отдельный файл 0600 root:root,
     #     updater читает его source'ом при каждом тике. Создаём/обновляем
     #     ТОЛЬКО если crowdsec включён и креды заданы (agent-режиму не нужны).
-    if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 0)" = "1" ] && [ -n "$cs_user" ] && [ -n "$cs_pass" ]; then
+    if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 1)" = "1" ] && [ -n "$cs_user" ] && [ -n "$cs_pass" ]; then
         # 2026-09-23: файл source'ится root'ом на каждом тике — пароль с $ ` " \
         # раньше ломал auth или исполнялся как код. Безопасные символы — прежний
         # формат "..." (существующие установки байт-в-байт те же), иначе %q.
@@ -679,6 +804,32 @@ EOF
         mkdir -p "$SHIELD_BLOCKLIST_STATE" /run/shieldnode 2>/dev/null || true
         [ -e /var/log/shieldnode.log ] || install -m 0640 /dev/null /var/log/shieldnode.log 2>/dev/null || true
     fi
+    # 2026-09-25 (v1.2.0, P0-2): при загрузке — блок-листы из снимков сразу после фаервола
+    # (отдельный юнит: не задерживает network-pre; сеть не нужна)
+    shield_persist_stream /etc/systemd/system/shieldnode-blocklist-restore.service 0644 <<EOF
+[Unit]
+Description=shieldnode: restore blocklists from last-good snapshots at boot
+After=shieldnode.service
+Requires=shieldnode.service
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=$SHIELD_BLOCKLIST_SCRIPT --restore-last-good
+Nice=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-$SHIELD_BLOCKLIST_STATE -/run/shieldnode -/var/log/shieldnode.log
+TimeoutStartSec=300
+
+[Install]
+WantedBy=shieldnode.service
+EOF
     shield_persist_stream /etc/systemd/system/shieldnode-blocklist-custom.path 0644 <<EOF
 [Unit]
 Description=watch $SHIELD_LISTS_DIR/custom.txt
@@ -695,6 +846,10 @@ Description=shieldnode blocklist update timer
 
 [Timer]
 OnBootSec=3min
+# 2026-09-26 (v1.2.0): OnActiveSec — от (пере)запуска самого таймера. Только OnBootSec/OnUnitActiveSec:
+# после restart таймера (apply/rollback) обе точки уже в прошлом — монотонный таймер не срабатывал
+# до reboot (лаба: NEXT «-», CrowdSec-список не обновлялся 3 ч, health WARN)
+OnActiveSec=${interval}min
 OnUnitActiveSec=${interval}min
 RandomizedDelaySec=120
 Persistent=true
@@ -702,6 +857,52 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+
+    # --- 2b) 2026-09-24 (v1.1.6): отдельный таймер crowdsec (agent-режим). Общий таймер тикает
+    # раз в BLOCKLIST_UPDATE_INTERVAL (360 мин) — CROWDSEC_AGENT_INTERVAL_MIN (30) не действовал,
+    # community blocklist (меняется ежечасно) обновлялся раз в 6ч. Свой таймер обновляет
+    # ТОЛЬКО crowdsec (`shieldnode-blocklist crowdsec`); остальные листы — по общему.
+    local cs_units=0
+    if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ] && [ "$cs_mode" = "agent" ]; then
+        cs_units=1
+        shield_persist_stream /etc/systemd/system/shieldnode-blocklist-crowdsec.service 0644 <<EOF
+[Unit]
+Description=shieldnode crowdsec community blocklist update (agent mode)
+After=network-online.target crowdsec.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SHIELD_BLOCKLIST_SCRIPT crowdsec
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-$SHIELD_BLOCKLIST_STATE -/run/shieldnode -/var/log/shieldnode.log
+TimeoutStartSec=300
+EOF
+        shield_persist_stream /etc/systemd/system/shieldnode-blocklist-crowdsec.timer 0644 <<EOF
+[Unit]
+Description=shieldnode crowdsec blocklist timer (every ${cs_interval} min)
+
+[Timer]
+OnBootSec=5min
+OnActiveSec=2min
+OnUnitActiveSec=${cs_interval}min
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    elif [ "${DRY_RUN:-0}" != "1" ] && [ -e /etc/systemd/system/shieldnode-blocklist-crowdsec.timer ]; then
+        # crowdsec выключен / feed-режим — свой таймер снимаем (feed душит 429 общим таймером)
+        systemctl disable --now shieldnode-blocklist-crowdsec.timer shieldnode-blocklist-crowdsec.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/shieldnode-blocklist-crowdsec.timer /etc/systemd/system/shieldnode-blocklist-crowdsec.service
+        log info "blocklist" "crowdsec-таймер снят (crowdsec выключен или feed-режим)"
+    fi
 
     # --- 3) сиды /etc/shieldnode/lists/ (операторские данные: НЕ в manifest, НЕ затираем)
     if [ "${DRY_RUN:-0}" != "1" ]; then
@@ -721,12 +922,22 @@ EOF
     fi
 
     # --- 4) активируем ---
+    # 2026-09-26 (v1.2.0): таймеры — enable + restart (не `enable --now`: для уже запущенного
+    # таймера это no-op, и таймер, у которого все точки отсчёта в прошлом, так и оставался без
+    # следующего срабатывания — лаба: CrowdSec-список 3 ч без обновления). restart + OnActiveSec
+    # гарантируют ближайшее срабатывание после каждого apply.
     if [ "${DRY_RUN:-0}" != "1" ]; then
         systemctl daemon-reload
-        systemctl enable --now shieldnode-blocklist.timer >/dev/null 2>&1 || \
+        { systemctl enable shieldnode-blocklist.timer >/dev/null 2>&1 && systemctl restart shieldnode-blocklist.timer >/dev/null 2>&1; } || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist.timer не удался"
+        systemctl enable shieldnode-blocklist-restore.service >/dev/null 2>&1 || \
+            log warn "blocklist" "systemctl enable shieldnode-blocklist-restore.service не удался"
         systemctl enable --now shieldnode-blocklist-custom.path >/dev/null 2>&1 || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist-custom.path не удался"
+        if [ "$cs_units" = 1 ]; then
+            { systemctl enable shieldnode-blocklist-crowdsec.timer >/dev/null 2>&1 && systemctl restart shieldnode-blocklist-crowdsec.timer >/dev/null 2>&1; } || \
+                log warn "blocklist" "systemctl enable shieldnode-blocklist-crowdsec.timer не удался"
+        fi
         # первый запуск неблокирующий: apply уже загрузил пустые сеты, updater
         # их наполнит в фоне (fetch может идти секунды/минуты на больших листах).
         # 2026-09-24 (v1.1.4): НЕ отсюда — здесь apply ещё держит основной lock, и
@@ -734,5 +945,11 @@ EOF
         # shield_blocklist_kick из main.sh, после снятия lock'а.
         SHIELD_BL_KICK=1
     fi
-    ok "blocklist" "updater+timer installed: $SHIELD_BLOCKLIST_SCRIPT (interval=${interval}m, threshold=$threshold)"
+    # 2026-09-25 (v1.2.0, E4): один «interval=360m» читался как «CrowdSec раз в 6 ч» — пишем оба
+    local cs_note="выключен"
+    if [ "${SH_F_ENABLE_CROWDSEC_LIST:-0}" = "1" ]; then
+        if [ "$cs_mode" = agent ]; then cs_note="каждые ${cs_interval} мин (свой таймер, локальная БД crowdsec)"
+        else cs_note="каждые ${cs_interval} мин (feed)"; fi
+    fi
+    ok "blocklist" "обновление списков: внешние фиды — каждые ${interval} мин; CrowdSec — $cs_note; custom — сразу при правке custom.txt и с фидами (порог алерта: $threshold сбоев подряд)"
 }

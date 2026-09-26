@@ -13,13 +13,21 @@ node_status() {
     source "$NODE_DIR/lib/udp.sh";       node_udp_plan
     source "$NODE_DIR/lib/network.sh";   node_network_plan
     source "$NODE_DIR/lib/limits.sh";    node_limits_plan
-    source "$NODE_DIR/lib/services.sh";  node_harden_ipv6   # ipv6-ключи видны в сверке
+    source "$NODE_DIR/lib/ipv6.sh"
 
     echo "node v$NODE_VERSION status — $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     # 2026-09-23 (v1.1.4): ожидание reboot после XanMod — первым делом, заметно (stdout)
     if node_xanmod_reboot_pending; then
         node_reboot_notice "kernel: XanMod установлен ($(cut -f2 "$(node_xanmod_pending_file)" 2>/dev/null)), ОЖИДАЕТ REBOOT — активно $(uname -r). Выполни: sudo reboot" 1
     fi
+    # 2026-09-26 (v1.2.0): пробная загрузка XanMod не удалась — нода на штатном ядре
+    if [ -f "${NODE_STATE_DIR:-/var/lib/node}/xanmod-trial-failed" ]; then
+        node_reboot_notice "kernel: пробная загрузка XanMod не удалась ($(cat "${NODE_STATE_DIR:-/var/lib/node}/xanmod-trial-failed")) — работает штатное ядро $(uname -r). Причина: journalctl -b -1; Secure Boot: mokutil --sb-state" 1
+    fi
+    # 2026-09-25 (v1.2.0, P1-4): IPv6 — инвариант стека
+    if node_ipv6_kernel_off; then echo "ipv6: выключен в ядре (ipv6.disable=1)"
+    elif node_ipv6_reboot_pending; then node_reboot_notice "IPv6: ipv6.disable=1 добавлен в GRUB, активируется после reboot (сейчас выключен через sysctl)" 1
+    else echo "ipv6: выключен через sysctl (ipv6.disable=1 в cmdline нет — повтори apply)"; fi
     echo "======================================================================"
     printf '%-46s %-14s %-14s %s\n' "parameter" "expected" "actual" "ok"
     echo "----------------------------------------------------------------------"
@@ -28,7 +36,12 @@ node_status() {
         actual="$(sysctl -n "$k" 2>/dev/null || echo '?')"
         # 2026-09-24 (v1.1.5): многозначные ключи ядро печатает через TAB, план — через пробел
         actual="${actual//$'\t'/ }"
-        if [ "$actual" = "$v" ]; then st="✓"; else st="✗"; fi
+        if [ "$actual" = "$v" ]; then st="✓"
+        # 2026-09-26 (v1.2.1): tcp_mem считается от MemTotal, который «плавает» между загрузками —
+        # расхождение в пределах 1% по каждому числу не ошибка (значение применено при apply)
+        elif [ "$k" = net.ipv4.tcp_mem ] && awk -v a="$actual" -v e="$v" 'BEGIN { n = split(a, x, " "); m = split(e, y, " "); if (n != m) exit 1
+                for (i = 1; i <= n; i++) { dd = x[i] - y[i]; if (dd < 0) dd = -dd; if (y[i] == 0 || dd * 100 > y[i]) exit 1 } }'; then st="✓≈"
+        else st="✗"; fi
         printf '%-46s %-14s %-14s %s\n' "$k" "$v" "$actual" "$st"
     done < "$NODE_PLAN_FILE"
     echo "----------------------------------------------------------------------"
@@ -70,7 +83,7 @@ node_status() {
     echo "kernel: $(uname -r) $(node_kernel_is_xanmod && echo '[XanMod]' || echo '[stock]')"
     echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) gen=$(node_bbr_generation) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
     echo "congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{print $2; exit}' || echo none)$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
+    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{sub(/^linux-image-/, "", $2); o = o (o ? "," : "") $2} END{print o ? o : "none"}' || echo none)$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
     # 2026-09-24 (v1.1.5): XanMod, поставленный НЕ по запросу (другим инструментом/вручную),
     # в записи GRUB по умолчанию — следующий reboot молча сменит ядро (ограничение №2)
     local gk; gk="$(node_grub_default_kernel)"

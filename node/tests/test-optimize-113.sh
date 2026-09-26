@@ -15,6 +15,9 @@ NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT=/tmp/node-test-opt113
 export NODE_DIR NODE_STATE_DIR="$OUT/state" NODE_LOG="$OUT/node.log" NODE_RT_TWEAKS="$OUT/state/rt.tsv" DRY_RUN=0
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$NODE_STATE_DIR" "$OUT/proc/net"; : > "$NODE_LOG"; : > "$NODE_RT_TWEAKS"
+# netdev_budget_usecs зависит от HZ ядра (v1.1.8) — фиксируем HZ=1000
+printf 'CONFIG_HZ=1000\n' > "$OUT/kconfig"; export NODE_KERNEL_CONFIG="$OUT/kconfig"
+mkdir -p "$OUT/boot"; export NODE_BOOT_DIR="$OUT/boot"   # v1.2.0: HZ считается и по /boot/config-* — не /boot хоста
 printf '#!/bin/sh\necho "default via 10.0.0.1 dev eth0 proto static"\n' > "$OUT/bin/ip"
 cat > "$OUT/bin/ethtool" <<'EOF'
 #!/bin/bash
@@ -105,6 +108,8 @@ t "softnet чисто: budget 600 / backlog 8192 (как в 1.1.2)" '[ "$(val ne
 t "softnet чисто: usecs 4000 (v1.1.7, было 8000)" '[ "$(val net.core.netdev_budget_usecs)" = 4000 ]'
 sn "000f4240 00000000 000001f4"; plan     # 500 / 1_000_000 = 0.05%
 t "squeeze 0.05% (ниже порога 0.1%): budget не меняется" '[ "$(val net.core.netdev_budget)" = 600 ]'
+sn "000011ce 00000000 00000020"; plan     # v1.2.0 (лаба): 32 / 4558 = 0.7%, но выборка мала (< 100 000)
+t "squeeze по малой выборке (32/4558 после boot): budget НЕ меняется" '[ "$(val net.core.netdev_budget)" = 600 ]'
 sn "000f4240 00000000 00002710"; plan     # 10000 / 1_000_000 = 1%
 t "squeeze 1%: netdev_budget 600 -> 1200" '[ "$(val net.core.netdev_budget)" = 1200 ]'
 t "squeeze 1%: usecs пропорционально 1200 -> 8000 (v1.1.7)" '[ "$(val net.core.netdev_budget_usecs)" = 8000 ]'
@@ -115,7 +120,12 @@ t "hex-разбор без strtonum (mawk): ffffffff = 4294967295" '[ "$_NODE_SN
 cfg 'NETDEV_BUDGET=900\n'; sn "000f4240 00000000 00002710"; plan
 t "явный NETDEV_BUDGET оператора не трогается даже при squeeze" '[ "$(val net.core.netdev_budget)" = 900 ]'
 cfg 'NETDEV_BUDGET_USECS=2000\n'; sn "000f4240 00000000 00000000"; plan
-t "явный NETDEV_BUDGET_USECS оператора соблюдается" '[ "$(val net.core.netdev_budget_usecs)" = 2000 ]'
+t "явный NETDEV_BUDGET_USECS оператора соблюдается (>= минимума 2 jiffy)" '[ "$(val net.core.netdev_budget_usecs)" = 2000 ]'
+printf 'CONFIG_HZ=250\n' > "$NODE_KERNEL_CONFIG"; cfg 'NETDEV_BUDGET_USECS=4000\n'; sn "000f4240 00000000 00000000"; plan
+t "HZ=250: явный 4000 < минимума 8000 — не пишется (было EINVAL -> apply падал)" '[ -z "$(val net.core.netdev_budget_usecs)" ] && grep -q "минимума ядра 8000" "$NODE_LOG"'
+cfg 'NETDEV_BUDGET_USECS=12000\n'; plan
+t "HZ=250: явный 12000 — пишется" '[ "$(val net.core.netdev_budget_usecs)" = 12000 ]'
+printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"
 cfg 'AUTO_SOFTNET_TUNE=0\n'; sn "000f4240 00000009 00002710"; plan
 t "AUTO_SOFTNET_TUNE=0: прежние фиксированные значения" '[ "$(val net.core.netdev_budget)" = 600 ] && [ "$(val net.core.netdev_max_backlog)" = 8192 ]'
 cfg ''
@@ -130,11 +140,12 @@ fx() { # <processed> <dropped> <ovf> <retrans> <out> <rcvbuf> <steal> <total> <m
     echo 1000 > "$OUT/sys/class/net/eth0/statistics/rx_packets"; echo 0 > "$OUT/sys/class/net/eth0/statistics/rx_dropped"
     echo "$9" > "$OUT/sys/class/net/eth0/statistics/rx_missed_errors"; echo 0 > "$OUT/sys/class/net/eth0/statistics/tx_dropped"; }
 export NODE_SYS_ROOT="$OUT/sys"
+mkdir -p "$OUT/proc/sys/kernel/random"; echo "aaaaaaaa-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
 fx 1000 0 0 0 1000 0 0 10000 0; node_perf_snapshot > "$OUT/base.txt"
 t "снапшот: все ключевые счётчики" 'for k in softnet_dropped TcpExtListenOverflows TcpRetransSegs UdpRcvbufErrors cpu_steal nic_rx_missed_errors; do grep -q "^$k=" "$OUT/base.txt" || exit 1; done'
 fx 2000 0 0 10 2000 0 0 20000 0; node_perf_report "$OUT/base.txt" > "$OUT/r1"
 t "отчёт без нагрузки: «нет сигналов узкого места»" 'grep -q "нет сигналов" "$OUT/r1" && ! grep -q "LIMIT" "$OUT/r1"'
-fx 5000 7 3 200 3000 4 900 20000 11; node_perf_report "$OUT/base.txt" > "$OUT/r2"
+fx 5000 7 3 200 3000 4 900 20000 150; node_perf_report "$OUT/base.txt" > "$OUT/r2"
 t "отчёт: softnet backlog overflow"        'grep -q "LIMIT: softnet backlog" "$OUT/r2"'
 t "отчёт: accept-очередь"                  'grep -q "LIMIT: accept-очередь" "$OUT/r2"'
 t "отчёт: UDP receive buffer"              'grep -q "LIMIT: UDP receive buffer" "$OUT/r2"'
@@ -144,6 +155,20 @@ t "отчёт: steal 9% (900/10000) — гипервизор" 'grep -q "steal=9.
 fx 10 0 0 0 10 0 0 100 0; node_perf_report "$OUT/base.txt" > "$OUT/r3"
 t "отчёт: счётчики меньше baseline -> «был reboot»" 'grep -q "был reboot" "$OUT/r3"'
 t "отчёт без baseline — понятное сообщение" 'node_perf_report "$OUT/nope" | grep -q "baseline нет"'
+# v1.2.1 (живая нода): единичный дроп NIC за 13 мин — не «LIMIT»
+fx 2000 0 0 10 2000 0 0 20000 1; node_perf_report "$OUT/base.txt" > "$OUT/r4"
+t "v1.2.1: 1 дроп NIC — без LIMIT" '! grep -q "LIMIT: NIC" "$OUT/r4"'
+# v1.2.1 (лаба): squeeze 2.7% на ~270 пакетах за 18 с после apply — шум, не предел
+echo "aaaaaaaa-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
+printf '%08x 00000000 %08x\n' 1270 7 > "$OUT/proc/net/softnet_stat"; node_perf_report "$OUT/base.txt" > "$OUT/r6"
+t "v1.2.1: squeeze на малой выборке — без LIMIT" '! grep -q "LIMIT: NAPI" "$OUT/r6"'
+printf '%08x 00000000 %08x\n' 501000 5000 > "$OUT/proc/net/softnet_stat"; node_perf_report "$OUT/base.txt" > "$OUT/r7"
+t "v1.2.1: squeeze 1% на 500 000 пакетов — LIMIT есть" 'grep -q "LIMIT: NAPI" "$OUT/r7"'
+# v1.2.1 (живая нода): apply -> reboot -> status: счётчики нового boot уже больше baseline,
+# старый признак «меньше baseline» не срабатывал — squeeze=-0.392%. Теперь по boot_id.
+echo "bbbbbbbb-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
+fx 5000 0 0 10 5000 0 0 50000 0; node_perf_report "$OUT/base.txt" > "$OUT/r5"
+t "v1.2.1: после reboot (другой boot_id) — «был reboot», без отрицательных дельт" 'grep -q "был reboot" "$OUT/r5" && ! grep -q "squeeze=-" "$OUT/r5"'
 unset NODE_PROC_ROOT NODE_SYS_ROOT; export DRY_RUN=0
 
 # ---------- XPS по scaling.rst ----------

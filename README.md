@@ -2,79 +2,105 @@
 
 Оптимизация и защита VPN-нод (Remnawave/Remnanode + Xray-core): node — тюнинг ОС/сети, shieldnode — nftables-фаервол
 
-Два независимых скрипта для Linux-серверов под высокой нагрузкой (Remnawave/Remnanode + Xray-core):
-
 | Папка | Назначение |
 |---|---|
-| **node/** | Оптимизация ОС и сети: sysctl-профили по tier'ам RAM, conntrack, лимиты FD, TCP/UDP/BBR, IRQ/RSS, настройка NIC, отключение лишних служб, тюнинг дата-плана, диагностика, атомарный откат |
-| **shieldnode/** | nftables-фаервол: защита SSH, отброс невалидных пакетов, SYN-защита, abuse-лимиты per-source, аварийный режим, атомарное применение и откат, блок-листы (threat/scanner/tor/custom) с автообновлением |
+| **node/** | Оптимизация ОС и сети: sysctl по объёму RAM, conntrack, лимиты FD, TCP/UDP/BBR+fq, очереди NIC, отключение лишних служб, **IPv6 выключен всегда**, диагностика, атомарный откат |
+| **shieldnode/** | nftables-фаервол: защита SSH, отброс мусора, SYN/UDP-лимиты по источнику, защита портов инбаундов Xray, закрытый API ноды, блок-листы (сканеры, угрозы, CINS, Spamhaus, CrowdSec, свой список), аварийный режим, атомарное применение и откат |
 
 ## Требования
 
-- Debian / Ubuntu, root, systemd
-- kernel ≥ 5.10 рекомендуется (BBR, fq, опционально XanMod)
-- python3 — только для парсинга JSON-блоклистов (shieldnode)
-- nftables — для shieldnode
+- Ubuntu 22.04/24.04 или Debian 12, root, systemd, nftables
+- Штатное ядро подходит (BBR + fq есть в 6.8); ядро XanMod — по желанию
+- python3 (разбор JSON: блок-листы, API Xray, диагностика)
 
 ## Установка
 
-Одной командой (скрипт сам скачает снапшот этого репозитория с GitHub, распакует в `/opt/vpn-node-stack` и запустит оба инсталлятора — сначала фаервол, потом оптимизация):
+Одна команда — на чистой ноде сразу предложит установку (1–3 минуты), затем откроет меню:
 
 ```bash
-sudo bash -c 'bash <(curl -sL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)'
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SpofyJet/vpn-node-stack/main/vpn-node-setup.sh)"
 ```
 
-Опции: `--dry-run` (только план), `status` (без root), `rollback` (откат).
+Порядок всегда один: `[1/3] Загрузка` → `[2/3] Фаервол` → `[3/3] Оптимизация`, затем итог — какие порты
+защищены, работает ли CrowdSec, BBR, IPv6 и нужна ли перезагрузка. Подробный журнал — `/var/log/vpn-node-setup.log`.
 
-Либо из клонированного репозитория:
+После установки:
 
 ```bash
-git clone https://github.com/SpofyJet/vpn-node-stack.git
-cd vpn-node-stack
-
-# 1) оптимизация ноды
-sudo bash node/install.sh            # plan → apply → self-test; --dry-run для просмотра
-
-# 2) фаервол
-sudo bash shieldnode/install.sh      # SSH-whitelist спросит текущий IP автоматически
+sudo vpn-node        # меню: обновить, пульт защиты, статус, безопасность, оптимизация, откат
+sudo guard           # пульт защиты: что отбито, кто в бане, блок-листы, проблемы + действия
+sudo vpn-node diag   # архив диагностики без секретов — прислать при проблеме
 ```
 
-## Использование
+Команды без меню: `sudo vpn-node status | apply | apply --dry-run | rollback | emergency on|off | diag | uninstall`.
+Закрепить версию: `VPN_STACK_REF=v1.4.0`; установить из файла: `VPN_STACK_TARBALL_URL=file:///root/vpn-node-stack-1.4.0.tar.gz`.
+
+## Как защищаются порты
+
+Список защищаемых портов собирается автоматически и **следит за реальностью** (служба `shieldnode-ports`):
+
+- **инбаунды Xray** — из конфигурации работающего ядра (API Xray), а не из списка открытых сокетов:
+  исходящие UDP-потоки клиентов (DNS, QUIC) больше не принимаются за инбаунды;
+- **SSH**, **API ноды** (порт remnanode, по умолчанию 2222), **порты, открытые в UFW**, и добавленные вручную;
+- новый инбаунд, добавленный в панели, защищается в течение минуты — без ручного «Применить».
+
+**API ноды** доступен только с адресов из `TRUSTED_IPS` и источников правил UFW для этого порта
+(например, `ufw allow from <IP панели> to any port 2222`). Если ни один источник не известен, порт не
+закрывается (чтобы не отрезать панель), а проверка показывает предупреждение.
+
+## IPv6
+
+IPv6 на нодах выключен **всегда**: `ipv6.disable=1` в параметрах ядра (после первой перезагрузки), sysctl на
+всех интерфейсах, systemd-networkd без IPv6, Docker `"ipv6": false`, и фаервол отбрасывает любой IPv6-пакет.
+Откат и удаление стека IPv6 не включают. Переключателя в меню нет.
+
+## Ядро XanMod (по желанию)
+
+По умолчанию ядро не меняется: на штатном ядре работают BBR и fq. XanMod (BBRv3) ставится из меню
+«Оптимизация → Ядро XanMod» или `ENABLE_XANMOD=1` в `/etc/node/node.conf` и требует перезагрузки;
+штатное ядро остаётся в GRUB запасным.
+
+## Пульт защиты (`sudo guard`)
+
+По-русски и по смыслу: сколько отбито сканеров, вредоносных сетей, подбора паролей, флуда; кто сейчас в бане;
+размер блок-листов; и **ровно те проблемы, которые находит полная проверка** (`status`) — «Проблем не найдено»
+показывается только когда проверка чиста. Действия: кто в бане, разбанить IP, доверенные IP, обновить
+блок-листы, полная проверка, аварийный режим. `guard --once` — снимок для cron/мониторинга.
+
+## Блок-листы
+
+- Внешние фиды обновляются каждые 6 ч, CrowdSec — каждые 30 мин, свой список — сразу при правке.
+- После перезагрузки и после применения фаервола наборы сразу заполняются последним удачным снимком с диска
+  (без сети), затем обновляются из источников.
+- **Свой список** — по умолчанию [SpofyJet/shield · lists/custom.txt](https://github.com/SpofyJet/shield/blob/main/lists/custom.txt);
+  локальные добавки — `/etc/shieldnode/lists/custom.txt`; свой URL — `BLOCKLIST_CUSTOM_URLS`, выключить — `none`.
+- **CrowdSec** — агент без аккаунта. Пока community-список не пришёл (до ~2 ч после установки), проверка пишет
+  «ждём», а не ошибку; если зарегистрированный агент долго держит 0 решений, его перезапускают (не чаще раза в час, не более 3 раз).
+
+## Использование без меню
 
 ```bash
-bash node/install.sh status          # что применено, какие значения
-bash node/install.sh rollback        # вернуть исходное состояние
-bash node/install.sh detect          # диагностика без изменений
-
-bash shieldnode/install.sh status
-bash shieldnode/install.sh rollback
-
-# тесты (не требуют root, кроме test-policies.sh)
-bash node/tests/test-config.sh && bash node/tests/test-datapath.sh && bash node/tests/test-rollback.sh
-bash shieldnode/tests/test-blocklist.sh && bash shieldnode/tests/test-template.sh
+bash /opt/vpn-node-stack/shieldnode/main.sh status   # полная проверка фаервола
+bash /opt/vpn-node-stack/shieldnode/main.sh verify   # «фаервол жив»: хуки, правила, IPv6 fail-safe, наборы
+bash /opt/vpn-node-stack/node/install.sh status      # оптимизация: ожидаемое vs фактическое
 ```
 
-Конфиги (всё опционально, значения по умолчанию разумные): `/etc/node/node.conf`, `/etc/shieldnode/shieldnode.conf`.
+Конфиги (всё опционально): `/etc/node/node.conf`, `/etc/shieldnode/config.conf` — `KEY=value`, файлы не исполняются.
 
 ## Гарантии безопасности
 
-- В логи не пишутся токены/UUID/конфиги Xray — только метаданные.
-- node не трогает конфиг Xray (inbounds/outbounds/routing/TLS/REALITY).
-- shieldnode не пишет net.netfilter.* — conntrack в одних руках у node.
-- Нет блокировки SSH: whitelist-first, loopback accept, self-test, авто-откат при ошибке.
-- Каждое применение — атомарно: временный файл → проверка → swap, с backup перед перезаписью.
+- SSH не отрезается: белый список первым, loopback, self-test и автооткат; фаервол поднимается при загрузке **до** сети и Docker.
+- Применение атомарное: проверка `nft -c`, бэкап, замена одной транзакцией.
+- В логах и диагностике нет токенов, UUID, ключей и конфигов Xray.
+- node не меняет конфиг Xray; shieldnode не трогает net.netfilter.* (conntrack — у node).
 
-## Структура
+## Документация
 
-```
-node/            install.sh, main.sh, apply.sh, config.sh, persist.sh,
-                 rollback.sh, status.sh, detect.sh, uninstall.sh,
-                 node.defaults.conf, lib/*.sh, tests/*.sh
-shieldnode/      install.sh, main.sh, firewall.sh, config.sh, persist.sh,
-                 rollback.sh, status.sh, detect.sh, emergency.sh, limits.sh,
-                 ssh.sh, shieldnode.defaults.conf, lib/*.sh, tests/*.sh
-```
+- `docs/ARCHITECTURE.md` — устройство стека, порядок загрузки, правила nft.
+- `docs/DIAGNOSIS.md` — разбор проблем v1.3.0: причины, доказательства, решения.
+- `CHANGELOG.md` — изменения по версиям.
+- `tests/e2e/` — приёмочные тесты на лаборатории (не нужны на ноде).
 
 ## Дисклеймер
 
-Скрипты меняют сетевой стек и фаервол. Прогони \`--dry-run\`, прочитай diff, держи консоль открытой до self-test. Использование — на свой риск.
+Скрипты меняют сетевой стек и фаервол. Сначала `apply --dry-run`, держи консоль провайдера под рукой. Использование — на свой риск.
