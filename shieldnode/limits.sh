@@ -18,7 +18,7 @@ shield_limit_num() {
 # shield_limits_resolve — выставить SH_R_* / SH_F_* для lib/nft.sh.
 shield_limits_resolve() {
     export SH_R_SSH_CONN_MAX SH_R_SSH_NEW_RATE SH_R_SSH_NEW_BURST
-    export SH_R_TCP_NEW_RATE SH_R_TCP_NEW_BURST SH_R_TCP_SYN_RATE SH_R_TCP_SYN_BURST SH_R_TCP_CONN_MAX SH_R_TCP_GLOBAL_CEIL
+    export SH_R_TCP_NEW_RATE SH_R_TCP_NEW_BURST SH_R_TCP_SYN_RATE SH_R_TCP_SYN_BURST SH_R_TCP_CONN_MAX SH_R_TCP_GLOBAL_CEIL SH_R_TCP_SYN_BAN_RATE SH_R_TCP_SYN_BAN_BURST
     export SH_R_UDP_RATE SH_R_UDP_BURST SH_R_UDP_GLOBAL_CEIL
     export SH_R_SSH_ABUSERS_TIMEOUT SH_R_SSH_ABUSERS_SIZE SH_R_TCP_ABUSERS_TIMEOUT SH_R_TCP_ABUSERS_SIZE
     export SH_R_UDP_ABUSERS_TIMEOUT SH_R_UDP_ABUSERS_SIZE SH_R_TEMP_BLOCKLIST_TIMEOUT SH_R_TEMP_BLOCKLIST_SIZE
@@ -28,10 +28,18 @@ shield_limits_resolve() {
     SH_R_SSH_CONN_MAX="$(shield_limit_num SSH_CONN_MAX 8)"
     SH_R_SSH_NEW_RATE="$(shield_limit_num SSH_NEW_RATE 10)"
     SH_R_SSH_NEW_BURST="$(shield_limit_num SSH_NEW_BURST 20)"
-    SH_R_TCP_NEW_RATE="$(shield_limit_num TCP_NEW_RATE 300)"
-    SH_R_TCP_NEW_BURST="$(shield_limit_num TCP_NEW_BURST 600)"
-    SH_R_TCP_SYN_RATE="$(shield_limit_num TCP_SYN_RATE 50)"
-    SH_R_TCP_SYN_BURST="$(shield_limit_num TCP_SYN_BURST 100)"
+    # 2026-09-27 (v1.2.2): значения и поведение старого shield 4.1.0 (SHIELD_CGNAT_SAFE=1): per-IP
+    # лимиты только срезают лишнее, IP НЕ банится. Прежние 50 SYN/с и 300 новых/мин с баном на 15 мин
+    # задевали клиентов: VLESS (Vision без mux) = одно TCP на каждое соединение приложения, за
+    # мобильным CGNAT / общим Wi-Fi — много людей на одном IP (лаба: всплеск 400 соединений -> бан;
+    # боевая нода: 2 IP в бане, 71 292 отброшенных пакета их повторов). Флуд с одного IP — 50k+/с.
+    SH_R_TCP_NEW_RATE="$(shield_limit_num TCP_NEW_RATE 40000)"
+    SH_R_TCP_NEW_BURST="$(shield_limit_num TCP_NEW_BURST 60000)"
+    SH_R_TCP_SYN_RATE="$(shield_limit_num TCP_SYN_RATE 2000)"
+    SH_R_TCP_SYN_BURST="$(shield_limit_num TCP_SYN_BURST 3000)"
+    # бан за SYN-флуд — по желанию; 0 = выключен (дефолт)
+    SH_R_TCP_SYN_BAN_RATE="$(shield_limit_num TCP_SYN_BAN_RATE 0)"
+    SH_R_TCP_SYN_BAN_BURST="$(shield_limit_num TCP_SYN_BAN_BURST 20000)"
     SH_R_TCP_CONN_MAX="$(shield_limit_num TCP_CONN_MAX 15000)"
     # Глобальные потолки: дефолт 0 (ВЫКЛЮЧЕНЫ) — опасны на CGNAT-нодах:
     # один NAT-пул клиентов набьёт общий потолок и положит защищённые порты
@@ -51,7 +59,7 @@ shield_limits_resolve() {
 
     SH_R_SSH_ABUSERS_TIMEOUT="$(shield_limit_num SSH_ABUSERS_TIMEOUT 3600)"
     SH_R_SSH_ABUSERS_SIZE="$(shield_limit_num SSH_ABUSERS_SIZE 65536)"
-    SH_R_TCP_ABUSERS_TIMEOUT="$(shield_limit_num TCP_ABUSERS_TIMEOUT 900)"
+    SH_R_TCP_ABUSERS_TIMEOUT="$(shield_limit_num TCP_ABUSERS_TIMEOUT 300)"
     SH_R_TCP_ABUSERS_SIZE="$(shield_limit_num TCP_ABUSERS_SIZE 131072)"
     SH_R_UDP_ABUSERS_TIMEOUT="$(shield_limit_num UDP_ABUSERS_TIMEOUT 900)"
     SH_R_UDP_ABUSERS_SIZE="$(shield_limit_num UDP_ABUSERS_SIZE 65536)"

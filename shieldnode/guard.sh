@@ -52,7 +52,8 @@ CrowdSec (сообщество)|^c_drops_crowdsec
 Ваш список (custom)|^c_drops_custom
 Выходы Tor|^c_drops_tor
 Подбор паролей SSH|^c_drops_ssh_abusers
-Флуд соединениями TCP/SYN|^c_drops_(tcp_abusers|syn|global_tcp)
+Флуд соединениями TCP/SYN|^c_drops_(tcp_abusers|syn_v|global_tcp)
+Ограничение частоты (без бана)|^c_drops_(syn_limit|newconn_limit|udp_limit)
 UDP-флуд|^c_drops_(udp_abusers|global_udp)
 Временные баны|^c_drops_temp
 Отражённые атаки (DNS/NTP)|^c_drops_amp
