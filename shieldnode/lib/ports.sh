@@ -31,13 +31,14 @@ _ports_patch_conf() {
         { print }' "$1"
 }
 
-# shield_ports_sync — один проход. rc 0 всегда, кроме ошибки применения.
+# shield_ports_sync — один проход. rc 0 — сделано/не нужно, 1 — ошибка применения,
+# 3 — основной lock занят (apply или запись блок-листа): проход НЕ выполнен, повторить.
 shield_ports_sync() {
     [ -f /run/shieldnode/emergency ] && return 0
     nft list table inet shieldnode >/dev/null 2>&1 || return 0
     # основной lock: идёт apply/rollback — пропускаем (apply посчитает то же самое)
     exec 8>>"$SHIELD_LOCK"
-    flock -n 8 || return 0
+    flock -n 8 || return 3
 
     # конфиг мог измениться (меню/оператор) — перечитываем кэш
     [ -n "${CONFIG_CACHE:-}" ] && rm -f "$CONFIG_CACHE"
@@ -123,8 +124,11 @@ shield_ports_watch() {
         # в 30 мин: remnanode перезапускает ядро при каждой смене конфига (новый PID), UFW/конфиг —
         # mtime в отпечатке, API ноды — новый TCP-слушатель (v1.2.0, лаба: 120 с = ~1.5% CPU на 1 vCPU)
         if [ "$fp" != "$last_fp" ] || [ $((now - last_full)) -ge "${SHIELD_PORTS_FULL_EVERY:-1800}" ]; then
-            shield_ports_sync || true
-            last_fp="$fp"; last_full="$now"
+            local src=0; shield_ports_sync || src=$?
+            # 2026-09-26 (v1.2.0): lock занят (rc 3) — изменение НЕ «поглощено», повтор на следующем
+            # тике. Раньше отпечаток запоминался и при пропуске: на лабе новый инбаунд оставался без
+            # защиты до страховочного прохода (30 мин), пока апдейтер блок-листов держал lock
+            if [ "$src" != 3 ]; then last_fp="$fp"; last_full="$now"; fi
         fi
         sleep "${SHIELD_PORTS_INTERVAL:-15}"
     done

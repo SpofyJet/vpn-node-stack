@@ -206,10 +206,18 @@ if [ -n "${MAIN_LOCK_FILE:-}" ]; then
     # `exec 8>f 2>/dev/null` перенаправление stderr постоянное — ошибки терялись
     if { exec 8>"$MAIN_LOCK_FILE"; } 2>/dev/null; then
         flock -n 8 2>/dev/null || { bl_log info "main lock занят (apply/rollback) — пропуск тика"; exit 0; }
+        # 2026-09-26 (v1.2.0): НЕ держим основной lock на весь прогон — только на запись в nft
+        # (main_lock_take/drop). Загрузка фидов и чтение cscli идут без него: на лабе зависший
+        # `cscli decisions list` (120 с до таймаута) держал lock, и ports-watch пропускал новый
+        # инбаунд (e2e критерий 4)
+        flock -u 8 2>/dev/null || true
+        MAIN_LOCK_FD=8
     else
         bl_log info "main lock $MAIN_LOCK_FILE недоступен — тик без основного lock'а"
     fi
 fi
+main_lock_take() { [ -n "${MAIN_LOCK_FD:-}" ] || return 0; flock -w 60 8 2>/dev/null || { bl_log info "main lock занят > 60 с (apply?) — запись в nft пропущена"; return 1; }; }
+main_lock_drop() { [ -n "${MAIN_LOCK_FD:-}" ] || return 0; flock -u 8 2>/dev/null || true; }
 
 # flock: серия триггеров схлопывается в последовательные запуски; при занятом
 # lock'е >90с — пропуск тика (следующий применит), а не параллельный апдейт
@@ -559,7 +567,11 @@ update_list() { # update_list <name>
             # 2026-09-24 (v1.1.4): пустой список — только flush (раньше висячая « }» =
             # синтакс-ошибка nft, служба падала на каждом тике с пустым custom.txt)
         } > "$tmp/legacy.nft"
-        nft -c -f "$tmp/legacy.nft" >/dev/null 2>"$tmp/legacy.err" && nft -f "$tmp/legacy.nft" 2>>"$tmp/legacy.err"
+        main_lock_take || { echo "main lock busy" > "$tmp/legacy.err"; return 1; }
+        local lrc=0
+        nft -c -f "$tmp/legacy.nft" >/dev/null 2>"$tmp/legacy.err" && nft -f "$tmp/legacy.nft" 2>>"$tmp/legacy.err" || lrc=1
+        main_lock_drop
+        return "$lrc"
     }
 
     if nft list set $TABLE "$set_v4" >/dev/null 2>&1; then
@@ -692,8 +704,9 @@ restore_last_good() {
             { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
             END { if (NR > 0) print " }" }' "$lg" > "$tmpf"
         n="$(wc -l < "$lg")"
-        if nft -f "$tmpf" 2>/dev/null; then bl_log info "$name: восстановлен из последнего снимка ($n записей) — до обновления из сети"
-        else bl_log warn "$name: снимок $lg не загрузился — ждём обновления из сети"; fi
+        main_lock_take || { rm -f "$tmpf"; continue; }
+        if nft -f "$tmpf" 2>/dev/null; then main_lock_drop; bl_log info "$name: восстановлен из последнего снимка ($n записей) — до обновления из сети"
+        else main_lock_drop; bl_log warn "$name: снимок $lg не загрузился — ждём обновления из сети"; fi
         rm -f "$tmpf"
     done
     return 0
@@ -833,6 +846,10 @@ Description=shieldnode blocklist update timer
 
 [Timer]
 OnBootSec=3min
+# 2026-09-26 (v1.2.0): OnActiveSec — от (пере)запуска самого таймера. Только OnBootSec/OnUnitActiveSec:
+# после restart таймера (apply/rollback) обе точки уже в прошлом — монотонный таймер не срабатывал
+# до reboot (лаба: NEXT «-», CrowdSec-список не обновлялся 3 ч, health WARN)
+OnActiveSec=${interval}min
 OnUnitActiveSec=${interval}min
 RandomizedDelaySec=120
 Persistent=true
@@ -872,6 +889,7 @@ Description=shieldnode crowdsec blocklist timer (every ${cs_interval} min)
 
 [Timer]
 OnBootSec=5min
+OnActiveSec=2min
 OnUnitActiveSec=${cs_interval}min
 RandomizedDelaySec=60
 Persistent=true
@@ -904,16 +922,20 @@ EOF
     fi
 
     # --- 4) активируем ---
+    # 2026-09-26 (v1.2.0): таймеры — enable + restart (не `enable --now`: для уже запущенного
+    # таймера это no-op, и таймер, у которого все точки отсчёта в прошлом, так и оставался без
+    # следующего срабатывания — лаба: CrowdSec-список 3 ч без обновления). restart + OnActiveSec
+    # гарантируют ближайшее срабатывание после каждого apply.
     if [ "${DRY_RUN:-0}" != "1" ]; then
         systemctl daemon-reload
-        systemctl enable --now shieldnode-blocklist.timer >/dev/null 2>&1 || \
+        { systemctl enable shieldnode-blocklist.timer >/dev/null 2>&1 && systemctl restart shieldnode-blocklist.timer >/dev/null 2>&1; } || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist.timer не удался"
         systemctl enable shieldnode-blocklist-restore.service >/dev/null 2>&1 || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist-restore.service не удался"
         systemctl enable --now shieldnode-blocklist-custom.path >/dev/null 2>&1 || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist-custom.path не удался"
         if [ "$cs_units" = 1 ]; then
-            systemctl enable --now shieldnode-blocklist-crowdsec.timer >/dev/null 2>&1 || \
+            { systemctl enable shieldnode-blocklist-crowdsec.timer >/dev/null 2>&1 && systemctl restart shieldnode-blocklist-crowdsec.timer >/dev/null 2>&1; } || \
                 log warn "blocklist" "systemctl enable shieldnode-blocklist-crowdsec.timer не удался"
         fi
         # первый запуск неблокирующий: apply уже загрузил пустые сеты, updater

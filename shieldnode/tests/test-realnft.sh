@@ -62,7 +62,7 @@ t "status: health без FAIL на свежем ruleset" "grep -q 'health: FAIL=
 # 2026-09-23 (v1.1.4): `nft list chains inet shieldnode` — синтаксическая ошибка (list chains
 # принимает только family); под set -e/pipefail status молча умирал после секции firewall
 t "status: доходит до конца (секция persist / ownership)" "grep -q -- '--- persist / ownership ---' $OUT/status.out"
-t "status: в секции firewall перечислены цепочки prerouting и input" "grep -q '^  chain prerouting' $OUT/status.out && grep -q '^  chain input' $OUT/status.out"
+t "status: в секции firewall перечислены цепочки prerouting и v6_output" "grep -q '^  chain prerouting' $OUT/status.out && grep -q '^  chain v6_output' $OUT/status.out"
 
 # 2026-09-24 (v1.1.4): первый guard (снапшота нет, prev_ts=0) печатал «дельта за
 # <секунды с 1970>s» — на живой ноде «дельта за 1790200980s»

@@ -8,6 +8,7 @@ NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 export NODE_DIR NODE_STATE_DIR="$OUT/state" NODE_LOG="$OUT/node.log" DRY_RUN=1
 printf 'CONFIG_HZ=1000\n' > "$OUT/kconfig"; export NODE_KERNEL_CONFIG="$OUT/kconfig"   # HZ-зависимый usecs
+mkdir -p "$OUT/boot"; export NODE_BOOT_DIR="$OUT/boot"   # v1.2.0: HZ считается и по /boot/config-* — не /boot хоста
 mkdir -p "$OUT/state"; : > "$NODE_LOG"
 source "$NODE_DIR/lib/common.sh"; source "$NODE_DIR/config.sh"; source "$NODE_DIR/lib/sysctl.sh"
 source "$NODE_DIR/lib/datapath.sh"; source "$NODE_DIR/lib/limits.sh"; source "$NODE_DIR/lib/network.sh"

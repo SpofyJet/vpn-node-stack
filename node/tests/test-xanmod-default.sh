@@ -13,7 +13,8 @@ if [ "${NODE_TEST_IN_NS:-0}" != "1" ]; then
     unshare -m true 2>/dev/null || { echo "SKIP: unshare -m недоступен"; exit 77; }
     NODE_TEST_IN_NS=1 exec unshare -m bash "$0" "$@"
 fi
-for d in /etc/apt /etc/default /run /var/lib /var/log; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
+# v1.2.0: пробная загрузка пишет юнит и скрипт и трогает GRUB — всё это тоже в песочнице
+for d in /etc/apt /etc/default /run /var/lib /var/log /usr/local/sbin /etc/systemd/system /boot; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
 NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 mkdir -p "$OUT/bin" "$OUT/state"
@@ -38,8 +39,17 @@ EOF
 printf '#!/bin/sh\necho "-----BEGIN PGP-----"\n' > "$OUT/bin/wget"
 printf '#!/bin/sh\ncat >/dev/null; echo KEY\n' > "$OUT/bin/gpg"
 printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/update-grub"
-printf '#!/bin/sh\necho "REBOOT $*" >> "%s/reboot.called"\nexit 0\n' "$OUT" > "$OUT/bin/systemctl"
-cp "$OUT/bin/systemctl" "$OUT/bin/reboot"
+printf '#!/bin/sh\ncase "$*" in *reboot*|*poweroff*) echo "REBOOT $*" >> "%s/reboot.called" ;; esac\nexit 0\n' "$OUT" > "$OUT/bin/systemctl"
+printf '#!/bin/sh\necho "REBOOT $*" >> "%s/reboot.called"\nexit 0\n' "$OUT" > "$OUT/bin/reboot"
+# GRUB-утилиты — заглушки с журналом (НИКОГДА не настоящие: хост теста загружается через GRUB)
+for g in grub-set-default grub-reboot grub-editenv; do printf '#!/bin/sh\necho "%s $*" >> "%s/grub.calls"\nexit 0\n' "$g" "$OUT" > "$OUT/bin/$g"; done
+mkdir -p "$OUT/efi"; export NODE_GRUB_CFG="$OUT/grub.cfg" NODE_EFIVARS="$OUT/efi"
+cat > "$OUT/grub.cfg" <<'GEOF'
+submenu 'Advanced options for Ubuntu' $menuentry_id_option 'gnulinux-advanced-UUID' {
+	menuentry 'Ubuntu, with Linux 6.18.54-x64v3-xanmod1' --class ubuntu $menuentry_id_option 'gnulinux-6.18.54-x64v3-xanmod1-advanced-UUID' {
+	menuentry 'Ubuntu, with Linux 6.18.54-x64v3-xanmod1 (recovery mode)' --class ubuntu $menuentry_id_option 'gnulinux-6.18.54-x64v3-xanmod1-recovery-UUID' {
+	menuentry 'Ubuntu, with Linux 6.8.0-60-generic' --class ubuntu $menuentry_id_option 'gnulinux-6.8.0-60-generic-advanced-UUID' {
+GEOF
 chmod +x "$OUT/bin"/*; export PATH="$OUT/bin:$PATH"
 
 fails=0
@@ -88,6 +98,21 @@ fresh; echo "deb [signed-by=$KEY] http://deb.xanmod.org noble main" > /etc/apt/s
 echo FOREIGN-KEY > "$KEY"; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
 t "чужой источник XanMod уже есть: свой не добавлен, чужой ключ не перезаписан, пакет ставится" \
   "[ $rc = 0 ] && [ ! -e $LIST ] && [ \"\$(cat $KEY)\" = FOREIGN-KEY ] && grep -q 'install -y' $APTLOG"
+
+# ---------- v1.2.0 (лаба): Secure Boot, место в /boot, пробная загрузка ----------
+fresh; rm -f "$OUT/grub.calls"; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "пробная загрузка: по умолчанию остаётся текущее штатное ядро" "grep -qx 'grub-set-default gnulinux-advanced-UUID>gnulinux-6.8.0-60-generic-advanced-UUID' $OUT/grub.calls"
+t "пробная загрузка: XanMod — только следующая загрузка (grub-reboot), не recovery" "grep -qx 'grub-reboot gnulinux-advanced-UUID>gnulinux-6.18.54-x64v3-xanmod1-advanced-UUID' $OUT/grub.calls"
+t "пробная загрузка: GRUB_DEFAULT=saved в grub.d, юнит подтверждения создан" "grep -qx 'GRUB_DEFAULT=saved' /etc/default/grub.d/98-vpn-node-kernel.cfg && test -x /usr/local/sbin/node-kernel-confirm.sh && grep -q 'ExecStart=/usr/local/sbin/node-kernel-confirm.sh' /etc/systemd/system/node-kernel-confirm.service"
+t "пробная загрузка: скрипт подтверждения синтаксически валиден" "bash -n /usr/local/sbin/node-kernel-confirm.sh"
+t "авто-reboot НЕ вызывается и с пробной загрузкой" "[ ! -e $OUT/reboot.called ]"
+printf '\x06\x00\x00\x00\x01' > "$OUT/efi/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "Secure Boot включён: XanMod НЕ ставится (ошибка шага с объяснением), apt не вызывался" "[ $rc != 0 ] && [ ! -s $APTLOG ] && grep -q 'Secure Boot' $OUT/inst.out"
+printf '\x06\x00\x00\x00\x00' > "$OUT/efi/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+fresh; rc=0; inst 'ENABLE_XANMOD=1\n' || rc=$?
+t "Secure Boot выключен (байт 0): XanMod ставится" "[ $rc = 0 ] && grep -q 'install -y' $APTLOG"
+rm -f "$OUT/efi/"*
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: xanmod-default (all checks)"; else echo "FAILED: $fails checks"; exit 1; fi

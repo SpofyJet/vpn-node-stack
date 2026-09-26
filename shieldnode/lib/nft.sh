@@ -164,21 +164,25 @@ EOF
     chain prerouting {
         type filter hook prerouting priority -150; policy accept;
 EOF
-        if [ "$SH_F_ENABLE_LOOPBACK" = "1" ]; then
-            cat <<'EOF'
-        # loopback: локальные проверки (sshd self-test, health-checks) — не баним сами себя
-        iifname "lo" accept
-EOF
-        fi
+        # 2026-09-26 (v1.2.0): горячий путь — каждый пакет. Первым дешёвое сравнение байта nfproto
+        # (IPv6 fail-safe), вторым established/related (так заканчивается путь почти всех пакетов),
+        # loopback — по индексу интерфейса (iif), а не по строке имени (iifname) до established:
+        # на лабе фаервол на 1 vCPU под шифрованием стоил несколько процентов пропускной (e2e C6)
         cat <<'EOF'
-        # 2026-09-25 (v1.2.0): IPv6 на ноде выключен ОБЯЗАТЕЛЬНО — fail-safe: если IPv6 вернётся
-        # (откат, провайдер, обновление ядра/netplan), не пройдёт ни один пакет (DIAGNOSIS P1-4)
+        # IPv6 на ноде выключен ОБЯЗАТЕЛЬНО — fail-safe: если IPv6 вернётся (откат, провайдер,
+        # обновление ядра/netplan), не пройдёт ни один пакет (DIAGNOSIS P1-4)
         meta nfproto ipv6 counter name c_drops_ipv6_failsafe drop
 EOF
         [ "$SH_F_ENABLE_ESTABLISHED" = "1" ] && cat <<'EOF'
         # established/related — вернувшийся трафик не трогаем (ТЗ §23)
         ct state established,related accept
 EOF
+        if [ "$SH_F_ENABLE_LOOPBACK" = "1" ]; then
+            cat <<'EOF'
+        # loopback: локальные проверки (sshd self-test, health-checks) — не баним сами себя
+        iif "lo" accept
+EOF
+        fi
         cat <<'EOF'
         # API ноды — только панель (TRUSTED_IPS + UFW «allow from» для этого порта); ДО whitelist:
         # сессия админа по SSH к API ноды доступа не даёт (DIAGNOSIS P0-2)
@@ -379,7 +383,8 @@ EOF
 
     chain v6_output {
         type filter hook output priority -150; policy accept;
-        oifname "lo" accept
+        meta nfproto ipv4 accept
+        oif "lo" accept
         meta nfproto ipv6 counter name c_drops_ipv6_failsafe drop
     }
 
@@ -389,17 +394,9 @@ EOF
     }
 EOF
 
-        # ---------- input: loopback (ТЗ §23) ----------
-        if [ "$SH_F_ENABLE_LOOPBACK" = "1" ]; then
-            cat <<'EOF'
-
-    chain input {
-        type filter hook input priority -150; policy accept;
-        # loopback-трафик (локальные сервисы, health-checks) — не трогаем
-        iifname "lo" accept
-    }
-EOF
-        fi
+        # ---------- input: убран (v1.2.0) ----------
+        # единственное правило «iifname lo accept» при policy accept ничего не меняло, но каждый
+        # пакет к ноде проходил лишний хук со сравнением строки; loopback принят в prerouting
 
         echo "}"
     }

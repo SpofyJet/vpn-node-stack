@@ -321,6 +321,7 @@ Description=shieldnode cleanup timer
 
 [Timer]
 OnBootSec=5min
+OnActiveSec=5min
 OnUnitActiveSec=15min
 
 [Install]
@@ -328,7 +329,7 @@ WantedBy=timers.target
 EOF
     if [ "${DRY_RUN:-0}" != "1" ]; then
         systemctl daemon-reload
-        systemctl enable --now shieldnode-cleanup.timer
+        systemctl enable shieldnode-cleanup.timer && systemctl restart shieldnode-cleanup.timer   # v1.2.0: см. lib/blocklist.sh «активируем»
     fi
     ok "limits" "cleanup timer installed"
 }

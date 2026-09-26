@@ -17,6 +17,7 @@ export NODE_DIR NODE_STATE_DIR="$OUT/state" NODE_LOG="$OUT/node.log" NODE_RT_TWE
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$NODE_STATE_DIR" "$OUT/proc/net"; : > "$NODE_LOG"; : > "$NODE_RT_TWEAKS"
 # netdev_budget_usecs зависит от HZ ядра (v1.1.8) — фиксируем HZ=1000
 printf 'CONFIG_HZ=1000\n' > "$OUT/kconfig"; export NODE_KERNEL_CONFIG="$OUT/kconfig"
+mkdir -p "$OUT/boot"; export NODE_BOOT_DIR="$OUT/boot"   # v1.2.0: HZ считается и по /boot/config-* — не /boot хоста
 printf '#!/bin/sh\necho "default via 10.0.0.1 dev eth0 proto static"\n' > "$OUT/bin/ip"
 cat > "$OUT/bin/ethtool" <<'EOF'
 #!/bin/bash
@@ -107,6 +108,8 @@ t "softnet чисто: budget 600 / backlog 8192 (как в 1.1.2)" '[ "$(val ne
 t "softnet чисто: usecs 4000 (v1.1.7, было 8000)" '[ "$(val net.core.netdev_budget_usecs)" = 4000 ]'
 sn "000f4240 00000000 000001f4"; plan     # 500 / 1_000_000 = 0.05%
 t "squeeze 0.05% (ниже порога 0.1%): budget не меняется" '[ "$(val net.core.netdev_budget)" = 600 ]'
+sn "000011ce 00000000 00000020"; plan     # v1.2.0 (лаба): 32 / 4558 = 0.7%, но выборка мала (< 100 000)
+t "squeeze по малой выборке (32/4558 после boot): budget НЕ меняется" '[ "$(val net.core.netdev_budget)" = 600 ]'
 sn "000f4240 00000000 00002710"; plan     # 10000 / 1_000_000 = 1%
 t "squeeze 1%: netdev_budget 600 -> 1200" '[ "$(val net.core.netdev_budget)" = 1200 ]'
 t "squeeze 1%: usecs пропорционально 1200 -> 8000 (v1.1.7)" '[ "$(val net.core.netdev_budget_usecs)" = 8000 ]'

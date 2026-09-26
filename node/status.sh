@@ -20,6 +20,10 @@ node_status() {
     if node_xanmod_reboot_pending; then
         node_reboot_notice "kernel: XanMod установлен ($(cut -f2 "$(node_xanmod_pending_file)" 2>/dev/null)), ОЖИДАЕТ REBOOT — активно $(uname -r). Выполни: sudo reboot" 1
     fi
+    # 2026-09-26 (v1.2.0): пробная загрузка XanMod не удалась — нода на штатном ядре
+    if [ -f "${NODE_STATE_DIR:-/var/lib/node}/xanmod-trial-failed" ]; then
+        node_reboot_notice "kernel: пробная загрузка XanMod не удалась ($(cat "${NODE_STATE_DIR:-/var/lib/node}/xanmod-trial-failed")) — работает штатное ядро $(uname -r). Причина: journalctl -b -1; Secure Boot: mokutil --sb-state" 1
+    fi
     # 2026-09-25 (v1.2.0, P1-4): IPv6 — инвариант стека
     if node_ipv6_kernel_off; then echo "ipv6: выключен в ядре (ipv6.disable=1)"
     elif node_ipv6_reboot_pending; then node_reboot_notice "IPv6: ipv6.disable=1 добавлен в GRUB, активируется после reboot (сейчас выключен через sysctl)" 1

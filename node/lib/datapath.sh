@@ -50,6 +50,23 @@ node_softnet_read() {
 # node_conf_user_set — в config.sh (v1.1.7: нужен и irq.sh в rt-reapply)
 
 # node_kernel_hz — CONFIG_HZ текущего ядра (пусто, если не определить). 2026-09-25 (v1.1.8)
+# node_kernel_hz_floor — 2026-09-26 (v1.2.0): НАИМЕНЬШИЙ HZ среди ядер, которые могут загрузиться:
+# текущее, все /boot/config-*, и XanMod (HZ=250), если он запрошен, но ещё не стоит. sysctl-файл
+# пишется ДО шага установки XanMod; значение под стоковое HZ=1000 (4000µs) XanMod отвергает при
+# boot — systemd-sysctl.service failed при первой загрузке нового ядра (лаба, 6.18.54-xanmod1).
+node_kernel_hz_floor() {
+    local cur v min="" f
+    cur="$(node_kernel_hz)"; [[ "$cur" =~ ^[0-9]+$ ]] && min="$cur"
+    for f in "${NODE_BOOT_DIR:-/boot}"/config-*; do
+        [ -r "$f" ] || continue
+        v="$(sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' "$f" | head -1)"
+        [[ "$v" =~ ^[0-9]+$ ]] && { [ -z "$min" ] || [ "$v" -lt "$min" ]; } && min="$v"
+    done
+    if [ "$(node_conf_get ENABLE_XANMOD 0)" = 1 ] && ! ls "${NODE_BOOT_DIR:-/boot}"/config-*xanmod* >/dev/null 2>&1; then
+        { [ -z "$min" ] || [ 250 -lt "$min" ]; } && min=250
+    fi
+    printf '%s' "$min"
+}
 node_kernel_hz() {
     local f="${NODE_KERNEL_CONFIG:-/boot/config-$(uname -r)}" v=""
     [ -r "$f" ] && v="$(sed -n 's/^CONFIG_HZ=\([0-9]*\)$/\1/p' "$f" | head -1)"
@@ -65,7 +82,10 @@ node_softnet_value() {
     case "$kind" in
         drop)    [ "${_NODE_SN_DROP:-0}" -gt 0 ] && v=$((v * 2)) ;;
         # squeeze > 0.1% processed: единичные исторические squeeze не в счёт
-        squeeze) [ $(( ${_NODE_SN_SQZ:-0} * 1000 )) -gt "${_NODE_SN_PROC:-0}" ] && [ "${_NODE_SN_SQZ:-0}" -gt 0 ] && v=$((v * 2)) ;;
+        # 2026-09-26 (v1.2.0): и не меньше 100 000 обработанных пакетов — на лабе после rollback решение
+        # принималось по 32 squeeze из 4558 пакетов (шум первых минут после boot): budget прыгал
+        # 600 <-> 1200 между apply (e2e критерий 7)
+        squeeze) [ "${_NODE_SN_PROC:-0}" -ge 100000 ] && [ $(( ${_NODE_SN_SQZ:-0} * 1000 )) -gt "${_NODE_SN_PROC:-0}" ] && [ "${_NODE_SN_SQZ:-0}" -gt 0 ] && v=$((v * 2)) ;;
     esac
     echo "$v"
 }
@@ -151,7 +171,7 @@ node_datapath_plan() {
     # не меньше 2 jiffy и кратно jiffy; ключ пишем, только если это БОЛЬШЕ дефолта ядра.
     # HZ неизвестен — не пишем вовсе (дефолт ядра всегда валиден). Явное значение < минимума — warn.
     local nbu hz jus min want
-    hz="$(node_kernel_hz)"
+    hz="$(node_kernel_hz_floor)"   # v1.2.0: валидно для ВСЕХ ядер, которые могут загрузиться
     nbu="$(node_conf_get NETDEV_BUDGET_USECS "")"
     if [[ "$hz" =~ ^[0-9]+$ ]] && [ "$hz" -gt 0 ]; then
         jus=$((1000000 / hz)); min=$((2 * jus))
@@ -370,7 +390,9 @@ TCEOF
         # 2026-09-25 (v1.2.0): запуск ЧЕРЕЗ юнит — его состояние = реальность. Обновление с v1.3.0:
         # старый скрипт падал при boot на «mq 0:» (virtio multiqueue), новый apply запускал скрипт
         # напрямую — fq стоял, а юнит оставался failed (`systemctl --failed`, мониторинг)
-        if [ -d /run/systemd/system ]; then
+        local via_unit="${NODE_FQ_VIA_UNIT:-auto}"
+        [ "$via_unit" = auto ] && { [ -d /run/systemd/system ] && via_unit=1 || via_unit=0; }
+        if [ "$via_unit" = 1 ]; then
             systemctl reset-failed node-fq-tune.service >/dev/null 2>&1 || true
             systemctl restart node-fq-tune.service >/dev/null 2>&1 || frc=$?
         else

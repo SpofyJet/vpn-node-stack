@@ -144,6 +144,16 @@ node_xanmod_install() {
     branch="$(node_conf_get XANMOD_BRANCH lts)"
     case "$branch" in lts|main) : ;; *) die "XANMOD_BRANCH: lts|main, получено '$branch'" ;; esac
 
+    # 2026-09-26 (v1.2.0, лаба): UEFI Secure Boot — ядро XanMod не подписано доверенным ключом,
+    # shim отвергает его («bad shim signature»), а после установки XanMod становился пунктом GRUB
+    # по умолчанию — нода не загружалась вовсе (только консоль провайдера). Не ставим.
+    if node_secure_boot_on; then
+        _xm_fail "UEFI Secure Boot включён — ядро XanMod не подписано доверенным ключом и НЕ загрузится. XanMod не устанавливается (выключите Secure Boot в панели провайдера или оставьте штатное ядро: BBR + fq работают и на нём)"; return
+    fi
+    local boot_kb; boot_kb="$(df -Pk /boot 2>/dev/null | awk 'NR == 2 {print $4}')"
+    if [[ "$boot_kb" =~ ^[0-9]+$ ]] && [ "$boot_kb" -lt 204800 ]; then
+        _xm_fail "в /boot свободно $((boot_kb / 1024)) МБ (< 200 МБ на ядро и initrd) — XanMod не устанавливается"; return
+    fi
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "would install XanMod kernel (branch $branch, variant $(node_conf_get XANMOD_VARIANT auto))"; return 0; }
 
     local level pkg
@@ -226,8 +236,9 @@ node_xanmod_install() {
         node_manifest_record /etc/apt/preferences.d/xanmod-kernel
     fi
     command -v update-grub >/dev/null 2>&1 && update-grub || true
+    node_xanmod_trial_setup || log warn "kernel" "пробная загрузка не настроена — XanMod станет ядром по умолчанию сразу (проверь: grub-editenv list)"
     # баннер — после шумного update-grub, прямо перед y/N-промптом
-    node_reboot_notice "XanMod установлен ($pkg). ТРЕБУЕТСЯ REBOOT для активации нового ядра: sudo reboot (сейчас активно $(uname -r))"
+    node_reboot_notice "XanMod установлен ($pkg). ТРЕБУЕТСЯ REBOOT (sudo reboot): первая загрузка — пробная; если нода не поднимется, перезагрузка из панели провайдера вернёт штатное ядро $(uname -r)"
     node_kernel_reboot_offer
 }
 
@@ -242,6 +253,73 @@ node_grub_default_kernel() {
     def="$(awk -F= '/^GRUB_DEFAULT=/{v=$2} END{gsub(/["'"'"']/, "", v); print v}' "${NODE_GRUB_DEFAULT_FILE:-/etc/default/grub}" 2>/dev/null || true)"
     [ "${def:-0}" = "0" ] || return 0
     awk '$1 == "linux" && $2 ~ /vmlinuz-/ { v = $2; sub(/.*vmlinuz-/, "", v); print v; exit }' "$cfg" 2>/dev/null || true
+}
+
+# node_secure_boot_on — UEFI Secure Boot включён (efivar SecureBoot: 5-й байт = 1)
+node_secure_boot_on() {
+    local v
+    for v in "${NODE_EFIVARS:-/sys/firmware/efi/efivars}"/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c; do
+        [ -r "$v" ] || return 1
+        [ "$(od -An -tu1 -j4 -N1 "$v" 2>/dev/null | tr -d ' ')" = 1 ]; return
+    done
+    return 1
+}
+
+# node_grub_entry <regex-ядра> — «подменю>пункт» GRUB для ядра (без recovery); пусто — нет
+node_grub_entry() {
+    local cfg="${NODE_GRUB_CFG:-/boot/grub/grub.cfg}" sub id
+    sub="$(grep -m1 '^submenu ' "$cfg" 2>/dev/null | grep -o "gnulinux-advanced-[^']*" || true)"
+    id="$(grep -E '^[[:space:]]+menuentry ' "$cfg" 2>/dev/null | grep -v recovery | grep -E "$1" | head -1 | grep -o "gnulinux-[^']*-advanced-[^']*" || true)"
+    [ -n "$sub" ] && [ -n "$id" ] && echo "$sub>$id"
+}
+
+# node_xanmod_trial_setup — 2026-09-26 (v1.2.0): XanMod не становится ядром по умолчанию сразу.
+# GRUB_DEFAULT=saved (grub.d, манифест node), saved_entry = текущее штатное ядро, next_entry
+# (grub-reboot) = XanMod — ОДНА пробная загрузка. node-kernel-confirm.service после успешной
+# загрузки XanMod (multi-user) делает его ядром по умолчанию. Не загрузился (панель провайдера →
+# reset) — GRUB берёт saved_entry: нода снова на штатном ядре, XanMod повторно не пробуется.
+node_xanmod_trial_setup() {
+    command -v grub-set-default >/dev/null 2>&1 && command -v grub-reboot >/dev/null 2>&1 || return 1
+    local stock xm
+    printf '%s\n' '# node: ядро по умолчанию — сохранённое (пробная загрузка XanMod, managed by node)' 'GRUB_DEFAULT=saved' \
+        | node_persist /etc/default/grub.d/98-vpn-node-kernel.cfg
+    update-grub >/dev/null 2>&1 || return 1
+    stock="$(node_grub_entry "Linux $(uname -r | sed 's/[.]/[.]/g')'")"
+    xm="$(node_grub_entry 'xanmod')"
+    [ -n "$stock" ] && [ -n "$xm" ] || return 1
+    grub-set-default "$stock" && grub-reboot "$xm" || return 1
+    {
+        echo '#!/bin/bash'
+        echo '# node — подтверждение пробной загрузки XanMod (generated, managed by node)'
+        cat <<'CEOF'
+p=/var/lib/node/pending-reboot-xanmod
+log() { printf '%s [%s] kernel-confirm: %s
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> /var/log/node.log; }
+cfg=/boot/grub/grub.cfg
+entry() { local sub id; sub=$(grep -m1 '^submenu ' "$cfg" | grep -o "gnulinux-advanced-[^']*"); id=$(grep -E '^[[:space:]]+menuentry ' "$cfg" | grep -v recovery | grep -F "Linux $1'" | head -1 | grep -o "gnulinux-[^']*-advanced-[^']*"); [ -n "$sub" ] && [ -n "$id" ] && echo "$sub>$id"; }
+case "$(uname -r)" in
+  *xanmod*)
+    e=$(entry "$(uname -r)")
+    if [ -n "$e" ] && [ "$(grub-editenv list | sed -n 's/^saved_entry=//p')" != "$e" ]; then
+        grub-set-default "$e" && log info "XanMod $(uname -r) загрузился — сделан ядром по умолчанию"
+    fi
+    rm -f /var/lib/node/xanmod-trial-failed ;;
+  *)
+    if [ -f "$p" ] && [ -z "$(grub-editenv list | sed -n 's/^next_entry=//p')" ]; then
+        date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/node/xanmod-trial-failed
+        log warn "пробная загрузка XanMod не удалась — нода на штатном ядре $(uname -r); XanMod больше не выбирается (подробности: journalctl -b -1)"
+    fi ;;
+esac
+exit 0
+CEOF
+    } | node_persist /usr/local/sbin/node-kernel-confirm.sh
+    chmod 0755 /usr/local/sbin/node-kernel-confirm.sh
+    printf '%s\n' '[Unit]' 'Description=node: confirm XanMod trial boot' 'After=multi-user.target' '' '[Service]' 'Type=oneshot' \
+        'ExecStart=/usr/local/sbin/node-kernel-confirm.sh' '' '[Install]' 'WantedBy=multi-user.target' \
+        | node_persist /etc/systemd/system/node-kernel-confirm.service
+    systemctl daemon-reload >/dev/null 2>&1; systemctl enable node-kernel-confirm.service >/dev/null 2>&1 || true
+    log info "kernel" "пробная загрузка: по умолчанию остаётся $(uname -r), следующая загрузка — XanMod один раз"
+    return 0
 }
 
 node_xanmod_pending_file() { echo "${NODE_STATE_DIR:-/var/lib/node}/pending-reboot-xanmod"; }
