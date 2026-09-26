@@ -16,6 +16,8 @@ rm -rf /tmp/node-dp-test
 mkdir -p "$NODE_STATE_DIR" "$NODE_DIAG_DIR" "$NODE_PROFILE_DIR"
 # 2026-09-25 (v1.1.8): netdev_budget_usecs зависит от HZ ядра — фиксируем (1000, как Ubuntu generic)
 printf 'CONFIG_HZ=1000\n' > /tmp/node-dp-test/kconfig; export NODE_KERNEL_CONFIG=/tmp/node-dp-test/kconfig
+# v1.2.0: HZ считается и по /boot/config-* (все ядра, которые могут загрузиться) — фикстура, не /boot хоста
+mkdir -p /tmp/node-dp-test/boot; rm -f /tmp/node-dp-test/boot/*; export NODE_BOOT_DIR=/tmp/node-dp-test/boot
 
 source "$NODE_DIR/lib/common.sh"
 source "$NODE_DIR/config.sh"
@@ -52,6 +54,16 @@ printf 'CONFIG_HZ=100\n' > "$NODE_KERNEL_CONFIG"; replan
 t "plan (HZ=100): не пишется (минимум 20000)" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN'"
 : > "$NODE_KERNEL_CONFIG"; replan
 t "plan (HZ неизвестен): не пишется" bash -c "! grep -q 'net.core.netdev_budget_usecs' '$PLAN'"
+# v1.2.0 (лаба): активно стоковое HZ=1000, но в /boot уже есть XanMod (HZ=250) — при его загрузке
+# 4000 давал EINVAL (systemd-sysctl.service failed). Значение должно быть валидным для обоих ядер.
+printf 'CONFIG_HZ=1000\n' > "$NODE_KERNEL_CONFIG"; printf 'CONFIG_HZ=1000\n' > /tmp/node-dp-test/boot/config-6.8.0-139-generic
+printf 'CONFIG_HZ=250\n' > /tmp/node-dp-test/boot/config-6.18.54-x64v3-xanmod1; replan
+t "plan (стоковое активно, XanMod в /boot): 4000 не пишется (для HZ=250 это 1 jiffy)" bash -c "! grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+rm -f /tmp/node-dp-test/boot/config-6.18.54-x64v3-xanmod1; replan
+t "plan (только стоковое в /boot): 4000 как прежде" bash -c "grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+printf 'ENABLE_XANMOD=1\n' >> "$CONFIG_CACHE.x"; cat "$CONFIG_CACHE" >> "$CONFIG_CACHE.x"; cp "$CONFIG_CACHE" "$CONFIG_CACHE.orig"; mv "$CONFIG_CACHE.x" "$CONFIG_CACHE"; replan
+t "plan (XanMod запрошен, ещё не установлен): 4000 не пишется (план под HZ=250)" bash -c "! grep -q 'net.core.netdev_budget_usecs	4000' '$PLAN'"
+mv "$CONFIG_CACHE.orig" "$CONFIG_CACHE"; rm -f /tmp/node-dp-test/boot/*; replan
 # живое ядро: план с НАСТОЯЩИМ /boot/config — значение должно приниматься ядром (4000 на 6.18/HZ=250
 # давал EINVAL и ронял apply). Ключ глобальный (не netns) — пишем на миг и сразу возвращаем исходное.
 if [ "$(id -u)" -eq 0 ] && [ -w /proc/sys/net/core/netdev_budget_usecs ]; then

@@ -59,7 +59,7 @@ shield_health() {
     # (0x2,0x4), символьные шаблоны ниже не совпадали: ложные FAIL на живой ноде.
     # Порты и адреса числовые и без -n (имена сервисов — только с -S, DNS — с -N).
     pre="$(nft list chain inet shieldnode prerouting 2>/dev/null || true)"
-    for ch in prerouting input; do
+    for ch in prerouting v6_output; do   # v1.2.0: цепочки input больше нет (пустой хук)
         if nft list chain inet shieldnode "$ch" >/dev/null 2>&1; then _hc PASS "chain $ch есть"; else _hc FAIL "chain $ch отсутствует"; fi
     done
     n="$(awk '/ drop( |$)/ {c++} END {print c + 0}' <<<"$pre")"
@@ -71,7 +71,7 @@ shield_health() {
     # намеренно — в «первый drop» не считаются
     d="$(awk '!f && / drop( |$)/ && !/c_drops_ipv6_failsafe|c_drops_nodeapi/ {print NR; f = 1}' <<<"$pre")"; d="${d:-999999}"
     est="$(awk '!f && /ct state established,related accept/ {print NR; f = 1}' <<<"$pre")"
-    lo="$(awk '!f && /iifname "lo" accept/ {print NR; f = 1}' <<<"$pre")"
+    lo="$(awk '!f && /iif(name)? "lo" accept/ {print NR; f = 1}' <<<"$pre")"
     wl="$(awk '!f && /@whitelist_v4 accept/ {print NR; f = 1}' <<<"$pre")"
     if [ "$(shield_conf_get ENABLE_ESTABLISHED 1)" = "1" ]; then
         if [ -n "$est" ] && [ "$est" -lt "$d" ]; then _hc PASS "established/related accept — до первого drop"; else _hc FAIL "established/related accept отсутствует или ПОСЛЕ drop — рвутся уже установленные сессии"; fi

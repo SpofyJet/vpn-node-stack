@@ -109,6 +109,18 @@ nft delete chain inet shieldnode v6_output; vfy || true
 t "verify: удалённая цепочка v6_output -> ✘ (негативный контроль)" "grep -q '✘ нет цепочки v6_output' $OUT/verify.out"
 { echo "flush ruleset"; cat "$SHIELD_NFT_PERSIST.bak-verify"; } | nft -f - 2>/dev/null || true
 
+# 5c) v1.2.0: основной lock занят (apply / запись блок-листа) — проход не выполнен, rc 3 (повтор на
+# следующем тике), ничего не меняется; после освобождения — применяется
+lsi VLESS:443:tcp SS:8388:both
+( exec 9>>/run/shieldnode/shieldnode.lock; flock -n 9; sleep 4 ) & lpid=$!; sleep 0.5
+src=0; bash "$SHIELD_DIR/main.sh" ports-sync >/dev/null 2>&1 || src=$?
+t "lock занят: ports-sync rc 3 и наборы не тронуты" "[ $src = 3 ] && ! grep -qw 8388 <<<\"\$(el protected_tcp)\""
+wait $lpid
+sync
+t "lock свободен: следующий проход применяет" "grep -qw 8388 <<<\"\$(el protected_tcp)\""
+t "watch: при rc 3 отпечаток не запоминается (повтор на следующем тике)" "grep -q 'if \[ \"\$src\" != 3 \]; then last_fp=' $SHIELD_DIR/lib/ports.sh"
+lsi VLESS:443:tcp; sync   # вернуть исходное состояние для следующих проверок
+
 # 6) аварийный режим — sync ничего не трогает
 lsi VLESS:443:tcp SS:8388:both; touch /run/shieldnode/emergency; sync
 t "emergency: sync пропущен" "! grep -qw 8388 <<<\"\$(el protected_tcp)\""

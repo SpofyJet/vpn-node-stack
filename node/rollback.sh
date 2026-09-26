@@ -24,7 +24,8 @@ node_rollback() {
     local u fq_lim=""
     # 2026-09-25 (v1.2.0): лимит fq, выставленный node, — до удаления скрипта (для шага 3a)
     [ -f /usr/local/sbin/node-fq-tune.sh ] && fq_lim="$(sed -n 's/^LIM=\([0-9]*\)$/\1/p' /usr/local/sbin/node-fq-tune.sh | head -1)"
-    for u in node-mss-clamp.service node-rt-tweaks.service node-fq-tune.service; do
+    local had_kernel_cfg=0; [ -f /etc/default/grub.d/98-vpn-node-kernel.cfg ] && had_kernel_cfg=1
+    for u in node-mss-clamp.service node-rt-tweaks.service node-fq-tune.service node-kernel-confirm.service; do
         if systemctl cat "$u" >/dev/null 2>&1; then
             systemctl disable --now "$u" >/dev/null 2>&1 || true
         fi
@@ -161,6 +162,13 @@ node_rollback() {
     rm -f /usr/local/sbin/node-rt-tweaks.sh /etc/udev/rules.d/99-node-rt-hotplug.rules
     udevadm control --reload >/dev/null 2>&1 || true
     nft delete table inet node_mss_clamp 2>/dev/null || true
+    # 2026-09-26 (v1.2.0): пробная загрузка XanMod (GRUB_DEFAULT=saved в grub.d) — файл снят по
+    # манифесту выше; пересобираем grub.cfg, чтобы он не ссылался на saved_entry
+    if [ "$had_kernel_cfg" = 1 ] && [ ! -f /etc/default/grub.d/98-vpn-node-kernel.cfg ]; then
+        command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1 || true
+        command -v grub-editenv >/dev/null 2>&1 && grub-editenv - unset saved_entry next_entry 2>/dev/null || true
+        log info "rollback" "GRUB: пробная загрузка XanMod снята (GRUB_DEFAULT по /etc/default/grub)"
+    fi
     # grub-файл (если XanMod-установка правила /etc/default/grub) — восстанавливаем
     local g; g="$(ls -1t /etc/default/grub.pre-node-* 2>/dev/null | head -1 || true)"
     if [ -n "$g" ] && [ -w /etc/default/grub ]; then

@@ -61,6 +61,7 @@ awk -F'\t' -v OFS='\t' -v d="\$dev" -v w="\$where" -v h="\$newh" -v L="\$L" -v F
 mv "\$DB.new" "\$DB"
 EOF
 for c in systemctl logger udevadm; do printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/$c"; done
+export NODE_FQ_VIA_UNIT=0   # v1.2.0: живой путь — через node-fq-tune.service; здесь проверяем сам скрипт с фейковым tc
 chmod +x "$OUT/bin"/*; export PATH="$OUT/bin:$PATH"
 
 source "$NODE_DIR/lib/common.sh"; source "$NODE_DIR/config.sh"; node_load_config >/dev/null 2>&1 || true
@@ -93,6 +94,12 @@ t "rollback: child fq вернулся к исходным" "[ \"\$(row ens9 1:2
 FAKE_TC_FAIL=1 node_fq_tune_apply > "$OUT/apply-fail.out" 2>&1 || true
 t "отказ tc: без ложного 'fq tuned'" "! grep -q 'fq tuned' $OUT/apply-fail.out $NODE_LOG"
 t "отказ tc: warn о неприменённом fq tune" "grep -q 'fq tune не применён' $OUT/apply-fail.out"
+
+# v1.2.0: на systemd-хосте apply запускает настройку ЧЕРЕЗ юнит (reset-failed + restart), чтобы
+# состояние юнита отражало реальность (обновление с v1.3.0 оставляло его failed)
+printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\nexit 0\n' "$OUT" > "$OUT/bin/systemctl"; : > "$OUT/systemctl.log"
+NODE_FQ_VIA_UNIT=1 node_fq_tune_apply > /dev/null 2>&1 || true
+t "через юнит: reset-failed + restart node-fq-tune.service" 'grep -qx "reset-failed node-fq-tune.service" "$OUT/systemctl.log" && grep -qx "restart node-fq-tune.service" "$OUT/systemctl.log"'
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: fq-tune (all checks)"; else echo "FAILED: $fails checks"; exit 1; fi

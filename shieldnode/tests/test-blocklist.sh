@@ -165,7 +165,9 @@ t "install: updater эмитирован" test -x "$SHIELD_BLOCKLIST_SCRIPT"
 t "install: updater синтаксически валиден" bash -n "$SHIELD_BLOCKLIST_SCRIPT"
 t "install: service ссылается на production-путь updater'а" grep -q "ExecStart=/usr/local/sbin/shieldnode-blocklist" "$OUT/etc/systemd/system/shieldnode-blocklist.service"
 t "install: timer интервал из конфига" grep -q "OnUnitActiveSec=360min" "$OUT/etc/systemd/system/shieldnode-blocklist.timer"
-t "install: timer enable через systemctl" grep -q "enable --now shieldnode-blocklist.timer" "$SYSTEMCTL_LOG"
+t "install: timer enable через systemctl" grep -q "enable shieldnode-blocklist.timer" "$SYSTEMCTL_LOG"
+# v1.2.0: restart (не enable --now — no-op для запущенного таймера с точками отсчёта в прошлом)
+t "install: timer перезапускается (ближайшее срабатывание после apply)" grep -q "restart shieldnode-blocklist.timer" "$SYSTEMCTL_LOG"
 t "install: custom.txt засеян" test -f "$SHIELD_LISTS_DIR/custom.txt"
 t "install: hardening юнита (NoNewPrivileges/ProtectSystem/Timeout)" bash -c "grep -q 'NoNewPrivileges=true' '$OUT/etc/systemd/system/shieldnode-blocklist.service' && grep -q 'ProtectSystem=strict' '$OUT/etc/systemd/system/shieldnode-blocklist.service' && grep -q 'TimeoutStartSec=600' '$OUT/etc/systemd/system/shieldnode-blocklist.service'"
 t "install: custom path-триггер (PathChanged, без PathExists)" bash -c "grep -q 'PathChanged=.*custom.txt' '$OUT/etc/systemd/system/shieldnode-blocklist-custom.path' && ! grep -q 'PathExists' '$OUT/etc/systemd/system/shieldnode-blocklist-custom.path'"
@@ -354,6 +356,16 @@ wait "$lockpid" || true
 # после освобождения lock'а тик снова работает
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
 t "main-lock: после освобождения lock'а updater работает" bash -c "test -s '$OUT/nftdb/set_scanner_blocklist_v4'"
+# v1.2.0 (лаба, e2e критерий 4): основной lock НЕ держится на время загрузки фидов (медленный
+# источник / зависший cscli) — только на запись в nft; иначе ports-watch пропускал новый инбаунд
+mkdir -p "$OUT/bin-slow"; printf '#!/bin/sh\nsleep 3\nexec %s "$@"\n' "$(command -v curl)" > "$OUT/bin-slow/curl"; chmod +x "$OUT/bin-slow/curl"
+: > "$OUT/nftdb/set_scanner_blocklist_v4"
+PATH="$OUT/bin-slow:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner &
+updpid=$!; sleep 1.5
+free=0; ( exec 7>"$OUT/lock"; flock -n 7 ) && free=1
+wait "$updpid" || true
+t "main-lock: во время загрузки фида основной lock свободен" test "$free" = 1
+t "main-lock: запись в nft после загрузки выполнена" bash -c "test -s '$OUT/nftdb/set_scanner_blocklist_v4'"
 
 # ================= 7) firewall отсутствует → тихий exit 0 =================
 rm -f "$OUT/nftdb/table"
@@ -514,6 +526,8 @@ SH_F_ENABLE_CROWDSEC_LIST=1 shield_blocklist_install
 SHIELD_BLOCKLIST_SCRIPT="$OUT/usr/local/sbin/shieldnode-blocklist"
 # 2026-09-24 (v1.1.6): общий таймер тикает раз в 360 мин — у agent-режима свой таймер
 t "crowdsec-agent: свой таймер каждые 30 мин" bash -c "grep -qx 'OnUnitActiveSec=30min' '$OUT/etc/systemd/system/shieldnode-blocklist-crowdsec.timer'"
+# v1.2.0: после restart таймера (apply/rollback) без OnActiveSec следующего срабатывания не было до reboot
+t "таймеры: OnActiveSec — срабатывают после перезапуска таймера (не только после boot)" bash -c "grep -qx 'OnActiveSec=2min' '$OUT/etc/systemd/system/shieldnode-blocklist-crowdsec.timer' && grep -qE '^OnActiveSec=[0-9]+min' '$OUT/etc/systemd/system/shieldnode-blocklist.timer'"
 t "crowdsec-agent: служба обновляет ТОЛЬКО crowdsec" bash -c "grep -qx 'ExecStart=/usr/local/sbin/shieldnode-blocklist crowdsec' '$OUT/etc/systemd/system/shieldnode-blocklist-crowdsec.service'"
 t "общий таймер — прежний интервал (360 мин)" bash -c "grep -qx 'OnUnitActiveSec=360min' '$OUT/etc/systemd/system/shieldnode-blocklist.timer'"
 t "crowdsec-agent: local://cscli-decisions запечён (не admin.api)" bash -c "grep -q '^BL_URLS_crowdsec=\"local://cscli-decisions\"' '$SHIELD_BLOCKLIST_SCRIPT'"
