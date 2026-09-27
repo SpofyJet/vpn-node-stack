@@ -31,7 +31,10 @@ node_reality_lsi_json() {
     fi
 }
 
-# node_reality_dests — уникальные dest REALITY-инбаундов («host:port»; голый порт -> 127.0.0.1:порт)
+# node_reality_dests — уникальные dest REALITY-инбаундов: строки «dest<TAB>SNI» (SNI — первый из serverNames).
+# dest: «host:port»; голый порт -> 127.0.0.1:порт; путь «/…» или «@…» — unix-сокет (selfsteal), как есть.
+# 2026-09-27 (v1.2.4): раньше путь сокета превращался в «/dev/shm/x.sock:443», а 127.0.0.1:8443
+# проверялся без SNI — у selfsteal (Caddy отвечает только на свой домен) это «недоступен».
 node_reality_dests() {
     node_reality_lsi_json | python3 -c '
 import json, sys
@@ -44,13 +47,15 @@ def walk(x):
     if isinstance(x, dict):
         if x.get("_TypedMessage_", "").endswith("reality.Config"):
             v = str(x.get("dest") or x.get("target") or "").strip()
+            sn = [str(n) for n in (x.get("serverNames") or x.get("server_names") or []) if n]
             if v:
                 if v.isdigit():
                     v = "127.0.0.1:" + v
-                elif ":" not in v:
+                elif not v.startswith(("/", "@")) and ":" not in v:
                     v += ":443"
-                if v not in out:
-                    out.append(v)
+                line = v + "\t" + (sn[0] if sn else "")
+                if line not in out:
+                    out.append(line)
         for y in x.values():
             walk(y)
     elif isinstance(x, list):
@@ -60,14 +65,24 @@ walk(d)
 print("\n".join(out))' 2>/dev/null || true
 }
 
-# node_reality_probe <host:port> — «рукопожатие_мс tls13 h2»: медиана 3 замеров TCP+TLS (без DNS);
-# tls13/h2 = yes|no. Пусто — dest недоступен.
+# node_reality_probe <dest> [SNI] — «рукопожатие_мс tls13 h2»: медиана 5 замеров (3 — мало: на шумной VM выброс
+# давал «54 мс» у selfsteal при реальных 6–13) TCP+TLS (без DNS);
+# tls13/h2 = yes|no. Пусто — dest недоступен. Как REALITY: соединение к адресу dest, но с SNI клиента
+# (serverNames) — у selfsteal (127.0.0.1:порт, unix-сокет) сертификат только на свой домен.
 node_reality_probe() {
-    local hp="$1" host port r vals="" tls="no" h2="no"
-    host="${hp%:*}"; port="${hp##*:}"
-    for _ in 1 2 3; do
+    local dest="$1" sni="${2:-}" host port r vals="" tls="no" h2="no"
+    local -a tgt
+    case "$dest" in
+        @*) tgt=(--abstract-unix-socket "${dest#@}" "https://${sni:-localhost}/") ;;
+        /*) tgt=(--unix-socket "$dest" "https://${sni:-localhost}/") ;;
+        *)  host="${dest%:*}"; port="${dest##*:}"
+            if [ -n "$sni" ] && [ "$sni" != "$host" ]; then tgt=(--connect-to "$sni:443:$host:$port" "https://$sni/")
+            else tgt=("https://$host:$port/"); fi ;;
+    esac
+    for _ in 1 2 3 4 5; do
         r="$(curl -k -s -o /dev/null --max-time 5 --tlsv1.3 --http2 \
-            -w '%{time_namelookup} %{time_appconnect} %{http_version}' "https://$host:$port/" 2>/dev/null || true)"
+            -w '%{time_namelookup} %{time_appconnect} %{http_version}' "${tgt[@]}" 2>/dev/null || true)"
+        # shellcheck disable=SC2086  # r — три поля curl -w
         set -- $r
         [ $# -eq 3 ] || continue
         awk -v a="$2" 'BEGIN { exit !(a > 0) }' || continue
@@ -84,21 +99,23 @@ _node_reality_verdict() { # <мс>
 
 # node_reality_check [кандидат ...] — отчёт: текущий dest (из Xray) и кандидаты, самый быстрый подходящий.
 node_reality_check() {
-    local cur cands d p ms tls h2 best="" best_ms=999999 cur_ms="" line
+    local cur cands d sn lbl p ms tls h2 best="" best_ms=999999 cur_ms="" line
     command -v curl >/dev/null 2>&1 || { echo "нужен curl"; return 1; }
     cur="$(node_reality_dests)"
     cands="${*:-$NODE_REALITY_CANDIDATES}"
-    echo "REALITY dest: сколько нода ждёт при КАЖДОМ подключении клиента (TCP + TLS 1.3 до dest, медиана 3 замеров)"
+    echo "REALITY dest: сколько нода ждёт при КАЖДОМ подключении клиента (TCP + TLS 1.3 до dest, медиана 5 замеров)"
     echo "  подходит как dest: TLS 1.3 и HTTP/2; меньше мс — быстрее открывается каждое соединение VPN"
     echo
     if [ -n "$cur" ]; then
         echo "  текущий (из работающего Xray):"
-        while IFS= read -r d; do
+        while IFS=$'\t' read -r d sn; do
             [ -n "$d" ] || continue
-            p="$(node_reality_probe "$d")"
-            if [ -z "$p" ]; then printf '    %-32s недоступен с ноды или без TLS 1.3 — REALITY с таким dest не работает\n' "$d"; continue; fi
+            lbl="$d"; [ -n "$sn" ] && [ "${d%:*}" != "$sn" ] && lbl="$d (SNI $sn)"
+            case "$d" in /*|@*|127.*) lbl="$lbl, selfsteal на этой ноде" ;; esac
+            p="$(node_reality_probe "$d" "$sn")"
+            if [ -z "$p" ]; then printf '    %s\n      недоступен с ноды или без TLS 1.3 для этого SNI — REALITY с таким dest не работает\n' "$lbl"; continue; fi
             read -r ms tls h2 <<<"$p"
-            printf '    %-32s %5s мс   TLS1.3 %s  h2 %s   %s\n' "$d" "$ms" "$tls" "$h2" "$(_node_reality_verdict "$ms")"
+            printf '    %-32s %5s мс   TLS1.3 %s  h2 %s   %s\n' "$lbl" "$ms" "$tls" "$h2" "$(_node_reality_verdict "$ms")"
             # несколько REALITY-инбаундов: сравниваем с самым медленным dest — тормозит он
             if [ -z "$cur_ms" ] || [ "$ms" -gt "$cur_ms" ]; then cur_ms="$ms"; fi
         done <<<"$cur"
@@ -109,7 +126,7 @@ node_reality_check() {
     echo "  варианты с этой ноды:"
     for d in $cands; do
         case "$d" in *:*) : ;; *) d="$d:443" ;; esac
-        grep -qxF "$d" <<<"$cur" && continue
+        cut -f1 <<<"$cur" | grep -qxF -- "$d" && continue
         p="$(node_reality_probe "$d")"
         if [ -z "$p" ]; then printf '    %-32s недоступен или без TLS 1.3\n' "$d"; continue; fi
         read -r ms tls h2 <<<"$p"

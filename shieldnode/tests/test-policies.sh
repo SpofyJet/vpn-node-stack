@@ -132,6 +132,31 @@ python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).send
 sleep 0.5
 t "UDP: через 1.5 с пакеты того же src снова доходят" test -f /tmp/shieldtest-udp-ok
 kill "$UDPSRV" 2>/dev/null || true; wait "$UDPSRV" 2>/dev/null || true; rm -f /tmp/shieldtest-udp-ok
+# 2026-09-27: established UDP-поток (сервер ответил — как сессия Hysteria2/QUIC) лимитом НЕ режется:
+# правило «ct state established accept» стоит раньше лимита (лаба: 194 084 пакета нагрузки — все established)
+ip netns exec "$NS" python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+s.bind(("10.77.0.2", 5353)); n = 0
+while True:
+    d, a = s.recvfrom(64)
+    if d == b"hello": s.sendto(b"hi", a)
+    elif d == b"count": s.sendto(str(n).encode(), a)
+    else: n += 1
+' >/dev/null 2>&1 &
+UDPSRV=$!
+sleep 0.5
+drops_before="$(ip netns exec "$NS" nft list counter inet shieldnode c_drops_udp_limit_v4 | awk '/packets/ {print $2}')"
+got="$(python3 -c '
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+s.sendto(b"hello", ("10.77.0.2", 5353)); s.recvfrom(64)          # ответ сервера -> поток established
+for _ in range(500):                                              # ~2000/с — в 40 раз выше лимита 50/с
+    s.sendto(b"x", ("10.77.0.2", 5353)); time.sleep(0.0005)
+time.sleep(0.5); s.sendto(b"count", ("10.77.0.2", 5353)); print(s.recvfrom(64)[0].decode())' 2>/dev/null || echo 0)"
+drops_after="$(ip netns exec "$NS" nft list counter inet shieldnode c_drops_udp_limit_v4 | awk '/packets/ {print $2}')"
+t "UDP established (сервер ответил): 500 пакетов при лимите 50/с дошли ($got), лимит не сработал" bash -c "[ '$got' -ge 495 ] && [ '$drops_before' = '$drops_after' ]"
+kill "$UDPSRV" 2>/dev/null || true; wait "$UDPSRV" 2>/dev/null || true
 
 # фаза 2: опц. бан за SYN-флуд (TCP_SYN_BAN_RATE > 0) работает, если его включить
 SH_R_TCP_SYN_BAN_RATE=5 SH_R_TCP_SYN_BAN_BURST=10 SH_R_TCP_NEW_RATE=100000 SH_R_TCP_NEW_BURST=100000 \

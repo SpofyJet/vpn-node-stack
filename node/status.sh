@@ -112,4 +112,9 @@ node_status() {
     echo "xray/remnanode sockets: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
     echo "----------------------------------------------------------------------"
     declare -F node_perf_report >/dev/null 2>&1 && node_perf_report "$NODE_STATE_DIR/perf-baseline.txt"
+    # 2026-09-27 (v1.2.2): UDP/QUIC — буферы и потери сокетов Xray, память UDP (только чтение)
+    if [ -f "$NODE_DIR/lib/udp.sh" ]; then
+        # shellcheck source=lib/udp.sh
+        source "$NODE_DIR/lib/udp.sh"; node_udp_health || true
+    fi
 }

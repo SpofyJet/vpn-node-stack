@@ -147,7 +147,7 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
             # v1.2.1: как и автонастройка — только на выборке >= 100 000 пакетов (лаба: 7 событий из ~270 за 18 с)
             if (sq > 0.1 && d("softnet_processed") >= 100000) { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
             if (d("TcpExtListenOverflows") > 0 || d("TcpExtListenDrops") > 0) { n++; print "  LIMIT: accept-очередь переполняется — somaxconn/tcp_max_syn_backlog или backlog inbound xray" }
-            if (d("UdpRcvbufErrors") > 0)        { n++; print "  LIMIT: UDP receive buffer — rmem_default/udp_mem (QUIC/Hysteria2)" }
+            if (d("UdpRcvbufErrors") > 0)        { n++; print "  LIMIT: UDP receive buffer — см. строки «сокет …» ниже: буфер < 16 МиБ -> rmem_max/NET_ADMIN, полный буфер -> CPU (QUIC/Hysteria2)" }
             if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
             if (st > 5)                          { n++; printf "  NOTE: CPU steal %.1f%% — конкуренция на гипервизоре; тюнинг хоста не поможет\n", st }
             # v1.2.1: единичные дропы (живая нода: +1 за 13 мин) — не предел; > 0.1% пакетов или >= 100

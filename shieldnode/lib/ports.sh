@@ -104,14 +104,23 @@ shield_ports_sync() {
     return 0
 }
 
-# _ports_fingerprint — дёшево: PID'ы ядра, TCP-слушатели ядра и rw-node, файлы UFW/конфига
+# _ports_fingerprint — дёшево: перезапуск ядра, внешние TCP-слушатели, файлы UFW/конфига.
+# 2026-09-27 (v1.2.3): один `ss -Hlntx` (netlink: ядро само отдаёт только слушающие TCP и unix, без
+# тысяч клиентских соединений) + awk вместо pgrep + ss + md5sum. Лаба (1 vCPU): тик стоил ~67 мс CPU
+# (pgrep обходит все процессы — 14 мс, плюс форки) = 0.45% ядра постоянно. Перезапуск Xray виден по
+# имени API-сокета (@xtls-api-<случайное>, новое при каждом старте ядра); pgrep — только если такого
+# сокета нет (sing-box, самостоятельный hysteria). SHIELD_SS_FIXTURE — вывод ss для тестов.
 _ports_fingerprint() {
-    {
-        pgrep -x 'xray|rw-core|sing-box|hysteria|v2ray' 2>/dev/null | sort | tr '\n' ' ' || true
-        # все внешние TCP-слушатели без -p (обход fd всех процессов дорог; любой новый — повод проверить)
-        { ss -tlnH 2>/dev/null || true; } | shield_ss_public_ports . | sort -u | tr '\n' ' '
-        stat -c '%Y' "${SHIELD_UFW_DIR:-/etc/ufw}/user.rules" "${SHIELD_UFW_DIR:-/etc/ufw}/ufw.conf" "$SHIELD_CONFIG" 2>/dev/null | tr '\n' ' ' || true
-    } | md5sum | cut -c1-16
+    local fp
+    fp="$({ if [ -n "${SHIELD_SS_FIXTURE:-}" ]; then cat "$SHIELD_SS_FIXTURE"; else ss -Hlntx 2>/dev/null; fi || true; } | awk '
+        $1 ~ /^u_/ { if ($5 ~ /^@xtls-api-/) print $5; next }
+        $1 == "tcp" { a = $5; n = split(a, x, ":"); p = x[n]; sub(/:[0-9]+$/, "", a)
+            if (a !~ /^(127\.|\[::1\]$|::1$)/ && a !~ /%lo$/) print "t" p }' | LC_ALL=C sort -u | tr '\n' ' ' || true)"
+    case "$fp" in
+        *@xtls-api-*) : ;;
+        *) fp="$fp$(pgrep -x 'xray|rw-core|sing-box|hysteria|v2ray' 2>/dev/null | sort | tr '\n' ' ' || true)" ;;
+    esac
+    printf '%s|%s' "$fp" "$(stat -c '%Y' "${SHIELD_UFW_DIR:-/etc/ufw}/user.rules" "${SHIELD_UFW_DIR:-/etc/ufw}/ufw.conf" "$SHIELD_CONFIG" 2>/dev/null | tr '\n' ' ' || true)"
 }
 
 # shield_ports_watch — цикл службы shieldnode-ports.service
@@ -119,7 +128,7 @@ shield_ports_watch() {
     local last_fp="" last_full=0 fp now
     log info "ports" "ports-watch запущен (проверка каждые ${SHIELD_PORTS_INTERVAL:-15} с)"
     while :; do
-        now="$(date +%s)"; fp="$(_ports_fingerprint 2>/dev/null || echo x)"
+        printf -v now '%(%s)T' -1; fp="$(_ports_fingerprint 2>/dev/null || echo x)"   # printf -v — без форка date
         # полный проход (docker exec … api lsi, ~1-2 с CPU) — при смене отпечатка; страховочный — раз
         # в 30 мин: remnanode перезапускает ядро при каждой смене конфига (новый PID), UFW/конфиг —
         # mtime в отпечатке, API ноды — новый TCP-слушатель (v1.2.0, лаба: 120 с = ~1.5% CPU на 1 vCPU)

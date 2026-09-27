@@ -373,7 +373,8 @@ EOF
             [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @udp_abusers_v6 counter name c_drops_udp_abusers_v6 drop"
             cat <<EOF
         # UDP-политика (§23, v1.2.2): per-src > $SH_R_UDP_RATE/s burst $SH_R_UDP_BURST — лишние пакеты отбрасываются
-        # БЕЗ бана (как старый shield, CGNAT-safe): стрим 4K за общим IP не выключает соседей на 15 мин
+        # БЕЗ бана (как старый shield, CGNAT-safe); видит только НОВЫЕ UDP-потоки — established (сессии
+        # Hysteria2/QUIC после ответа сервера) приняты выше и лимитом не режутся
         udp dport @protected_udp meter udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } counter name c_drops_udp_limit_v4 drop
 EOF
             [ "$SH_F_IPV6" = "1" ] && cat <<EOF
