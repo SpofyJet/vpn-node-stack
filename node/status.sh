@@ -93,6 +93,8 @@ node_status() {
     echo "perf_sysctl=$(node_conf_get ENABLE_PERFORMANCE_SYSCTL 0) nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0) irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
     echo "datapath=$(node_conf_get ENABLE_DATAPATH 1) fq_tune=$(node_conf_get ENABLE_FQ_TUNE 1) busy_poll=$(node_conf_get ENABLE_BUSY_POLL 0) netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo '?')/$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo '?')"
     echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash $NODE_DIR/install.sh rollback)"
+    # 2026-09-27 (v1.2.2): начальное окно TCP — атрибут маршрута по умолчанию (lib/route.sh)
+    echo "initcwnd: план=$(node_conf_get TCP_INITCWND 32) (0 = окно ядра 10) факт=$(ip -4 -o route show table main default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "initcwnd") { v = $(i + 1); exit } } END { print (v != "" ? v : "ядро (10)") }')"
     # runtime-твики и reboot-напоминание — против молчаливой потери после reboot
     if node_rt_boot_needed 2>/dev/null; then
         if systemctl is-enabled node-rt-tweaks.service >/dev/null 2>&1; then

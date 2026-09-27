@@ -79,7 +79,7 @@ t "rt-unit: wrapper вызывает rt-reapply из NODE_DIR" 'grep -q "cd '"'"
 t "rt-unit: systemctl enable вызван" 'grep -q "enable node-rt-tweaks.service" /tmp/node-irt-test/systemctl.log'
 
 # выключаем все твики (defaults конфигурируем через CONFIG_CACHE: first-match wins)
-printf 'ENABLE_FQ_TUNE=0\nENABLE_RPS=0\nENABLE_CPU_PERF_GOVERNOR=0\n' > /tmp/node-irt-test/node.conf
+printf 'ENABLE_FQ_TUNE=0\nENABLE_RPS=0\nENABLE_CPU_PERF_GOVERNOR=0\nTCP_INITCWND=0\n' > /tmp/node-irt-test/node.conf
 export NODE_CONFIG=/tmp/node-irt-test/node.conf
 node_load_config >/dev/null 2>&1 || true
 # перенаправляем пути unit'а под sandbox: persist-stub пишет в $OUT

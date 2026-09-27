@@ -134,6 +134,8 @@ node_rollback() {
     if ! ls /etc/sysctl.d/99-z[01234]-node-*.conf >/dev/null 2>&1 && [ -f "$keys_f" ]; then : > "$keys_f"; fi
 
     # 3. runtime-твики (ethtool/rings/offloads/txqueuelen/irq affinity) — явный откат
+    # shellcheck source=lib/route.sh
+    source "$NODE_DIR/lib/route.sh"   # 2026-09-27 (v1.2.2): kind route в реестре runtime-твиков
     node_rt_rollback
 
     # 3a. 2026-09-25 (v1.2.0): qdisc'и, настроенные node (fq с limit=$fq_lim, корневой mq 1:),

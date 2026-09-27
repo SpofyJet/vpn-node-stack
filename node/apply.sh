@@ -63,6 +63,7 @@ node_apply() {
     source "$NODE_DIR/lib/irq.sh"        # node_irq_*
     source "$NODE_DIR/lib/cpu.sh"        # node_cpu_check
     source "$NODE_DIR/lib/xray.sh"
+    source "$NODE_DIR/lib/route.sh"      # 2026-09-27 (v1.2.2): initcwnd/initrwnd
 
     log info "apply" "sysctl keys planned: $(wc -l < "$NODE_PLAN_FILE")"
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -110,6 +111,7 @@ node_apply() {
     node_step_run cpu_governor_apply       node_cpu_governor_apply   # 2026-09-24 (v1.1.7)
     node_step_run network_mtu_diag         node_network_mtu_diag
     node_step_run network_mss_clamp        node_network_mss_clamp
+    node_step_run route_initcwnd           node_route_initcwnd_apply   # 2026-09-27 (v1.2.2)
     node_step_run network_docker           node_network_docker_integration
     node_step_run fq_tune_apply            node_fq_tune_apply
     node_step_run xanmod_install           node_xanmod_install
@@ -213,6 +215,7 @@ node_rt_boot_needed() {
     [ "$(node_conf_get ENABLE_MSS_CLAMP 0)"      = "1" ] && return 0
     [ "$(node_conf_get ENABLE_EEE_OFF 0)"        = "1" ] && return 0
     [ "$(node_conf_get ENABLE_CPU_PERF_GOVERNOR 1)" = "1" ] && return 0   # v1.1.7
+    [ "$(node_conf_get TCP_INITCWND 32)" != "0" ] && return 0              # v1.2.2
     return 1
 }
 
@@ -342,5 +345,7 @@ node_rt_reapply() {
     node_irq_affinity_apply
     node_network_mss_clamp
     node_fq_tune_apply
+    # 2026-09-27 (v1.2.2): initcwnd — атрибут маршрута, после reboot его нет; unit идёт After=network-online
+    source "$NODE_DIR/lib/route.sh"; node_route_initcwnd_apply runtime
     ok "rt" "rt-reapply завершён"
 }

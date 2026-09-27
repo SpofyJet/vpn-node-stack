@@ -30,7 +30,7 @@
 #   VPN_STACK_REF=v1.2.0   VPN_STACK_REPO=Owner/name   VPN_STACK_TARBALL_URL=https://...
 set -euo pipefail
 
-VERSION="1.4.3"
+VERSION="1.4.4"
 REPO="${VPN_STACK_REPO:-SpofyJet/vpn-node-stack}"
 RAW_BASE="${VPN_STACK_RAW_BASE:-https://raw.githubusercontent.com/$REPO/main}"
 # 2026-09-24 (v1.1.3): VPN_STACK_REF — воспроизводимая установка (тег/ветка/коммит).
@@ -700,6 +700,8 @@ menu_node() {
         if uname -r | grep -qi xanmod; then item 5 "Ядро XanMod: ${C_G}активно${C_0} ($(uname -r))"
         elif [ "$(conf_get "$NODE_CONF" ENABLE_XANMOD)" = 1 ]; then item 5 "Ядро XanMod: ${C_Y}установлено, ждёт перезагрузки${C_0}"
         else item 5 "Ядро XanMod: ${C_D}не используется${C_0} — установить"; fi
+        # 2026-09-27 (v1.4.4): REALITY ждёт dest на каждом подключении клиента — замер с ноды
+        item 6 "Скорость dest REALITY — сколько ждёт каждое подключение (только замер)"
         item 0 "Назад"
         # 2026-09-25 (v1.4.0): IPv6 на нодах выключен всегда (требование стека) — переключателя нет
         printf '\n  %sIPv6: выключен всегда (ядро ipv6.disable=1 + sysctl + фаервол)%s\n' "$C_D" "$C_0"
@@ -722,10 +724,31 @@ menu_node() {
                fi
                pause ;;
             4) echo; confirm "Откатить оптимизацию node к исходному состоянию?" n && run_tool node rollback || true; pause ;;
+            6) echo
+               printf '  Свои варианты dest через пробел (например www.example.com), Enter — стандартный список:\n'
+               ask "  > "
+               # shellcheck disable=SC2086  # список хостов — отдельные слова
+               run_tool node reality-check $(printf '%s' "$REPLY" | tr -cd 'A-Za-z0-9.:_ -') || true; pause ;;
             0|q|"") return 0 ;;
             *) ;;
         esac
     done
+}
+
+# 2026-09-27 (v1.4.4): обновление из меню кладёт на диск новый установщик, а меню — всё ещё процесс
+# старого: шапка показывала «установщик v1.4.0» до выхода (прод, 1.4.0 -> 1.4.3). Перезапуск меню
+# новой версией; битый файл (не прошёл bash -n) — остаёмся в текущей.
+menu_reexec_if_updated() {
+    local f="$WORK_DIR/vpn-node-setup.sh" v
+    [ -f "$f" ] || return 0
+    v="$(sed -nE 's/^VERSION="([^"]+)"/\1/p' "$f" 2>/dev/null | head -1)"
+    { [ -n "$v" ] && [ "$v" != "$VERSION" ]; } || return 0
+    if ! bash -n "$f" 2>/dev/null; then
+        warn "новый установщик v$v не прошёл проверку синтаксиса — меню остаётся v$VERSION"
+        return 0
+    fi
+    printf '\n  %sУстановщик обновлён: v%s -> v%s, перезапускаю меню%s\n' "$C_G" "$VERSION" "$v" "$C_0"
+    exec bash "$f" menu
 }
 
 menu_main() {
@@ -739,7 +762,7 @@ menu_main() {
         printf '   %s1.%s фаервол shieldnode — защита SSH и VPN-портов, блок-листы, CrowdSec\n' "$C_B" "$C_0"
         printf '   %s2.%s оптимизация node — BBR, буферы, conntrack, лимиты (штатное ядро; XanMod — по желанию)\n' "$C_B" "$C_0"
         printf '   %sSSH не прервётся: ваш IP попадёт в белый список, при ошибке — автооткат.%s\n\n' "$C_D" "$C_0"
-        if confirm "Установить сейчас?" y; then run_stack apply || true; pause; fi
+        if confirm "Установить сейчас?" y; then run_stack apply || true; pause; menu_reexec_if_updated; fi
     fi
     while :; do
         header
@@ -757,7 +780,8 @@ menu_main() {
         [ -x "$BIN_LINK" ] && printf '  %sзапуск в следующий раз: sudo %s · пульт: sudo guard%s\n\n' "$C_D" "$(basename "$BIN_LINK")" "$C_0"
         ask "  Выбор: "
         case "$REPLY" in
-            1) echo; confirm "Скачать стек с GitHub и применить (сначала фаервол, затем оптимизация)?" y && run_stack apply || true; pause ;;
+            1) echo; confirm "Скачать стек с GitHub и применить (сначала фаервол, затем оптимизация)?" y && run_stack apply || true; pause
+               menu_reexec_if_updated ;;
             2) need_installed && { run_tool_plain shieldnode guard || true; } ;;
             3) echo; need_installed && { run_stack status || true; pause; } ;;
             4) need_installed && menu_security ;;

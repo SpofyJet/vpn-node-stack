@@ -3,7 +3,7 @@
 # Modes: apply (default) | status | rollback [id] | detect | uninstall
 set -euo pipefail
 
-NODE_VERSION="1.2.1"
+NODE_VERSION="1.2.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NODE_DIR="$SCRIPT_DIR"
 export NODE_STATE_DIR="/var/lib/node"
@@ -19,7 +19,7 @@ export DRY_RUN
 
 usage() {
     cat <<'EOF'
-node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.2.1
+node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.2.2
 
 Использование: node [опции] <команда> [аргумент]
 
@@ -29,6 +29,9 @@ node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray)
   status           ожидаемое vs фактическое (работает без root)
   rollback [id]    откат к backup-набору (без id — последний/удаление своих)
   uninstall        полный откат
+  reality-check [host[:port] ...]
+                   скорость dest REALITY с этой ноды (только чтение): текущий dest из Xray
+                   и кандидаты; каждое подключение клиента ждёт рукопожатие с dest
 
 Опции:
   --id <id>        явный id набора отката (альтернатива позиционному)
@@ -56,9 +59,12 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+REALITY_CANDIDATES=()
 for arg in "${POSITIONAL[@]}"; do
+    # 2026-09-27 (v1.2.2): reality-check [host[:port] ...] — остальные аргументы — кандидаты в dest
+    if [ "${MODE:-}" = reality-check ]; then REALITY_CANDIDATES+=("$arg"); continue; fi
     case "$arg" in
-        apply|status|detect|uninstall|rollback|rt-reapply|reserve-ports) MODE="$arg" ;;
+        apply|status|detect|uninstall|rollback|rt-reapply|reserve-ports|reality-check) MODE="$arg" ;;
         [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ROLLBACK_ID="$arg" ;;
         *) echo "unknown argument: '$arg'" >&2; usage >&2; exit 64 ;;
     esac
@@ -141,6 +147,12 @@ case "$MODE" in
         # shellcheck source=uninstall.sh
         source "$NODE_DIR/uninstall.sh"
         node_uninstall
+        ;;
+    reality-check)
+        # 2026-09-27 (v1.2.2): только чтение — замер dest REALITY с этой ноды
+        # shellcheck source=lib/reality.sh
+        source "$NODE_DIR/lib/reality.sh"
+        node_reality_check "${REALITY_CANDIDATES[@]}"
         ;;
     reserve-ports)
         # 2026-09-25 (v1.2.0): внутренний режим (зовёт shieldnode ports-sync при смене инбаундов):

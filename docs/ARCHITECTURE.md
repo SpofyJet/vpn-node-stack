@@ -141,8 +141,10 @@ registry. `HARDEN_IPV6=0` is ignored with a warning.
 (`99-z0..z4-node-*.conf`), conntrack, `sysctl -p` of node files only, restore of keys dropped
 from the plan, the IPv6 invariant, services hardening, storage, FD limits (drop-ins only for
 units whose `ExecStart` runs xray/remnanode), NIC/IRQ (opt-in parts), CPU governor, MSS clamp
-(opt-in), fq tuning (re-handles a default `mq 0:` root so the fq children are addressable),
-XanMod (**opt-in**, `ENABLE_XANMOD=0`), logrotate, `node-rt-tweaks.service`, contract.
+(opt-in), the initial TCP window on IPv4 default routes (`TCP_INITCWND`, `lib/route.sh`: runtime
+`ip route change … initcwnd/initrwnd`, a networkd `[DHCPv4] InitialCongestionWindow=` drop-in so
+DHCP renewals keep it, re-applied at boot by `node-rt-tweaks.service`), fq tuning (re-handles a
+default `mq 0:` root so the fq children are addressable), XanMod (**opt-in**, `ENABLE_XANMOD=0`), logrotate, `node-rt-tweaks.service`, contract.
 Every change is recorded (sysctl-orig.tsv, runtime-tweaks.tsv, services-state.tsv, manifest)
 so `rollback` restores the pre-node state — except the IPv6 invariant.
 

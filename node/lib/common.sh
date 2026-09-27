@@ -190,6 +190,10 @@ node_rt_rollback() {
                         # shellcheck disable=SC2086
                         command -v tc >/dev/null && tc qdisc replace dev "$iface" $param fq $orig >/dev/null 2>&1 \
                             && log info "rt" "fq $iface/$param restored ($orig)" || true ;;
+            # 2026-09-27 (v1.2.2): initcwnd/initrwnd на default-маршрутах + drop-in networkd (lib/route.sh)
+            route)      if declare -F node_route_initcwnd_rollback >/dev/null; then
+                            node_route_initcwnd_rollback && log info "rt" "initcwnd/initrwnd сняты с маршрутов по умолчанию"
+                        else log warn "rt" "lib/route.sh не подключён — initcwnd не снят (сойдёт при reboot)"; fi ;;
             mount)      findmnt -rn "$param" >/dev/null 2>&1 \
                             && mount -o "remount,$orig" "$param" >/dev/null 2>&1 \
                             && log info "rt" "mount $param remounted (orig opts)" || true ;;
