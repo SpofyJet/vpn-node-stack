@@ -350,9 +350,17 @@ EOF
 ( exec 9>"$OUT/lock"; flock -n 9 || exit 1; sleep 3 ) &
 lockpid=$!
 sleep 0.5
-PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
-t "main-lock: тик пропущен при занятом lock'е (set не тронут)" bash -c "test ! -s '$OUT/nftdb/set_scanner_blocklist_v4'"
+BL_MAIN_LOCK_WAIT=1 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+t "main-lock: занят дольше ожидания — тик пропущен (set не тронут)" bash -c "test ! -s '$OUT/nftdb/set_scanner_blocklist_v4'"
 wait "$lockpid" || true
+# v1.2.4: lock занят КОРОТКО (ports-watch раз в 15 с) — тик ждёт и выполняется, а не пропускается на 6 ч
+( exec 9>"$OUT/lock"; flock -n 9 || exit 1; sleep 2 ) &
+lockpid=$!
+sleep 0.5
+t0=$(date +%s); PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner; t1=$(date +%s)
+t "main-lock: занят 2 с — updater дождался и обновил (v1.2.4)" bash -c "test -s '$OUT/nftdb/set_scanner_blocklist_v4' && [ $((t1 - t0)) -ge 1 ]"
+wait "$lockpid" || true
+: > "$OUT/nftdb/set_scanner_blocklist_v4"
 # после освобождения lock'а тик снова работает
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
 t "main-lock: после освобождения lock'а updater работает" bash -c "test -s '$OUT/nftdb/set_scanner_blocklist_v4'"
@@ -693,5 +701,123 @@ t "инъекция: числа — дефолты (MIN_ENTRIES_CINS=2000, ин�
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom >/dev/null 2>&1 || true
 t "инъекция: запуск updater ничего не исполнил" bash -c "[ ! -e /tmp/pwned-bl ] && [ ! -e /tmp/pwned-bl2 ] && [ ! -e /tmp/pwned-bl3 ]"
 mv "$CONFIG_CACHE.bak-inj" "$CONFIG_CACHE"
+
+# ================= 13) v1.2.4: прод 2026-09-28 — GitHub недоступен, crowdsec не установлен, пустые наборы =================
+# fake curl: raw.githubusercontent.com — таймаут (rc 28), cdn.jsdelivr.net — отдаёт fixture; адреса — в журнал
+SHIELD_LOG_FILE_BL="$OUT/bl-13.log"; : > "$SHIELD_LOG_FILE_BL"
+mkdir -p "$OUT/bin-gh"
+cat > "$OUT/bin-gh/curl" <<CURL_EOF
+#!/bin/bash
+out=""; url=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; -*) shift ;; *) url="\$1"; shift ;; esac; done
+echo "\$url" >> "$OUT/curl.calls"
+case "\$url" in
+    https://raw.githubusercontent.com/*|https://cinsscore.com/*) exit 28 ;;
+    https://cdn.jsdelivr.net/gh/SpofyJet/shield@main/lists/custom.txt) printf '45.148.10.0/24\n91.240.118.9\n' > "\$out" ;;
+    https://cdn.jsdelivr.net/gh/acme/lists@main/scan/v4.txt) printf '1.1.1.0/24\n' > "\$out" ;;
+    *) exit 22 ;;
+esac
+CURL_EOF
+chmod +x "$OUT/bin-gh/curl"
+: > "$SHIELD_LISTS_DIR/custom.txt"
+cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+LOG_FILE=$SHIELD_LOG_FILE_BL
+BL_ENABLED_scanner=0
+BL_ENABLED_threat=0
+BL_ENABLED_tor=0
+BL_ENABLED_custom=1
+BL_ENABLED_crowdsec=0
+BL_ENABLED_spamhaus=0
+BL_ENABLED_cins=0
+BL_URLS_custom="https://raw.githubusercontent.com/SpofyJet/shield/main/lists/custom.txt"
+BL_MIN_custom=0
+EOF
+: > "$OUT/nftdb/set_custom_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/.applied-custom.sha256" "$OUT/curl.calls"
+rc=0; PATH="$OUT/bin-gh:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom || rc=$?
+t "github недоступен: custom взят с jsDelivr (rc 0, записи в наборе)" bash -c "[ $rc = 0 ] && grep -qx '45.148.10.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '91.240.118.9/32' '$OUT/nftdb/set_custom_blocklist_v4'"
+t "github недоступен: сначала raw, потом зеркало @main" bash -c "sed -n 1p '$OUT/curl.calls' | grep -q '^https://raw.githubusercontent.com/SpofyJet/shield/main/' && sed -n 2p '$OUT/curl.calls' | grep -qx 'https://cdn.jsdelivr.net/gh/SpofyJet/shield@main/lists/custom.txt'"
+t "github недоступен: в логе — «взят с зеркала jsDelivr»" grep -q 'custom: .*взят с зеркала jsDelivr' "$SHIELD_LOG_FILE_BL"
+# GitHub не ответил по сети — следующие его файлы в этом прогоне сразу с зеркала (без 10-секундных ожиданий)
+sed -i "s|^BL_URLS_custom=.*|BL_URLS_custom=\"https://raw.githubusercontent.com/SpofyJet/shield/main/lists/custom.txt https://raw.githubusercontent.com/acme/lists/main/scan/v4.txt\"|" "$SHIELD_BLOCKLIST_OVERRIDE"
+: > "$OUT/nftdb/set_custom_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/.applied-custom.sha256" "$OUT/curl.calls"
+PATH="$OUT/bin-gh:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom || true
+t "github недоступен: второй файл — сразу с зеркала (1 запрос к raw, 2 к jsDelivr)" bash -c "[ \$(grep -c '^https://raw.githubusercontent.com/' '$OUT/curl.calls') = 1 ] && [ \$(grep -c '^https://cdn.jsdelivr.net/' '$OUT/curl.calls') = 2 ] && grep -qx '1.1.1.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '45.148.10.0/24' '$OUT/nftdb/set_custom_blocklist_v4'"
+# refs/heads/<ветка> и не-GitHub адреса
+sed -i "s|^BL_URLS_custom=.*|BL_URLS_custom=\"https://raw.githubusercontent.com/acme/lists/refs/heads/main/scan/v4.txt https://gist.githubusercontent.com/u/abc/raw/x.txt\"|" "$SHIELD_BLOCKLIST_OVERRIDE"
+: > "$OUT/nftdb/set_custom_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/.applied-custom.sha256" "$OUT/curl.calls"
+PATH="$OUT/bin-gh:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom || true
+t "зеркало: refs/heads/main -> @main" bash -c "grep -qx 'https://cdn.jsdelivr.net/gh/acme/lists@main/scan/v4.txt' '$OUT/curl.calls' && grep -qx '1.1.1.0/24' '$OUT/nftdb/set_custom_blocklist_v4'"
+t "зеркало: для gist зеркала нет (один запрос)" test "$(grep -c 'gist\|jsdelivr.*abc' "$OUT/curl.calls")" = 1
+
+# crowdsec agent-режим, cscli нет: не сбой фида — статус absent, без fail-counter и алерта, warn раз в сутки
+# PATH без cscli: на машине разработчика crowdsec может стоять — системные каталоги ссылками, кроме cscli
+mkdir -p "$OUT/bin-nocs"
+for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    [ -d "$d" ] || continue
+    for x in "$d"/*; do b="${x##*/}"; [ "$b" = cscli ] || [ -e "$OUT/bin-nocs/$b" ] || ln -s "$x" "$OUT/bin-nocs/$b"; done
+done
+ln -sf "$OUT/bin/nft" "$OUT/bin-nocs/nft"; ln -sf "$OUT/bin/systemctl" "$OUT/bin-nocs/systemctl"
+cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+LOG_FILE=$SHIELD_LOG_FILE_BL
+BL_ENABLED_crowdsec=1
+BL_URLS_crowdsec="local://cscli-decisions"
+BL_MIN_crowdsec=0
+BL_INTERVAL_crowdsec=0
+EOF
+mv "$SHIELD_LISTS_DIR/crowdsec.txt" "$OUT/crowdsec.txt.saved2" 2>/dev/null || true
+: > "$OUT/nftdb/set_crowdsec_blocklist_v4"; echo 2 > "$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt"; date > "$SHIELD_BLOCKLIST_STATE/.alert-crowdsec"
+rm -f "$SHIELD_BLOCKLIST_STATE/status-crowdsec"
+nocs_path="$OUT/bin-nocs"
+rc=0; PATH="$nocs_path" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec || rc=$?
+t "crowdsec нет: rc 0 (служба не падает каждые 30 мин)" test "$rc" = 0
+t "crowdsec нет: статус absent, fail-counter 0, алерт снят" bash -c "grep -q '^absent' '$SHIELD_BLOCKLIST_STATE/status-crowdsec' && [ \"\$(cat '$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt')\" = 0 ] && [ ! -e '$SHIELD_BLOCKLIST_STATE/.alert-crowdsec' ]"
+n1="$(grep -c 'crowdsec не установлен' "$SHIELD_LOG_FILE_BL" || true)"
+PATH="$nocs_path" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec || true
+t "crowdsec нет: повторный прогон — без нового warn (раз в сутки)" test "$(grep -c 'crowdsec не установлен' "$SHIELD_LOG_FILE_BL" || true)" = "$n1"
+mv "$OUT/crowdsec.txt.saved2" "$SHIELD_LISTS_DIR/crowdsec.txt" 2>/dev/null || true
+rm -f "$SHIELD_BLOCKLIST_STATE/status-crowdsec"
+
+# --retry-empty: пустой набор без данных — загрузка; заполненный/пустой-по-праву/после 3 сбоев — не трогаем
+cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+LOG_FILE=$SHIELD_LOG_FILE_BL
+BL_ENABLED_scanner=1
+BL_ENABLED_threat=1
+BL_ENABLED_tor=0
+BL_ENABLED_custom=1
+BL_ENABLED_crowdsec=1
+BL_ENABLED_spamhaus=1
+BL_ENABLED_cins=1
+BL_URLS_scanner="https://raw.githubusercontent.com/acme/lists/main/scan/v4.txt"
+BL_URLS_threat="https://cinsscore.com/list/threat.txt"
+BL_URLS_custom=""
+BL_URLS_cins="https://cinsscore.com/list/ci-badguys.txt"
+BL_URLS_spamhaus="https://cinsscore.com/list/spam.txt"
+BL_MIN_scanner=1
+BL_MIN_custom=0
+EOF
+: > "$OUT/nftdb/set_scanner_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/last-good-scanner.txt" "$SHIELD_BLOCKLIST_STATE/fails-scanner.cnt"
+echo "8.8.4.0/24" > "$OUT/nftdb/set_threat_blocklist_v4"
+: > "$OUT/nftdb/set_custom_blocklist_v4"; : > "$SHIELD_BLOCKLIST_STATE/last-good-custom.txt"
+: > "$OUT/nftdb/set_cins_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/last-good-cins.txt"; echo 3 > "$SHIELD_BLOCKLIST_STATE/fails-cins.cnt"
+: > "$OUT/nftdb/set_spamhaus_blocklist_v4"; printf '203.0.114.0/24\n' > "$SHIELD_BLOCKLIST_STATE/last-good-spamhaus.txt"
+: > "$OUT/nftdb/set_crowdsec_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/last-good-crowdsec.txt"
+rm -f "$OUT/curl.calls"
+rc=0; PATH="$OUT/bin-gh:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" --retry-empty || rc=$?
+t "retry: rc 0" test "$rc" = 0
+t "retry: пустой scanner без снимка — загружен (через зеркало)" grep -qx '1.1.1.0/24' "$OUT/nftdb/set_scanner_blocklist_v4"
+t "retry: пустой spamhaus со снимком — восстановлен без сети" bash -c "grep -qx '203.0.114.0/24' '$OUT/nftdb/set_spamhaus_blocklist_v4' && ! grep -q 'spam.txt' '$OUT/curl.calls'"
+t "retry: заполненный threat не тронут (без запроса)" bash -c "[ \"\$(cat '$OUT/nftdb/set_threat_blocklist_v4')\" = 8.8.4.0/24 ] && ! grep -q 'threat.txt' '$OUT/curl.calls'"
+t "retry: custom пуст по праву (успешный пустой снимок) — не трогаем" bash -c "! grep -q 'custom' '$OUT/curl.calls'"
+t "retry: cins после 3 сбоев подряд — не чаще раза в час" bash -c "! grep -q 'ci-badguys' '$OUT/curl.calls'"
+t "retry: crowdsec не трогаем (свой таймер)" test ! -s "$OUT/nftdb/set_crowdsec_blocklist_v4"
+touch -d '-2 hours' "$SHIELD_BLOCKLIST_STATE/fails-cins.cnt"
+PATH="$OUT/bin-gh:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" --retry-empty || true
+t "retry: через час после 3 сбоев — снова пробуем" grep -q 'ci-badguys' "$OUT/curl.calls"
+t "retry: юниты эмитированы (каждые 10 мин, после boot/apply через 6 мин)" bash -c "grep -qx 'ExecStart=/usr/local/sbin/shieldnode-blocklist --retry-empty' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.service' && grep -qx 'OnUnitActiveSec=10min' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.timer' && grep -qx 'OnBootSec=6min' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.timer' && grep -qx 'OnActiveSec=6min' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.timer'"
+t "retry: таймер включается и перезапускается при apply" bash -c "grep -qx 'enable shieldnode-blocklist-retry.timer' '$SYSTEMCTL_LOG' && grep -qx 'restart shieldnode-blocklist-retry.timer' '$SYSTEMCTL_LOG'"
+t "retry: rollback снимает таймер, uninstall удаляет файлы" bash -c "grep -q 'shieldnode-blocklist-retry.timer shieldnode-blocklist-retry.service' '$SHIELD_DIR/rollback.sh' && grep -q 'shieldnode-blocklist-retry.timer' '$SHIELD_DIR/uninstall.sh'"
 
 if [ "$fails" -eq 0 ]; then echo "PASS: blocklist (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

@@ -198,14 +198,16 @@ fi
 mkdir -p "$STATE_DIR" "$(dirname "$BL_LOCK_FILE")" 2>/dev/null || true
 
 # основной lock shieldnode (apply/rollback): updater не должен менять сеты
-# посреди apply. НЕблокирующе: занят → пропуск тика (следующий применит).
+# посреди apply. 2026-09-28 (v1.2.4): ЖДЁМ до BL_MAIN_LOCK_WAIT с (120), а не пропускаем сразу: lock на
+# доли секунды каждые 15 с берёт ports-watch, и тик, попавший в этот миг, пропускался — следующий через
+# 6 ч (лаба/прод: после reboot все блок-листы пустые до вечера). Не дождались — повтор даст retry-таймер.
 # Если lock-файл недоступен (нет прав/каталога) — info и работаем без него.
 if [ -n "${MAIN_LOCK_FILE:-}" ]; then
     mkdir -p "$(dirname "$MAIN_LOCK_FILE")" 2>/dev/null || true
     # 2026-09-23 (v1.1.4): 2>/dev/null — только на время exec (в группе); у голого
     # `exec 8>f 2>/dev/null` перенаправление stderr постоянное — ошибки терялись
     if { exec 8>"$MAIN_LOCK_FILE"; } 2>/dev/null; then
-        flock -n 8 2>/dev/null || { bl_log info "main lock занят (apply/rollback) — пропуск тика"; exit 0; }
+        flock -w "${BL_MAIN_LOCK_WAIT:-120}" 8 2>/dev/null || { bl_log warn "main lock занят > ${BL_MAIN_LOCK_WAIT:-120} с (apply/rollback) — пропуск тика (повтор — retry-таймер)"; exit 0; }
         # 2026-09-26 (v1.2.0): НЕ держим основной lock на весь прогон — только на запись в nft
         # (main_lock_take/drop). Загрузка фидов и чтение cscli идут без него: на лабе зависший
         # `cscli decisions list` (120 с до таймаута) держал lock, и ports-watch пропускал новый
@@ -274,6 +276,18 @@ cs_kick_if_stuck() {
     systemctl restart crowdsec >/dev/null 2>&1 || true
 }
 
+# gh_mirror <url> — raw.githubusercontent.com/<o>/<r>/[refs/heads/|refs/tags/]<ref>/<путь> ->
+# cdn.jsdelivr.net/gh/<o>/<r>@<ref>/<путь>; не GitHub raw — код 1 (зеркала нет)
+gh_mirror() {
+    local p="${1#https://raw.githubusercontent.com/}" o r ref
+    [ "$p" != "$1" ] || return 1
+    o="${p%%/*}"; p="${p#*/}"; r="${p%%/*}"; p="${p#*/}"
+    case "$p" in refs/heads/*) p="${p#refs/heads/}" ;; refs/tags/*) p="${p#refs/tags/}" ;; esac
+    ref="${p%%/*}"
+    [ -n "$o" ] && [ -n "$r" ] && [ -n "$ref" ] && [ "$ref" != "$p" ] && [ -n "${p#*/}" ] || return 1
+    printf 'https://cdn.jsdelivr.net/gh/%s/%s@%s/%s\n' "$o" "$r" "$ref" "${p#*/}"
+}
+
 # --- обновление одного списка ---
 update_list() { # update_list <name>
     local name="$1" enabled urls min_entries max_entries minp4 minp6 interval_guard
@@ -292,7 +306,7 @@ update_list() { # update_list <name>
     case "$name" in tor) set_prefix="tor_exit_blocklist" ;; esac
     local set_v4="${set_prefix}_v4" set_v6="${set_prefix}_v6"
     local fail_counter="$STATE_DIR/fails-$name.cnt"
-    local tmp remote_ok=0 local_ok=0 cs_empty=0
+    local tmp remote_ok=0 local_ok=0 cs_empty=0 cs_absent=0
     tmp="$(mktemp -d /tmp/shieldnode-bl.XXXXXX)" || return 1
     : > "$tmp/all.raw"
 
@@ -327,7 +341,15 @@ update_list() { # update_list <name>
             local://cscli-decisions)
                 # agent-режим: читаем ЛОКАЛЬНУЮ БД crowdsec (CAPI уже стянул демон)
                 if ! command -v cscli >/dev/null 2>&1; then
-                    bl_log warn "$name: agent-режим, но cscli не найден — пропущен"
+                    # 2026-09-28 (v1.2.4): crowdsec не установлен — это не «фид падает»: раньше каждые
+                    # 30 мин warn + fail-counter + алерт «фид падает подряд» (прод: пакет не поставился
+                    # при apply). Статус absent для health, warn — не чаще раза в сутки.
+                    local st_f="$STATE_DIR/status-$name"
+                    if ! grep -q '^absent' "$st_f" 2>/dev/null || [ -n "$(find "$st_f" -mmin +1440 2>/dev/null)" ]; then
+                        bl_log warn "$name: crowdsec не установлен (cscli нет) — список не работает; установка: повторный apply (sudo vpn-node → Применить), выключить: ENABLE_CROWDSEC_LIST=0"
+                        echo "absent $(date +%s)" > "$st_f"
+                    fi
+                    cs_absent=1
                     continue
                 fi
                 # 2026-09-25 (v1.1.6): -a — БЕЗ него cscli отдаёт только ЛОКАЛЬНЫЕ решения, community
@@ -360,7 +382,22 @@ update_list() { # update_list <name>
                 curl -fsSL --compressed --connect-timeout 10 --max-time 120 \
                      -K - -o "$f" "$u" 2>/dev/null <<< "user = \"$cs_auth\"" || curl_rc=$? ;;
             *)
-                curl -fsSL --connect-timeout 10 --max-time 60 -o "$f" "$u" 2>/dev/null || curl_rc=$? ;;
+                # 2026-09-28 (v1.2.4): у части хостеров raw.githubusercontent.com не открывается
+                # (прод: таймаут, scanner неполный, custom не обновлялся) — та же ветка через jsDelivr.
+                # GitHub не ответил по сети (7/28) — остальные его файлы в этом прогоне сразу с зеркала
+                # (иначе +10 с на каждый: у scanner их 9)
+                local mirror=""; mirror="$(gh_mirror "$u")" || mirror=""
+                if [ -n "$mirror" ] && [ "${GH_RAW_DOWN:-0}" = 1 ]; then
+                    curl_rc=1
+                else
+                    curl -fsSL --connect-timeout 10 --max-time 60 -o "$f" "$u" 2>/dev/null || curl_rc=$?
+                    case "$curl_rc" in 6|7|28|35) [ -n "$mirror" ] && GH_RAW_DOWN=1 ;; esac
+                fi
+                if [ "$curl_rc" -ne 0 ] && [ -n "$mirror" ]; then
+                    curl_rc=0
+                    curl -fsSL --connect-timeout 10 --max-time 60 -o "$f" "$mirror" 2>/dev/null || curl_rc=$?
+                    [ "$curl_rc" -eq 0 ] && [ -s "$f" ] && bl_log info "$name: $u недоступен — взят с зеркала jsDelivr"
+                fi ;;
         esac
         if [ "$curl_rc" -eq 0 ] && [ -s "$f" ]; then
             remote_ok=$((remote_ok + 1))
@@ -394,6 +431,11 @@ update_list() { # update_list <name>
         # БД crowdsec пуста — честный статус для health, set/алерты не трогаем
         echo "waiting $(date +%s)" > "$STATE_DIR/status-$name"
         bl_log info "$name: CrowdSec ещё не получил community-список (0 решений) — ждём, set не тронут"
+        rm -rf "$tmp"
+        return 0
+    fi
+    if [ ! -s "$tmp/all.raw" ] && [ "$cs_absent" = 1 ]; then
+        echo 0 > "$fail_counter"; rm -f "$STATE_DIR/.alert-$name"
         rm -rf "$tmp"
         return 0
     fi
@@ -716,6 +758,30 @@ if [ "${1:-}" = "--restore-last-good" ]; then
     exit 0
 fi
 
+# 2026-09-28 (v1.2.4): --retry-empty (таймер каждые 10 мин) — включённые списки, чей живой набор пуст:
+# сначала снимок с диска, иначе загрузка из сети. Прод: первое обновление прервала перезагрузка
+# (или фид не ответил) — наборы пустовали до следующего тика общего таймера (до 6 ч). После 3
+# неудач подряд — не чаще раза в час. crowdsec — своим таймером; пустой успешный список — норма.
+if [ "${1:-}" = "--retry-empty" ]; then
+    restore_last_good
+    rc=0
+    for name in scanner threat tor custom spamhaus cins; do
+        _v="BL_ENABLED_$name"; [ "${!_v:-0}" = 1 ] || continue
+        set="${name}_blocklist_v4"; [ "$name" = tor ] && set="tor_exit_blocklist_v4"
+        nft list set $TABLE "$set" >/dev/null 2>&1 || continue
+        nft list set $TABLE "$set" 2>/dev/null | grep -q 'elements = ' && continue
+        lg="$STATE_DIR/last-good-$name.txt"
+        [ -f "$lg" ] && [ ! -s "$lg" ] && continue
+        cf="$STATE_DIR/fails-$name.cnt"
+        if [ "$(cat "$cf" 2>/dev/null || echo 0)" -ge 3 ] 2>/dev/null && [ -z "$(find "$cf" -mmin +55 2>/dev/null)" ]; then
+            continue
+        fi
+        bl_log info "$name: набор пуст — повторная загрузка (retry)"
+        update_list "$name" || rc=1
+    done
+    exit 0
+fi
+
 rc=0
 # аргументы = подмножество списков (systemd path-триггер зовёт с "custom");
 # без аргументов — все включённые
@@ -858,6 +924,41 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+    # --- 2a) 2026-09-28 (v1.2.4): повтор для пустых наборов (--retry-empty) каждые 10 мин. Прод: первое
+    # обновление прервала перезагрузка / фид не ответил — наборы пустовали до тика общего таймера (6 ч).
+    # Если все наборы заполнены, проход — несколько `nft list set` без сети.
+    shield_persist_stream /etc/systemd/system/shieldnode-blocklist-retry.service 0644 <<EOF
+[Unit]
+Description=shieldnode: retry empty blocklists (snapshot or network)
+After=network-online.target shieldnode.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SHIELD_BLOCKLIST_SCRIPT --retry-empty
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-$SHIELD_BLOCKLIST_STATE -/run/shieldnode -/var/log/shieldnode.log
+TimeoutStartSec=600
+EOF
+    shield_persist_stream /etc/systemd/system/shieldnode-blocklist-retry.timer 0644 <<EOF
+[Unit]
+Description=shieldnode: retry empty blocklists every 10 min
+
+[Timer]
+OnBootSec=6min
+OnActiveSec=6min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+
     # --- 2b) 2026-09-24 (v1.1.6): отдельный таймер crowdsec (agent-режим). Общий таймер тикает
     # раз в BLOCKLIST_UPDATE_INTERVAL (360 мин) — CROWDSEC_AGENT_INTERVAL_MIN (30) не действовал,
     # community blocklist (меняется ежечасно) обновлялся раз в 6ч. Свой таймер обновляет
@@ -932,6 +1033,8 @@ EOF
             log warn "blocklist" "systemctl enable shieldnode-blocklist.timer не удался"
         systemctl enable shieldnode-blocklist-restore.service >/dev/null 2>&1 || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist-restore.service не удался"
+        { systemctl enable shieldnode-blocklist-retry.timer >/dev/null 2>&1 && systemctl restart shieldnode-blocklist-retry.timer >/dev/null 2>&1; } || \
+            log warn "blocklist" "systemctl enable shieldnode-blocklist-retry.timer не удался"
         systemctl enable --now shieldnode-blocklist-custom.path >/dev/null 2>&1 || \
             log warn "blocklist" "systemctl enable shieldnode-blocklist-custom.path не удался"
         if [ "$cs_units" = 1 ]; then

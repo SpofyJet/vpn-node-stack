@@ -169,7 +169,7 @@ shield_health() {
     esac
 
     # блоклисты: ENABLE_* <-> сет+drop-правило; наполненность; свежесть; алерты
-    local bl_on st now name flag def set want has_set has_rule cnt lg age_h iv alert waiting
+    local bl_on st now name flag def set want has_set has_rule cnt lg age_h iv alert waiting absent
     bl_on="$(shield_conf_get ENABLE_BLOCKLISTS 1)"
     st="${SHIELD_BLOCKLIST_STATE:-/var/lib/shieldnode/blocklists}"; now="$(date +%s)"
     while IFS=: read -r name flag def set; do
@@ -191,6 +191,9 @@ shield_health() {
             alert=""; [ -f "$st/.alert-$name" ] && alert="$(cat "$st/.alert-$name" 2>/dev/null)"
             waiting=0; grep -q '^waiting' "$st/status-$name" 2>/dev/null && waiting=1
         else alert=""; waiting=0; fi
+        # 2026-09-28 (v1.2.4): agent-режим без cscli — crowdsec не установлен (не «фид падает»)
+        absent=0
+        if [ "$name" = crowdsec ] && [ "$(shield_crowdsec_resolve_mode)" = agent ] && ! command -v cscli >/dev/null 2>&1; then absent=1; fi
         if [ "${cnt:-0}" -eq 0 ] && [ -n "${lg:-}" ] && [ -f "$lg" ] && [ ! -s "$lg" ] && [ -z "$alert" ]; then
             # 2026-09-25 (v1.1.7): последнее УСПЕШНОЕ обновление дало 0 записей — пустой set корректен
             # (custom без IP в custom.txt, свежий crowdsec без решений). Раньше — ложный WARN «ПУСТ».
@@ -199,6 +202,9 @@ shield_health() {
             else
                 _hc PASS "$name: пуст — источник сейчас не содержит записей (обновление успешно)"
             fi
+        elif [ "${cnt:-0}" -eq 0 ] && [ "$absent" = 1 ]; then
+            _hc WARN "crowdsec: не установлен (cscli нет) — список не работает. Установить: sudo vpn-node → Применить (ставит crowdsec); выключить: ENABLE_CROWDSEC_LIST=0"
+            continue
         elif [ "${cnt:-0}" -eq 0 ] && [ "$waiting" = 1 ]; then
             # 2026-09-25 (v1.2.0, P1-3): cscli ответил «0 решений» — это не сбой фида
             _hc INFO "$name: CrowdSec работает, но community-список ещё не пришёл (обычно до 2 ч после установки) — ждём"

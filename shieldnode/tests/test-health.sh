@@ -128,6 +128,18 @@ gen ''; healthy; rm -f "$OUT/bl/.alert-"*; : > "$ELEMS/crowdsec_blocklist_v4"; r
 t "crowdsec ждёт community-список -> INFO, FAIL=0 WARN=0" 'has "[INFO] crowdsec: CrowdSec работает, но community-список ещё не пришёл" && [ "$(sumf)" = "health: FAIL=0 WARN=0" ]'
 rm -f "$OUT/bl/status-crowdsec"; H
 t "без статуса waiting тот же пустой crowdsec -> WARN (негативный контроль)" 'has "[WARN] crowdsec: set ПУСТ"'
+# v1.2.4 (прод 2026-09-28): agent-режим, а crowdsec не установлен (cscli нет) — одно понятное WARN,
+# без «set ПУСТ» / «фид падает подряд» / «успешных обновлений не было»
+mkdir -p "$OUT/nocs"
+for d in /usr/sbin /usr/bin /sbin /bin; do [ -d "$d" ] || continue
+    for x in "$d"/*; do b="${x##*/}"; [ "$b" = cscli ] || [ -e "$OUT/nocs/$b" ] || ln -s "$x" "$OUT/nocs/$b"; done; done
+gen ''; healthy; : > "$ELEMS/crowdsec_blocklist_v4"; rm -f "$OUT/bl/last-good-crowdsec.txt" "$OUT/bl/status-crowdsec"; date > "$OUT/bl/.alert-crowdsec"
+( shield_crowdsec_resolve_mode() { echo agent; }; PATH="$OUT/bin:$OUT/nocs"; H )
+t "crowdsec не установлен -> одно WARN «не установлен», без ложных" 'has "[WARN] crowdsec: не установлен (cscli нет)" && ! grep -qE "crowdsec: (set ПУСТ|фид падает|успешных)" "$OUT/h.txt"'
+printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/cscli"; chmod +x "$OUT/bin/cscli"
+( shield_crowdsec_resolve_mode() { echo agent; }; PATH="$OUT/bin:$OUT/nocs"; H )
+t "cscli есть, набор пуст -> прежняя проверка (негативный контроль)" 'has "[WARN] crowdsec: set ПУСТ" && ! has "не установлен (cscli нет)"'
+rm -f "$OUT/bin/cscli" "$OUT/bl/.alert-crowdsec"
 # бывшие проверки guard (guard теперь = health): SSH не слушает
 gen 'SSH_PORT=2201\n'; healthy; H
 t "SSH_PORT=2201 не слушает -> WARN «SSH не слушает»" 'has "[WARN] SSH не слушает порт 2201"'

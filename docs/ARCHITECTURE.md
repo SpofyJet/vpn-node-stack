@@ -157,6 +157,7 @@ so `rollback` restores the pre-node state — except the IPv6 invariant.
 | `shieldnode-ports.service` | `After=shieldnode.service docker.service`, `Restart=always` | port watcher (§4) |
 | `shieldnode-blocklist.timer` | `OnBootSec=3min`, every 360 min | updater (all feeds) |
 | `shieldnode-blocklist-crowdsec.timer` | `OnBootSec=5min`, every 30 min (agent mode) | updater `crowdsec` |
+| `shieldnode-blocklist-retry.timer` | `OnBootSec=6min`, `OnActiveSec=6min`, every 10 min | updater `--retry-empty`: empty enabled sets (except crowdsec) — snapshot, else network; after 3 failures at most hourly |
 | `shieldnode-blocklist-custom.path` | change of `/etc/shieldnode/lists/custom.txt` | updater `custom` |
 | `shieldnode-cleanup.timer` | every 15 min | abuse journal cleanup |
 | `node-fq-tune.service`, `node-rt-tweaks.service` | network-pre / network-online | fq params, runtime tweaks |

@@ -33,6 +33,10 @@ shield_rollback() {
         if [ -e /etc/systemd/system/shieldnode-ports.service ]; then
             systemctl disable --now shieldnode-ports.service >/dev/null 2>&1 || true
         fi
+        # 2026-09-28 (v1.2.4): таймер повтора пустых наборов — тоже только при наличии файла
+        if [ -e /etc/systemd/system/shieldnode-blocklist-retry.timer ]; then
+            systemctl disable --now shieldnode-blocklist-retry.timer shieldnode-blocklist-retry.service >/dev/null 2>&1 || true
+        fi
         if [ -e /etc/systemd/system/shieldnode-blocklist-crowdsec.timer ]; then
             systemctl disable --now shieldnode-blocklist-crowdsec.timer shieldnode-blocklist-crowdsec.service >/dev/null 2>&1 || true
         fi
