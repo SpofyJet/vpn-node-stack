@@ -165,7 +165,7 @@ shield_health() {
     for p in $lu; do _h_port_in "$p" "$pu" || { _hc WARN "инбаунд $p/udp не в protected_udp — без abuse-лимитов (подхватится автоматически за ≤1 мин)"; bad=1; }; done
     case "$SH_IB_SOURCE" in
         none) _hc INFO "VPN-ядро сейчас ничего не слушает (remnanode не запущен или панель ещё не прислала конфиг) — защищены последние известные порты" ;;
-        *)    [ "$bad" = 0 ] && _hc PASS "все инбаунды под защитой (источник: $([ "$SH_IB_SOURCE" = api ] && echo 'конфиг Xray' || echo 'эвристика'); tcp: ${lt:--}; udp: ${lu:--})" ;;
+        *)    [ "$bad" = 0 ] && _hc PASS "все инбаунды под защитой (источник: $([ "$SH_IB_SOURCE" = api ] && echo 'конфиг Xray' || echo 'эвристика'); tcp: ${SH_IB_TCP:--}; udp: ${lu:--}${SH_IB_API_PORT:+; API ноды: $SH_IB_API_PORT})" ;;
     esac
 
     # блоклисты: ENABLE_* <-> сет+drop-правило; наполненность; свежесть; алерты
@@ -336,9 +336,11 @@ shield_status() {
 
     echo "--- detect ---"
     echo "ssh ports (detected): $(shield_ssh_ports_summary)"
-    echo "protected ports state: $([ -s "$SHIELD_PROTECTED_STATE" ] && cat "$SHIELD_PROTECTED_STATE" || echo '(none)')"
+    # 2026-10-08: это авто-детект (SSH + инбаунды + API ноды), а не весь protected_tcp (+UFW/EXTRA)
+    echo "protected ports, auto-detected (ssh+inbounds+node API): $([ -s "$SHIELD_PROTECTED_STATE" ] && cat "$SHIELD_PROTECTED_STATE" || echo '(none)')"
     echo "last snapshot: $(ls -1t "$SHIELD_STATE_DIR"/diagnostics/*.txt 2>/dev/null | head -1 || echo '(none)')"
-    echo "admin session IP: ${SSH_CONNECTION:-<not an ssh session>}"
+    # 2026-10-08: из SSH_CONNECTION («ip порт ip порт») — только IP клиента
+    echo "admin session IP: $([ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION%% *}" || echo '<not an ssh session>')"
     echo
 
     echo "--- persist / ownership ---"

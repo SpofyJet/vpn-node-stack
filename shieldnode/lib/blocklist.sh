@@ -254,6 +254,64 @@ for x in sorted(set(out)):
 PY_EOF
 }
 
+# cs_split_decisions <json> <global_out> <ssh_out> — 2026-10-09 (v1.2.5): решения crowdsec по смыслу.
+# Раньше ВСЁ из `cscli decisions list -a` (и общий список CAPI, и локальные баны за подбор SSH на
+# ЭТОЙ ноде) шло в crowdsec_blocklist_v4 — drop на всех портах на 4 ч. Мобильный CGNAT-адрес, с
+# которого один абонент долбил :22, терял VPN для всех за ним (прод: RU-адрес в бане ssh-slow-bf).
+# Локальные (origin=crowdsec) SSH-сценарии, scope Ip -> <ssh_out> «ip секунд_до_конца» -> ssh_abusers
+# (drop только на SSH-портах). CAPI, ручные (cscli), прочие сценарии -> <global_out>, как раньше.
+# simulated=true (режим симуляции crowdsec) не блокируется вовсе.
+cs_split_decisions() {
+    python3 - "$1" "$2" "$3" <<'PY_EOF' 2>/dev/null
+import json, re, sys
+try:
+    data = json.load(open(sys.argv[1])) or []
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+def secs(d):
+    t = 0
+    for n, u in re.findall(r'([0-9.]+)(h|ms|m|s)', d or ''):
+        t += float(n) * {'h': 3600, 'm': 60, 's': 1, 'ms': 0.001}[u]
+    return int(min(max(t, 60), 7 * 86400))
+glob, ssh = set(), {}
+for al in data:
+    for de in (al or {}).get('decisions') or []:
+        v = (de.get('value') or '').strip()
+        if not v or de.get('simulated') or (de.get('type') or 'ban') != 'ban':
+            continue
+        if de.get('origin') == 'crowdsec' and 'ssh' in (de.get('scenario') or '') and (de.get('scope') or '').lower() == 'ip':
+            ssh[v] = max(ssh.get(v, 0), secs(de.get('duration')))
+        else:
+            glob.add(v)
+with open(sys.argv[2], 'w') as g:
+    for x in sorted(glob): g.write(x + '\n')
+with open(sys.argv[3], 'w') as f:
+    for x, t in sorted(ssh.items()): f.write('%s %d\n' % (x, t))
+PY_EOF
+}
+
+# cs_apply_ssh_bans <ssh_list> — локальные SSH-баны crowdsec в ssh_abusers(_v6) со сроком решения.
+# add существующего элемента — не ошибка (срок не продлевается: решение и так живёт свой срок).
+cs_apply_ssh_bans() {
+    [ -s "$1" ] || return 0
+    local fam set n=0
+    for fam in 4 6; do
+        set=ssh_abusers; [ "$fam" = 6 ] && set=ssh_abusers_v6
+        nft list set $TABLE "$set" >/dev/null 2>&1 || continue
+        awk -v fam="$fam" '(fam == 6) == ($1 ~ /:/) && $2 ~ /^[0-9]+$/ { print $1 " timeout " $2 "s" }' "$1" > "$1.$fam"
+        [ -s "$1.$fam" ] || continue
+        awk -v s="$set" 'NR % 500 == 1 { if (NR > 1) print " }"; printf "add element inet shieldnode %s { ", s }
+            { printf "%s%s", (NR % 500 == 1 ? "" : ", "), $0 } END { if (NR > 0) print " }" }' "$1.$fam" > "$1.$fam.nft"
+        main_lock_take || return 1
+        if nft -f "$1.$fam.nft" 2>/dev/null; then n=$((n + $(wc -l < "$1.$fam"))); else bl_log warn "crowdsec: локальные SSH-баны в $set не легли"; fi
+        main_lock_drop
+    done
+    [ "$n" -gt 0 ] && bl_log info "crowdsec: $n локальных SSH-банов -> ssh_abusers (drop только на SSH-портах, не на VPN)"
+    return 0
+}
+
 # cs_kick_if_stuck — 2026-09-25 (v1.2.0, P1-3): на лабе свежий crowdsec, зарегистрированный в
 # CAPI, держал 0 community-решений, пока демон не перезапустили (после рестарта — 15000).
 # Если демон работает > 10 мин, зарегистрирован, а решений 0 — один рестарт в час, не больше 3
@@ -408,7 +466,15 @@ update_list() { # update_list <name>
                 https://admin.api.crowdsec.net/*|local://*) date +%s > "$STATE_DIR/lastok-$name.ts" ;;
             esac
             case "$u" in
-                local://*) extract_json_ips "$f" >> "$tmp/all.raw" 2>/dev/null || cat "$f" >> "$tmp/all.raw" ;;
+                local://*)
+                    if cs_split_decisions "$f" "$tmp/cs-global.list" "$tmp/cs-ssh.list"; then
+                        cs_apply_ssh_bans "$tmp/cs-ssh.list" || true
+                        cat "$tmp/cs-global.list" >> "$tmp/all.raw"
+                        # всё, что есть, — локальные SSH-баны: общего списка (CAPI) пока нет
+                        [ -s "$tmp/cs-global.list" ] || cs_empty=1
+                    else
+                        extract_json_ips "$f" >> "$tmp/all.raw" 2>/dev/null || cat "$f" >> "$tmp/all.raw"
+                    fi ;;
                 *.json|*.json\?*) extract_json_ips "$f" >> "$tmp/all.raw" 2>/dev/null || cat "$f" >> "$tmp/all.raw" ;;
                 *) cat "$f" >> "$tmp/all.raw" ;;
             esac
@@ -591,6 +657,25 @@ update_list() { # update_list <name>
         fi
     fi
 
+    # 8c) 2026-10-08 (v1.2.5): тот же итоговый контент (v4+v6 после агрегации), что и в прошлый
+    #     успешный раз, и живой набор не пуст — nft не трогаем. На живой ноде каждый тик заново
+    #     заливал десятки тысяч элементов (crowdsec — каждые 30 мин) без единого изменения; ядро
+    #     писало «nf_tables_trans_destroy_work hogged CPU». Пустой живой набор (apply пересоздал
+    #     таблицу) — заливаем всегда, как и гард custom выше.
+    local load_hash="" hash_file="$STATE_DIR/.applied-load-$name.sha256"
+    load_hash=$(cat "$tmp/load.list" "$tmp/load6.list" 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ "${FORCE:-0}" != "1" ] && [ -n "$load_hash" ] && [ -f "$hash_file" ] && \
+       [ "$(cat "$hash_file" 2>/dev/null)" = "$load_hash" ] && \
+       nft list set $TABLE "$set_v4" 2>/dev/null | grep -q 'elements = '; then
+        echo 0 > "$fail_counter"
+        rm -f "$STATE_DIR/.alert-$name" "$STATE_DIR/status-$name"
+        # mtime last-good = «последний успех» для status/guard (свежесть фида) — фид жив, просто тот же
+        touch "$STATE_DIR/last-good-$name.txt" 2>/dev/null || true
+        bl_log info "$name: без изменений ($v4_count v4 + $v6_count v6) — набор $set_v4 не тронут"
+        rm -rf "$tmp"
+        return 0
+    fi
+
     # 9) замена содержимого сета: flush + add element ОДНИМ `nft -f` — это одна
     #    netlink-транзакция, трафик видит либо старое, либо новое содержимое.
     # 2026-09-23 (v1.1.4): путь «заливка <set>__next + rename set» удалён —
@@ -645,6 +730,8 @@ update_list() { # update_list <name>
         if [ "$name" = "custom" ] && [ -n "$cur_hash" ] && [ "$v6_failed" = "0" ]; then
             echo "$cur_hash" > "$STATE_DIR/.applied-custom.sha256"
         fi
+        # v6 не залился — хэш не пишем: следующий тик повторит полную заливку
+        if [ "$v6_failed" = "0" ] && [ -n "$load_hash" ]; then echo "$load_hash" > "$hash_file"; else rm -f "$hash_file"; fi
         bl_log info "$name: updated $set_v4: $v4_count v4 + $v6_count v6 (remote=$remote_ok, local=$local_ok)"
     fi
     rm -rf "$tmp"
@@ -1001,7 +1088,7 @@ EOF
     elif [ "${DRY_RUN:-0}" != "1" ] && [ -e /etc/systemd/system/shieldnode-blocklist-crowdsec.timer ]; then
         # crowdsec выключен / feed-режим — свой таймер снимаем (feed душит 429 общим таймером)
         systemctl disable --now shieldnode-blocklist-crowdsec.timer shieldnode-blocklist-crowdsec.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/shieldnode-blocklist-crowdsec.timer /etc/systemd/system/shieldnode-blocklist-crowdsec.service
+        shield_persist_remove /etc/systemd/system/shieldnode-blocklist-crowdsec.timer /etc/systemd/system/shieldnode-blocklist-crowdsec.service
         log info "blocklist" "crowdsec-таймер снят (crowdsec выключен или feed-режим)"
     fi
 

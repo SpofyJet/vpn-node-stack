@@ -30,6 +30,9 @@ SYSTEMCTL_LOG="$OUT/systemctl.log"
 shield_persist_stream() { local dst="$1" mode="${2:-0644}"
     mkdir -p "$OUT$(dirname "$dst")"; cat > "$OUT$dst"; chmod "$mode" "$OUT$dst" 2>/dev/null || true; }
 shield_manifest_record() { :; }
+shield_persist_remove() { local f; for f in "$@"; do rm -f -- "$OUT$f"; done; }
+# 2026-10-08: страховка — install проверяет существование ЖИВОГО /etc/systemd/system/…crowdsec.timer;
+# без подмены удаления тест под root снёс бы таймер на живой ноде
 cat > "$OUT/bin/systemctl" <<EOF
 #!/bin/bash
 echo "\$*" >> "$SYSTEMCTL_LOG"
@@ -258,6 +261,26 @@ PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT"
 t "scanner: применены v4-записи из plain+JSON фидов" bash -c "grep -qx '185.220.101.4/32' '$OUT/nftdb/set_scanner_blocklist_v4' && grep -qx '6.6.6.0/24' '$OUT/nftdb/set_scanner_blocklist_v4'"
 t "scanner: spamhaus '; SBL' парсится как CIDR" grep -qx "91.240.118.0/24" "$OUT/nftdb/set_scanner_blocklist_v4"
 t "scanner: fail counter сброшен на успехе" bash -c "test \$(cat '$SHIELD_BLOCKLIST_STATE/fails-scanner.cnt' 2>/dev/null || echo x) = 0"
+
+# ================= 5b) 2026-10-08: тот же контент — nft не трогаем (кроме пустого живого набора) =================
+# interval-guard выключен: иначе тик пропускается ещё до fetch и новый гард не проверяется
+echo 'BL_INTERVAL_scanner=0' >> "$SHIELD_BLOCKLIST_OVERRIDE"
+printf '#!/bin/sh\necho "$*" >> %s/logger.calls\n' "$OUT" > "$OUT/bin/logger"; chmod +x "$OUT/bin/logger"
+: > "$OUT/ops.same"; : > "$OUT/logger.calls"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" FAKE_NFT_OPS="$OUT/ops.same" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+t "unchanged: повторный тик с тем же фидом не делает flush набора" bash -c "! grep -q 'flush set scanner_blocklist_v4' '$OUT/ops.same'"
+t "unchanged: в логе «без изменений»" grep -q "scanner: без изменений" "$OUT/logger.calls"
+t "unchanged: last-good освежён (status не считает фид протухшим)" bash -c "test \$(( \$(date +%s) - \$(stat -c %Y '$SHIELD_BLOCKLIST_STATE/last-good-scanner.txt') )) -lt 60"
+t "unchanged: набор по-прежнему полон" grep -qx "185.220.101.4/32" "$OUT/nftdb/set_scanner_blocklist_v4"
+: > "$OUT/nftdb/set_scanner_blocklist_v4"          # apply пересоздал таблицу — живой набор пуст
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+t "unchanged: пустой живой набор заливается, несмотря на тот же хэш" grep -qx "185.220.101.4/32" "$OUT/nftdb/set_scanner_blocklist_v4"
+cp "$OUT/fixtures/scanner.txt" "$OUT/fixtures/scanner.txt.orig"; echo "5.188.10.77" >> "$OUT/fixtures/scanner.txt"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+t "unchanged: изменившийся фид заливается" grep -qx "5.188.10.77/32" "$OUT/nftdb/set_scanner_blocklist_v4"
+mv "$OUT/fixtures/scanner.txt.orig" "$OUT/fixtures/scanner.txt"
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
+rm -f "$OUT/bin/logger"; sed -i '/^BL_INTERVAL_scanner=0$/d' "$SHIELD_BLOCKLIST_OVERRIDE"
 
 # ================= 6) scanner: все источники мертвы → keep old + alert на пороге =================
 cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
@@ -548,8 +571,10 @@ cat > "$OUT/bin/cscli" <<'CSCLI_EOF'
 # как настоящий cscli (1.8): без -a — только ЛОКАЛЬНЫЕ решения; community (CAPI) — только с -a
 case "$*" in
     "decisions list -a -t ban --limit 0 -o json")
-        echo '[{"scenario":"crowdsecurity/ssh-slow-bf","decisions":[{"value":"45.83.64.77","scope":"Ip","origin":"crowdsec","type":"ban"}]},
-               {"scenario":"update : +2/-0 IPs","decisions":[{"value":"185.220.101.9","scope":"Ip","origin":"CAPI","type":"ban"},{"value":"91.240.118.0/24","scope":"Range","origin":"CAPI","type":"ban"}]}]'
+        echo '[{"scenario":"crowdsecurity/ssh-slow-bf","source":{"ip":"45.83.64.77","range":"45.83.64.0/19","value":"45.83.64.77"},"decisions":[{"value":"45.83.64.77","scope":"Ip","origin":"crowdsec","type":"ban","scenario":"crowdsecurity/ssh-slow-bf","duration":"3h58m44.5s"}]},
+               {"scenario":"crowdsecurity/ssh-bf","decisions":[{"value":"77.88.99.10","scope":"Ip","origin":"crowdsec","type":"ban","scenario":"crowdsecurity/ssh-bf","duration":"1h","simulated":true}]},
+               {"scenario":"manual","decisions":[{"value":"5.188.10.99","scope":"Ip","origin":"cscli","type":"ban","scenario":"manual ban","duration":"24h"}]},
+               {"scenario":"update : +2/-0 IPs","decisions":[{"value":"185.220.101.9","scope":"Ip","origin":"CAPI","type":"ban","scenario":"ssh:bruteforce"},{"value":"91.240.118.0/24","scope":"Range","origin":"CAPI","type":"ban","scenario":"ssh:bruteforce"}]}]'
         exit 0 ;;
     "decisions list -t ban -o json")
         echo '[{"scenario":"crowdsecurity/ssh-slow-bf","decisions":[{"value":"45.83.64.77","scope":"Ip","origin":"crowdsec","type":"ban"}]}]'
@@ -559,6 +584,7 @@ esac
 CSCLI_EOF
 chmod +x "$OUT/bin/cscli"
 : > "$OUT/nftdb/set_crowdsec_blocklist_v4"
+: > "$OUT/nftdb/set_ssh_abusers"
 rm -f "$SHIELD_BLOCKLIST_STATE/lastok-crowdsec.ts"
 cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
 BL_LOCK_FILE=$OUT/blocklist.lock
@@ -569,7 +595,13 @@ BL_INTERVAL_crowdsec=0
 EOF
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" crowdsec
 t "crowdsec-agent: community (CAPI, только с -a) применён в set" bash -c "grep -qx '185.220.101.9/32' '$OUT/nftdb/set_crowdsec_blocklist_v4' && grep -qx '91.240.118.0/24' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
-t "crowdsec-agent: и локальные решения (SSH-брутфорс) тоже" bash -c "grep -qx '45.83.64.77/32' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+# 2026-10-09 (v1.2.5): локальный бан за подбор SSH — НЕ в общий набор (drop всех портов), а в
+# ssh_abusers со сроком решения (drop только SSH): CGNAT-соседи не теряют VPN
+t "crowdsec-agent: локальный SSH-бан НЕ в общем наборе (не режет VPN)" bash -c "! grep -q '45.83.64.77' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
+t "crowdsec-agent: локальный SSH-бан -> ssh_abusers со сроком решения" grep -qx '45.83.64.77 timeout 14324s' "$OUT/nftdb/set_ssh_abusers"
+t "crowdsec-agent: ручной бан (cscli) — в общем наборе, как раньше" grep -qx '5.188.10.99/32' "$OUT/nftdb/set_crowdsec_blocklist_v4"
+t "crowdsec-agent: simulated-решение не блокируется нигде" bash -c "! grep -q '77.88.99.10' '$OUT/nftdb/set_crowdsec_blocklist_v4' '$OUT/nftdb/set_ssh_abusers'"
+t "crowdsec-agent: range из alert.source не попадает в набор" bash -c "! grep -q '45.83.64.0/19' '$OUT/nftdb/set_crowdsec_blocklist_v4'"
 t "crowdsec-agent: минимум для локальной БД = 0 (feed — 500)" grep -q '^BL_MIN_crowdsec="0"' "$SHIELD_BLOCKLIST_SCRIPT"
 
 # v1.2.0 (P1-3, прод E4 «crowdsec set EMPTY» + алерт): свежий демон, community-список ещё не

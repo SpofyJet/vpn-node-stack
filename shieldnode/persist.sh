@@ -79,6 +79,18 @@ shield_persist_stream() {
     ok "persist" "$dst"
 }
 
+# shield_persist_remove <path...> — удалить СВОИ файлы (юниты и т.п.). 2026-10-08 (v1.2.5): единая
+# точка, как shield_persist_stream: тесты подменяют обе и пишут/удаляют под $OUT. Раньше
+# blocklist.sh делал `rm -f /etc/systemd/system/...` напрямую — test-blocklist.sh под root
+# сносил живой crowdsec-таймер ноды.
+shield_persist_remove() {
+    local f
+    for f in "$@"; do
+        if [ "${DRY_RUN:-0}" = "1" ]; then log info "dry-run" "would remove $f"; continue; fi
+        rm -f -- "$f"
+    done
+}
+
 # shield_persist_nft <runtime-ruleset-file> — копия применённого ruleset для boot.
 shield_persist_nft() {
     local src="$1"
@@ -203,8 +215,9 @@ shield_persist_security_sysctl() {
         "net.ipv4.icmp_echo_ignore_broadcasts=1|smurf-защита: не отвечать на broadcast ping"
         "net.ipv4.icmp_ignore_bogus_error_responses=1|не отвечать на некорректные ICMP errors"
         "net.ipv4.tcp_rfc1337=1|защита TIME_WAIT от RST-флуда (old fallback v5.0.4)"
-        "net.ipv4.conf.all.log_martians=1|логировать martian-пакеты (видимость, ТЗ §27)"
-        "net.ipv4.conf.default.log_martians=1|то же для новых интерфейсов"
+        # 2026-10-09 (v1.2.5): log_martians убран. UFW при старте применяет /etc/ufw/sysctl.conf
+        # (log_martians=0) ПОСЛЕ systemd-sysctl — на живой ноде значение всё равно было 0; и это верно:
+        # под spoofed-флудом каждый martian-пакет — строка в kern.log (rate-limit ядра общий на всё)
         "net.ipv4.conf.all.accept_redirects=0|не принимать ICMP redirects (MITM-вектор)"
         "net.ipv4.conf.default.accept_redirects=0|то же для новых интерфейсов"
         "net.ipv4.conf.all.secure_redirects=0|и «secure» redirects тоже не принимать"
@@ -222,6 +235,12 @@ shield_persist_security_sysctl() {
     for entry in "${plan[@]}"; do
         kv="${entry%%|*}"; comment="${entry#*|}"
         key="${kv%%=*}"; val="${kv#*=}"
+        # 2026-10-09 (v1.2.5): IPv6 выключен в ядре (ipv6.disable=1 — обязательный режим node) —
+        # ключей net.ipv6.* нет вовсе; раньше каждый apply писал 4 warn «kernel отклонил»
+        if [[ "$key" == net.ipv6.* ]] && [ ! -d "${SHIELD_PROC_SYS:-/proc/sys}/net/ipv6" ]; then
+            log debug "sysctl" "skip $key — IPv6 выключен в ядре"
+            continue
+        fi
         if ! validate_key_ownership "$key"; then
             log warn "sysctl" "skip $key — владелец node (реестр), не трогаем"
             continue
@@ -253,7 +272,9 @@ shield_persist_security_sysctl() {
         echo "# Сгенерировано shieldnode v$SHIELD_VERSION"
         for entry in "${accepted[@]}"; do
             kv="${entry%%|*}"; comment="${entry#*|}"
-            printf '%-55s # %s\n' "$kv" "$comment"
+            # 2026-10-09: комментарий — отдельной строкой. sysctl.d(5) не знает хвостовых комментариев:
+            # systemd-sysctl писал в ядро «0   # текст…» (журнал boot: Couldn't write '0  # не принимать…')
+            printf '# %s\n%s\n' "$comment" "$kv"
         done
     } | shield_persist_stream "$SHIELD_SYSCTL_SECURITY" 0640
     # owner-keys для cross-check со стороны node (ТЗ §15/§21)

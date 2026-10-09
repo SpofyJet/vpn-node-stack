@@ -286,22 +286,32 @@ shield_valid_cidr() {
     esac
 }
 
+# shield_admin_ip_from_ancestors — IP клиента из SSH_CONNECTION ближайшего предка (до 32 уровней).
+# SHIELD_PROC — корень /proc (подмена в тестах).
+shield_admin_ip_from_ancestors() {
+    local proc="${SHIELD_PROC:-/proc}" pid="${SHIELD_ADMIN_PID:-$$}" i v ppid
+    for ((i = 0; i < 32; i++)); do
+        ppid="$(awk '/^PPid:/ {print $2}' "$proc/$pid/status" 2>/dev/null || true)"
+        [[ "$ppid" =~ ^[0-9]+$ ]] && [ "$ppid" -gt 1 ] || return 0
+        pid="$ppid"
+        v="$(tr '\0' '\n' < "$proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -1 || true)"
+        [ -n "$v" ] && { printf '%s\n' "${v%% *}"; return 0; }
+    done
+    return 0
+}
+
 # --- админ IP текущей сессии (anti-lockout, ТЗ §20): только если реально SSH-сессия ---
 shield_detect_admin_ip() {
     local a=""
     if [ -n "${SSH_CONNECTION:-}" ]; then
         a="${SSH_CONNECTION%% *}"
-    elif command -v ss >/dev/null 2>&1; then
-        # fallback: sshd-сессии. Баг 2026-09-23: с явным `state established` ss НЕ
-        # печатает колонку State (Recv-Q Send-Q Local Peer Process) — $5 был полем
-        # Process ('users:(("sshd",...'): под sudo/su (SSH_CONNECTION сброшен) admin
-        # не whitelist'ился вовсе, а мусор с ':' уходил в whitelist_v6 и nft -c
-        # отвергал весь ruleset. Берём 2-е поле вида адрес:порт (1-е — Local) —
-        # не зависит от набора колонок/версии iproute2. IPv6 [a::b]:p — скобки срезаем.
-        a="$(ss -tnp state established 2>/dev/null \
-            | awk '/sshd/{n=0; for (i=1; i<=NF; i++) if ($i ~ /:[0-9]+$/ && ++n==2) { print $i; break }}' \
-            | sed -E -e 's/^\[([^]]+)\]:[0-9]+$/\1/' -e t -e 's/:[0-9]+$//' \
-            | grep -vE '^(127\.|::1$|0\.0\.0\.0$)' | head -1 || true)"
+    else
+        # 2026-10-09 (v1.2.5): под sudo (env_reset) SSH_CONNECTION сброшен — берём его из окружения
+        # ПРЕДКОВ процесса: шелл админа выше sudo держит настоящий. Раньше здесь был «первый
+        # established-пир sshd» из ss: туда попадают и pre-auth соединения (бот посреди подбора
+        # пароля — тоже процесс sshd), и такой адрес уходил в whitelist — мимо ВСЕЙ защиты до
+        # следующего apply. Нет SSH-сессии среди предков (cron/systemd/панель) — не угадываем.
+        a="$(shield_admin_ip_from_ancestors)"
     fi
     [ -n "$a" ] || return 0
     # 2026-09-25 (v1.1.7): IPv4-mapped (::ffff:1.2.3.4) — sshd слушает dual-stack [::]:22, и под sudo

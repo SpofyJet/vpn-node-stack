@@ -40,7 +40,14 @@ node_udp_health() {
         "${mem:-?}" "${pressure:-?}" "$(awk -v m="${mem:-0}" -v p="${pressure:-0}" 'BEGIN { printf (p > 0 ? "%.1f" : "?"), (p > 0 ? m * 100 / p : 0) }')" \
         "${rcvbuf:-?}" "${ring:-нет данных}"
     # UDP-сокеты прокси: пара строк ss — «UNCONN … local … users:((\"rw-core\",…))» + «skmem:(r…,rb…,…,d…)»
-    { ss -uamnp 2>/dev/null || true; } | awk '
+    # 2026-10-08 (v1.2.5): сводка вместо строки на сокет. На живой ноде у rw-core ~3000 UDP-сокетов —
+    # это исходящие потоки клиентов (DNS/QUIC через freedom), status разрастался до 3000+ строк.
+    # Поштучно — только «серверные» сокеты (порт ниже ip_local_port_range: эфемерным он не бывает)
+    # и сокеты с потерями/заполненной очередью (не больше 10).
+    local lport_lo
+    lport_lo="$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || true)"
+    { ss -uamnp 2>/dev/null || true; } | awk -v lo="${lport_lo:-32768}" '
+        function human(b) { return (b >= 1048576) ? sprintf("%d МиБ", b / 1048576) : sprintf("%d КиБ", b / 1024) }
         /^(UNCONN|ESTAB)/ { loc = $4; proc = ""; if (match($0, /users:\(\("[^"]+"/)) proc = substr($0, RSTART + 9, RLENGTH - 10); next }
         /skmem:\(/ && proc ~ /^(xray|rw-core|hysteria|sing-box|v2ray)/ {
             rb = 0; r = 0; d = 0
@@ -48,14 +55,30 @@ node_udp_health() {
             if (match($0, /rb[0-9]+/)) rb = substr($0, RSTART + 2, RLENGTH - 2) + 0
             if (match($0, /\(r[0-9]+/)) r = substr($0, RSTART + 2, RLENGTH - 2) + 0
             if (match($0, /d[0-9]+\)/)) d = substr($0, RSTART + 1, RLENGTH - 2) + 0
-            buf = (rb >= 1048576) ? sprintf("%d МиБ", rb / 1048576) : sprintf("%d КиБ", rb / 1024)
-            if (d + 0 > 0) {
-                hint = (rb + 0 < 16777216) ? " — буфер меньше, чем просит quic-go (8 МиБ): rmem_max >= 8388608 или cap NET_ADMIN у контейнера" \
+            port = loc; sub(/.*:/, "", port); port += 0
+            n[proc]++; dr[proc] += d; q[proc] += r
+            if (!(proc in bmin) || rb < bmin[proc]) bmin[proc] = rb
+            if (rb > bmax[proc]) bmax[proc] = rb
+            server = (port > 0 && port < lo)
+            if (d > 0 || (rb > 0 && r * 2 >= rb) || server) {
+                if (d > 0) {
+                    hint = (rb < 16777216) ? " — буфер меньше, чем просит quic-go (8 МиБ): rmem_max >= 8388608 или cap NET_ADMIN у контейнера" \
                                            : " — буфер полный по размеру: Xray не успевает читать (CPU/steal), не память"
-                printf "  ПОТЕРИ: сокет %s (%s): буфер %s, в очереди %d Б, потеряно %d пакетов%s\n", loc, proc, buf, r, d, hint
-            } else
-                printf "  сокет %s (%s): буфер %s, в очереди %d Б, потерь 0 — ok\n", loc, proc, buf, r
+                    line = sprintf("  ПОТЕРИ: сокет %s (%s): буфер %s, в очереди %d Б, потеряно %d пакетов%s", loc, proc, human(rb), r, d, hint)
+                } else
+                    line = sprintf("  сокет %s (%s%s): буфер %s, в очереди %d Б, потерь 0 — ok", loc, proc, server ? ", инбаунд" : "", human(rb), r)
+                if (d > 0 || r * 2 >= rb) { if (nbad < 10) bad[++nbad] = line; else extra++ }
+                else if (nsrv < 10) srv[++nsrv] = line
+            }
             proc = ""
+        }
+        END {
+            for (p in n)
+                printf "  %s: UDP-сокетов %d (буфер %s…%s), в очередях %d Б, потерь на открытых сокетах %d%s\n", \
+                    p, n[p], human(bmin[p]), human(bmax[p]), q[p], dr[p], (dr[p] > 0 ? " — см. ниже" : " — ok")
+            for (i = 1; i <= nsrv; i++) print srv[i]
+            for (i = 1; i <= nbad; i++) print bad[i]
+            if (extra > 0) printf "  … и ещё %d сокетов с потерями/полной очередью\n", extra
         }'
     if [ -n "$mem" ] && [ -n "$pressure" ] && [ "$mem" -ge "$pressure" ] 2>/dev/null; then
         echo "  ВНИМАНИЕ: память UDP выше порога давления udp_mem — ядро урезает буферы всех UDP-сокетов"

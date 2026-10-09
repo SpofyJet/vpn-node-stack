@@ -84,6 +84,9 @@ t "connlimit-наборы: БЕЗ timeout (иначе ct count: Operation not su
 t "ct count — только внутри add @set (standalone syntax error у nft)" bash -c "! grep -E 'ct count' '$RS' | grep -vq 'add @'"
 t "ct count правила в канонической форме" bash -c "grep -q 'add @ssh_connlimit { ip saddr ct count over' '$RS' && grep -q 'add @tcp_connlimit { ip saddr ct count over' '$RS'"
 t "protected_tcp/udp с портами" bash -c "grep -q 'set protected_tcp' '$RS' && grep -q '8443' '$RS'"
+# 2026-10-09 (v1.2.5): бан SSH-подбора режет только SSH-порты — не VPN-трафик CGNAT-соседей
+t "ssh_abusers: drop только на SSH-портах (не весь трафик IP)" bash -c "grep -qE 'tcp dport \\{ 22,2222 \\} ip saddr @ssh_abusers .* drop' '$RS' && ! grep -qE '^[[:space:]]+ip saddr @ssh_abusers ' '$RS'"
+t "API ноды: панель принимается до блок-листов (только порт API)" bash -c "awk '/tcp dport @node_api_port ip saddr @node_api_allow_v4 accept/{a=NR} /@scanner_blocklist_v4 counter/{b=NR} END{exit !(a && b && a<b)}' '$RS'"
 t "per-src rate-limit ТОЛЬКО через meter" bash -c "grep -q 'meter ssh_new_22' '$RS' && grep -q 'meter tcp_syn' '$RS' && grep -q 'meter udp_rate' '$RS'"
 t "plain limit только для global ceiling" bash -c "grep -q 'limit rate over 8000/minute counter name c_drops_global_tcp drop' '$RS' && grep -q 'limit rate over 20000/second counter name c_drops_global_udp drop' '$RS'"
 t "global ceiling scope: SYN-потолок только на protected_tcp (SSH не задевает)" grep -q 'tcp dport @protected_tcp tcp flags syn ct state new limit rate over 8000/minute' "$RS"
@@ -192,6 +195,11 @@ shield_emergency_ruleset > /tmp/shieldnode-test/emergency.nft
 t "emergency: только ssh/established/whitelist" bash -c "grep -q 'tcp dport 22 ct state new accept' /tmp/shieldnode-test/emergency.nft && grep -q 'ip protocol tcp drop' /tmp/shieldnode-test/emergency.nft"
 t "emergency: loopback accept первым (иначе мёртвый локальный DNS)" bash -c "grep -q 'iifname \"lo\" accept' /tmp/shieldnode-test/emergency.nft && awk '/chain prerouting/{f=1; next} f && /iifname \"lo\" accept/{ok=1} f && /ct state established/{print ok; exit}' /tmp/shieldnode-test/emergency.nft | grep -q 1"
 t "emergency: скобки сбалансированы" bash -c "test \$(grep -o '{' /tmp/shieldnode-test/emergency.nft | wc -l) = \$(grep -o '}' /tmp/shieldnode-test/emergency.nft | wc -l)"
+# 2026-10-09 (v1.2.5): аварийный режим не роняет VPN — инбаунды принимают новых клиентов, API ноды — только панели
+EMERG_VPN_TCP="443 8443" EMERG_VPN_UDP="443" EMERG_API_PORT=2222 EMERG_API_ALLOW="203.0.113.10" shield_emergency_ruleset > /tmp/shieldnode-test/emergency-vpn.nft
+t "emergency: инбаунды VPN открыты для новых подключений (до общего drop)" bash -c "grep -q 'tcp dport { 443, 8443 } ct state new accept' /tmp/shieldnode-test/emergency-vpn.nft && grep -q 'udp dport { 443 } accept' /tmp/shieldnode-test/emergency-vpn.nft && awk '/dport \\{ 443, 8443 \\}/{a=NR} /ip protocol tcp drop/{b=NR} END{exit !(a && b && a<b)}' /tmp/shieldnode-test/emergency-vpn.nft"
+t "emergency: API ноды — только с адреса панели" grep -q 'tcp dport 2222 ip saddr { 203.0.113.10 } accept' /tmp/shieldnode-test/emergency-vpn.nft
+t "emergency: без EMERG_* (EMERGENCY_KEEP_VPN=0) — как раньше, только SSH" bash -c "! grep -qE 'dport \\{|ip saddr \\{' /tmp/shieldnode-test/emergency.nft"
 
 # --- владение sysctl (§15): net.netfilter.* — жёсткий запрет для shieldnode ---
 t "validate_key_ownership: net.netfilter.* запрещён" bash -c "! validate_key_ownership net.netfilter.nf_conntrack_max"
@@ -203,6 +211,14 @@ t "validate_key_ownership: rp_filter разрешён" validate_key_ownership ne
 source "$SHIELD_DIR/persist.sh"
 shield_persist_security_sysctl > /tmp/shieldnode-test/security-sysctl.log 2>&1
 t "persist: tcp_rfc1337=1 в security-sysctl плане" grep -q 'sysctl net.ipv4.tcp_rfc1337=1' /tmp/shieldnode-test/security-sysctl.log
+# 2026-10-09 (v1.2.5): IPv6 выключен в ядре — net.ipv6.* не трогаем и не warn'им (ключей нет)
+mkdir -p /tmp/shieldnode-test/procsys-nov6/net/ipv4
+SHIELD_PROC_SYS=/tmp/shieldnode-test/procsys-nov6 shield_persist_security_sysctl > /tmp/shieldnode-test/security-sysctl-nov6.log 2>&1
+t "persist: без IPv6 в ядре — net.ipv6.* пропущены, warn нет" bash -c "! grep -q 'net.ipv6' /tmp/shieldnode-test/security-sysctl-nov6.log && ! grep -q 'отклонил' /tmp/shieldnode-test/security-sysctl-nov6.log && grep -q 'sysctl net.ipv4.tcp_rfc1337=1' /tmp/shieldnode-test/security-sysctl-nov6.log"
+mkdir -p /tmp/shieldnode-test/procsys-v6/net/ipv6
+SHIELD_PROC_SYS=/tmp/shieldnode-test/procsys-v6 shield_persist_security_sysctl > /tmp/shieldnode-test/security-sysctl-v6.log 2>&1
+t "persist: IPv6 в ядре есть — net.ipv6.* в плане" grep -q 'sysctl net.ipv6.conf.all.accept_redirects=0' /tmp/shieldnode-test/security-sysctl-v6.log
+t "persist: log_martians в плане нет (UFW всё равно ставит 0)" bash -c "! grep -q log_martians /tmp/shieldnode-test/security-sysctl.log"
 t "persist: net.netfilter.* в security-sysctl плане НЕТ (владелец node)" bash -c "! grep -q 'sysctl net.netfilter\.' /tmp/shieldnode-test/security-sysctl.log"
 
 echo

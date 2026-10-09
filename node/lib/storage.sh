@@ -95,17 +95,19 @@ node_noatime_apply() {
         NF < 4           { print; next }
         $3 == "swap"     { print; next }
         {
-            o=$4
-            # discard: убираем с ведущей запятой / первым / единственным
-            gsub(/,discard/, "", o)
-            sub(/^discard,/, "", o)
-            sub(/^discard$/, "", o)
-            sub(/^,/, "", o); sub(/,$/, "", o)
-            if (o=="") o="defaults"
-            if (o !~ /(^|,)(noatime|nodiratime)(,|$)/) {
-                if (o ~ /(^|,)(relatime|atime)(,|$)/) sub(/(relatime|atime)/, "noatime", o)
-                else o = o ",noatime"
+            # 2026-10-09 (v1.2.5): по ЦЕЛЫМ опциям (через запятую). Подстроки ломали fstab:
+            # strictatime -> strictnoatime, norelatime -> nonoatime, discard=async -> «=async»
+            # (findmnt --verify опции не проверяет — такой fstab записался бы)
+            n = split($4, op, ","); o = ""; has = 0
+            for (i = 1; i <= n; i++) {
+                x = op[i]
+                if (x == "" || x == "discard" || x ~ /^discard=/) continue
+                if (x == "relatime" || x == "atime" || x == "strictatime" || x == "norelatime") x = "noatime"
+                if (x == "noatime") { if (has) continue; has = 1 }
+                o = o (o == "" ? "" : ",") x
             }
+            if (o == "") o = "defaults"
+            if (!has) o = o ",noatime"
             $4=o
             print
         }

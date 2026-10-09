@@ -60,9 +60,26 @@ node_limits_persist() {
         backup "$f"; rm -f "$f"; rmdir "$(dirname "$f")" 2>/dev/null || true
         log info "limits" "убран drop-in node с юнита $base (больше не xray/remnanode)"
     done
-    [ "$n" -eq 0 ] && warn "limits" "systemd-unit'ы xray/remnanode не найдены (docker-only?). Drop-in не создан; примени LimitNOFILE вручную в compose/unit контейнера."
+    [ "$n" -eq 0 ] && node_limits_check_container
     # daemon-reload в chroot/контейнере без systemd падает — это не повод
     # ронять весь apply (drop-in'ы подхватятся при первом же boot/reload)
     systemctl daemon-reload 2>/dev/null || warn "limits" "systemctl daemon-reload не удался (chroot/контейнер?) — drop-in'ы применятся при boot"
     ok "limits" "daemon-reload done; drop-ins применятся при следующем рестарте сервисов (сейчас НЕ рестартуем)"
+}
+
+# node_limits_check_container — 2026-10-08 (v1.2.5): docker-only нода (remnawave/node). Drop-in
+# некуда ставить — проверяем ФАКТ: лимит открытых файлов у работающего VPN-ядра (rw-core/xray).
+# Раньше warn звучал всегда, даже когда в compose уже ulimits.nofile 1048576 (живая нода).
+node_limits_check_container() {
+    local pid soft
+    pid="$(pgrep -x rw-core 2>/dev/null | head -1 || true)"
+    [ -n "$pid" ] || pid="$(pgrep -x xray 2>/dev/null | head -1 || true)"
+    soft="$([ -n "$pid" ] && awk '/^Max open files/ {print $4}' "/proc/$pid/limits" 2>/dev/null || true)"
+    if [ -z "$soft" ]; then
+        warn "limits" "systemd-unit'ы xray/remnanode не найдены, процесс VPN-ядра не запущен — LimitNOFILE не проверен; в docker задай ulimits.nofile в compose."
+    elif [ "$soft" = unlimited ] || { [[ "$soft" =~ ^[0-9]+$ ]] && [ "$soft" -ge "$NODE_LIMIT_NOFILE" ]; }; then
+        log info "limits" "VPN-ядро в контейнере (pid $pid): открытых файлов до $soft (>= $NODE_LIMIT_NOFILE) — drop-in не нужен"
+    else
+        warn "limits" "VPN-ядро в контейнере (pid $pid): лимит открытых файлов $soft < $NODE_LIMIT_NOFILE — задай ulimits.nofile в docker-compose (soft и hard) и пересоздай контейнер"
+    fi
 }

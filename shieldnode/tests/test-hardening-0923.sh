@@ -60,7 +60,15 @@ t() { local name="$1" cmd="$2"
     if eval "$cmd" >/dev/null 2>&1; then echo "ok   - $name"; else echo "FAIL - $name"; fails=$((fails+1)); fi; }
 
 # ---------- ss / валидация ----------
-t "admin IP: peer из 2-го поля адрес:порт, loopback пропущен" '[ "$(shield_detect_admin_ip)" = 203.0.113.7 ]'
+# 2026-10-09 (v1.2.5): без SSH_CONNECTION — НЕ «первый established-пир sshd» из ss (туда попадали
+# pre-auth боты -> whitelist мимо всей защиты), а SSH_CONNECTION предка (шелл админа над sudo)
+FP="$(mktemp -d)"; mkdir -p "$FP/100" "$FP/50" "$FP/40"
+printf 'Name:\tbash\nPPid:\t50\n' > "$FP/100/status"
+printf 'Name:\tsudo\nPPid:\t40\n' > "$FP/50/status"; printf 'PATH=/usr/bin\0' > "$FP/50/environ"
+printf 'Name:\tbash\nPPid:\t1\n' > "$FP/40/status"; printf 'HOME=/home/a\0SSH_CONNECTION=198.51.100.9 51000 10.0.0.5 22\0' > "$FP/40/environ"
+t "admin IP: под sudo — SSH_CONNECTION из предка (шелл над sudo)" '[ "$(SSH_CONNECTION= SHIELD_PROC="$FP" SHIELD_ADMIN_PID=100 shield_detect_admin_ip)" = 198.51.100.9 ]'
+printf 'HOME=/root\0' > "$FP/40/environ"
+t "admin IP: нет SSH-сессии среди предков — пусто, ss-пир sshd (pre-auth бот) НЕ берётся" '[ -z "$(SSH_CONNECTION= SHIELD_PROC="$FP" SHIELD_ADMIN_PID=100 shield_detect_admin_ip)" ]'
 t "admin IP: SSH_CONNECTION приоритетнее"      '[ "$(SSH_CONNECTION="198.51.100.4 5555 10.0.0.5 22" shield_detect_admin_ip)" = 198.51.100.4 ]'
 # 2026-09-25 (v1.1.7): под sudo (SSH_CONNECTION сброшен) ss на dual-stack sshd отдаёт ::ffff:v4 —
 # админ уходил в admin6 и при выключенном IPv6 не whitelist'ился вовсе
@@ -68,7 +76,8 @@ t "admin IP: IPv4-mapped (::ffff:a.b.c.d) из SSH_CONNECTION -> чистый IP
 t "admin IP: настоящий IPv6 не трогается" '[ "$(SSH_CONNECTION="2001:db8::7 1690 2001:db8::1 22" shield_detect_admin_ip)" = 2001:db8::7 ]'
 t "admin IP: мусор в SSH_CONNECTION не проходит в nft" '[ -z "$(SSH_CONNECTION="1.2.3.4}; flush 1 2 3" shield_detect_admin_ip 2>/dev/null)" ]'
 t "valid_ip: v4/v6 да, 999.1.1.1/process-строка нет" 'shield_valid_ip 203.0.113.7 && shield_valid_ip 2001:db8::1 && ! shield_valid_ip 999.1.1.1 && ! shield_valid_ip "users:((\"sshd\",pid=1))"'
-shield_limits_resolve >/dev/null 2>&1
+printf 'HOME=/home/a\0SSH_CONNECTION=203.0.113.7 51000 10.0.0.5 22\0' > "$FP/40/environ"
+SSH_CONNECTION= SHIELD_PROC="$FP" SHIELD_ADMIN_PID=100 shield_limits_resolve >/dev/null 2>&1
 t "UDP: protected_udp = локальный порт 8443 (не 0.0.0.0:*)" '[ "$SH_F_PROTECTED_UDP" = 8443 ]'
 t "whitelist_v4 содержит admin"                 '[ "$SH_F_ADMIN_V4" = 203.0.113.7 ]'
 SH_F_IPV6=1 shield_nft_build_ruleset > "$OUT/rs.nft"

@@ -19,8 +19,10 @@ node_svc_snapshot() { # <unit>
     local u="$1"
     [ -f "$NODE_SVC_STATE" ] && cut -f1 "$NODE_SVC_STATE" | grep -qxF -- "$u" && return 0
     local en ac
-    en="$(systemctl is-enabled "$u" 2>/dev/null || echo unknown)"
-    ac="$(systemctl is-active "$u" 2>/dev/null || echo unknown)"
+    # 2026-10-09 (v1.2.5): `$(cmd || echo unknown)` при выводе И rc!=0 (is-active: «inactive», rc=3)
+    # давал две строки — в реестре появлялась строка «unknown», rollback дёргал юнит «unknown»
+    en="$(systemctl is-enabled "$u" 2>/dev/null | head -1)" || true; [ -n "$en" ] || en=unknown
+    ac="$(systemctl is-active "$u" 2>/dev/null | head -1)" || true;  [ -n "$ac" ] || ac=unknown
     printf '%s\t%s\t%s\n' "$u" "$en" "$ac" >> "$NODE_SVC_STATE"
     log debug "services" "snapshot $u: enabled=$en active=$ac"
 }
@@ -124,7 +126,10 @@ node_services_apply() {
 
     # автообновления: APT::Periodic=0 + таймеры (явное решение оператора:
     # security-апдейты ставятся вручную в окно обслуживания — как на старой ноде)
-    if [ "$(node_conf_get HARDEN_UNATTENDED 1)" = "1" ]; then
+    if [ "$(node_conf_get HARDEN_UNATTENDED 1)" != "1" ]; then
+        node_unattended_safe_apply
+    else
+        node_needrestart_protect   # ручной `apt upgrade` тоже не должен перезапускать docker
         {
             echo "// node: автообновления отключены (HARDEN_UNATTENDED=1). Вернуть: удалить файл + enable apt-daily*.timer"
             echo "APT::Periodic::Update-Package-Lists \"0\";"
@@ -183,6 +188,51 @@ node_services_apply() {
 # Без ручной affinity irqbalance — единственное, что разводит IRQ многоочередного NIC по
 # ядрам; безусловное отключение оставляло все прерывания на CPU0 (softirq-узкое место).
 # Отключённый прежней версией irqbalance возвращается в исходное состояние.
+# node_unattended_safe_apply — 2026-10-09 (v1.2.5): HARDEN_UNATTENDED=0 — автообновления БЕЗОПАСНОСТИ,
+# не рвущие VPN: needrestart не трогает docker/containerd, пакеты docker из автообновлений исключены,
+# авто-reboot выключен. Дефолт — 1 (выключены, решение оператора).
+node_unattended_safe_apply() {
+    local apt="${NODE_APT_CONF_DIR:-/etc/apt/apt.conf.d}"   # override — тесты
+    local off="$apt/99-node-no-unattended" reg="$NODE_STATE_DIR/file-origins.tsv"
+    if [ -f "$off" ] && awk -F'\t' -v p="$off" '$1 == p && $2 == "created" {f = 1} END {exit !f}' "$reg" 2>/dev/null; then
+        if [ "${DRY_RUN:-0}" = "1" ]; then log info "dry-run" "would remove $off (автообновления безопасности снова включаются)"
+        else rm -f "$off"; log info "services" "убран $off — автообновления безопасности включены"; fi
+    fi
+    # Persistent=true: включённый после долгого простоя таймер СРАЗУ догоняет пропущенный запуск —
+    # на живой ноде полное обновление (150+ пакетов) стартовало в момент apply. Штамп «последний запуск =
+    # сейчас» переносит первое обновление на штатное окно (OnCalendar 06:00 + до 60 мин). Только для
+    # выключенных таймеров — расписание работающих не трогаем.
+    local td="${NODE_SYSTEMD_TIMERS_DIR:-/var/lib/systemd/timers}" tm
+    for tm in apt-daily.timer apt-daily-upgrade.timer; do
+        systemctl is-active --quiet "$tm" 2>/dev/null && continue
+        [ "${DRY_RUN:-0}" = "1" ] || { [ -d "$td" ] && touch "$td/stamp-$tm"; } || true
+    done
+    node_svc_restore apt-daily.timer
+    node_svc_restore apt-daily-upgrade.timer
+    {
+        echo '// node: автообновления безопасности — да, рестарт VPN — нет (managed by node; HARDEN_UNATTENDED=1 — выключить)'
+        echo 'Unattended-Upgrade::Package-Blacklist { "^docker-" ; "^containerd" ; };'
+        echo 'Unattended-Upgrade::Automatic-Reboot "false";'
+    } | node_persist "$apt/52-node-unattended-vpn"
+    node_needrestart_protect
+}
+
+# node_needrestart_protect — 2026-10-09 (v1.2.5): ВСЕГДА, при любом HARDEN_UNATTENDED. needrestart
+# (Ubuntu 24.04) после обновления libc сам перезапускает сервисы — и при ручном `apt upgrade` тоже:
+# docker/containerd перезапустились бы, а это обрыв всех клиентов (remnanode в docker).
+node_needrestart_protect() {
+    local nr="${NODE_NEEDRESTART_DIR:-/etc/needrestart}"
+    [ -d "$nr" ] || return 0
+    mkdir -p "$nr/conf.d"
+    {
+        echo '# node: не перезапускать docker/containerd после обновления библиотек — оборвало бы все'
+        echo '# VPN-соединения (remnanode в docker). Перезапуск — вручную в окно обслуживания (managed by node)'
+        echo '$nrconf{override_rc}{qr(^docker)} = 0;'
+        echo '$nrconf{override_rc}{qr(^containerd)} = 0;'
+        echo '$nrconf{override_rc}{qr(^systemd-networkd)} = 0;'
+    } | node_persist "$nr/conf.d/90-node-vpn.conf"
+}
+
 node_svc_irqbalance_apply() {
     if [ "$(node_conf_get HARDEN_IRQBALANCE 1)" = "1" ] && [ "$(node_conf_get ENABLE_IRQ_AFFINITY 0)" = "1" ]; then
         node_svc_disable irqbalance.service

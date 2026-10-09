@@ -246,6 +246,14 @@ _g_act_unban() {
     local s n=0 sets="ssh_abusers tcp_abusers udp_abusers temporary_blocklist"
     case "$ip" in *:*) sets="ssh_abusers_v6 tcp_abusers_v6 udp_abusers_v6 temporary_blocklist_v6" ;; esac
     for s in $sets; do nft delete element inet shieldnode "$s" "{ $ip }" >/dev/null 2>&1 && n=$((n + 1)); done
+    # 2026-10-09 (v1.2.5): локальные баны crowdsec за SSH лежат в ssh_abusers — без снятия решения
+    # updater вернул бы IP через ≤30 мин; ручные (cscli) и CAPI-решения так же снимаются здесь
+    # rc cscli = 0 и при «0 decision(s) deleted» — смотрим число в выводе
+    local csd=0
+    command -v cscli >/dev/null 2>&1 && csd="$(timeout 30 cscli decisions delete --ip "$ip" 2>&1 | grep -oE '[0-9]+ decision' | grep -oE '^[0-9]+' | head -1 || true)"
+    if [[ "${csd:-0}" =~ ^[0-9]+$ ]] && [ "${csd:-0}" -gt 0 ]; then
+        n=$((n + 1)); log info "guard" "unban $ip: решений crowdsec снято: $csd"
+    fi
     if [ "$n" -gt 0 ]; then printf '  %s✔ %s разбанен (наборов: %s)%s\n' "$G_G" "$ip" "$n" "$G_0"; log info "guard" "unban $ip ($n sets)"
     else printf '  %s не найден среди банов (блок-листы сканеров/угроз так не снимаются — для своего IP используй «Доверенные IP»)\n' "$ip"; fi
     _g_pause

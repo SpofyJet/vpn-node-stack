@@ -192,6 +192,9 @@ EOF
         # API ноды — только панель (TRUSTED_IPS + UFW «allow from» для этого порта); ДО whitelist:
         # сессия админа по SSH к API ноды доступа не даёт (DIAGNOSIS P0-2)
         tcp dport @node_api_port ip saddr != @node_api_allow_v4 counter name c_drops_nodeapi drop
+        # 2026-10-09 (v1.2.5): панель -> API ноды — до блок-листов: адрес панели (или сеть её хостера)
+        # в фиде сканеров обрывал управление нодой. Только порт API, прочее от того же IP — общим путём.
+        tcp dport @node_api_port ip saddr @node_api_allow_v4 accept
         # whitelist первым из блокирующих решений: админ/исключения §30 не режутся
         ip saddr @whitelist_v4 accept
 EOF
@@ -288,11 +291,13 @@ EOF
 EOF
         [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @temporary_blocklist_v6 counter name c_drops_temp_v6 drop"
 
-        cat <<'EOF'
-        # повторные abusers — сразу drop (§21–23)
-        ip saddr @ssh_abusers counter name c_drops_ssh_abusers_v4 drop
-EOF
-        [ "$SH_F_IPV6" = "1" ] && echo "        ip6 saddr @ssh_abusers_v6 counter name c_drops_ssh_abusers_v6 drop"
+        # повторные abusers — сразу drop (§21–23). 2026-10-09 (v1.2.5): бан SSH-подбора — только на
+        # SSH-портах. Раньше `ip saddr @ssh_abusers drop` резал ВСЕ порты: мобильный CGNAT-адрес, с
+        # которого один абонент долбил :22, на час терял и VPN (443/8443) для всех абонентов за этим IP.
+        # Ручные/аварийные баны (temporary_blocklist) по-прежнему режут всё.
+        local ssh_set; ssh_set="$(printf '%s' "${SH_F_SSH_PORTS:-22}" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')"
+        echo "        tcp dport { $ssh_set } ip saddr @ssh_abusers counter name c_drops_ssh_abusers_v4 drop"
+        [ "$SH_F_IPV6" = "1" ] && echo "        tcp dport { $ssh_set } ip6 saddr @ssh_abusers_v6 counter name c_drops_ssh_abusers_v6 drop"
 
         # --- SSH-защита (ТЗ §19–20): только новые соединения; meter = per-source
         if [ "$SH_F_ENABLE_SSH_PROTECTION" = "1" ]; then

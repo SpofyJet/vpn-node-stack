@@ -5,6 +5,8 @@ set -euo pipefail
 
 SHIELD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SHIELD_DIR SHIELD_VERSION=1.0.0
+# guard без root отказывается (nft root-only); тест работает против fake-nft — разрешаем явно
+export SHIELD_GUARD_ALLOW_NONROOT=1
 OUT=/tmp/shieldnode-guard-test
 export SHIELD_STATE_DIR="$OUT/state"
 export SHIELD_LOG="$OUT/shieldnode.log"

@@ -2,7 +2,7 @@
 # shieldnode — main.sh: точка входа, режимы, lock, диспетчеризация (TZ §4, §28).
 set -euo pipefail
 
-SHIELD_VERSION="1.2.4"
+SHIELD_VERSION="1.2.5"
 # readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
 SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
@@ -13,8 +13,9 @@ export DRY_RUN=0
 export LOG_LEVEL=info
 
 usage() {
+    # 2026-10-08: версия из SHIELD_VERSION (в справке застряла 1.2.0 при SHIELD_VERSION=1.2.3)
+    echo "shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v$SHIELD_VERSION"
     cat <<'EOF'
-shieldnode — nftables-фаервол для VPN-нод (Remnawave/Xray). v1.2.0
 
 Использование: shieldnode [опции] <команда> [аргумент]
 

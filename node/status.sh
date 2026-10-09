@@ -83,7 +83,7 @@ node_status() {
     echo "kernel: $(uname -r) $(node_kernel_is_xanmod && echo '[XanMod]' || echo '[stock]')"
     echo "bbr: available=$(node_bbr_available && echo yes || echo no) active=$(node_bbr_active && echo yes || echo no) gen=$(node_bbr_generation) enabled_cfg=$(node_conf_get ENABLE_BBR 1)"
     echo "congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$(dpkg -l 'linux-image*xanmod*' 2>/dev/null | awk '/^ii/{sub(/^linux-image-/, "", $2); o = o (o ? "," : "") $2} END{print o ? o : "none"}' || echo none)$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
+    echo "xanmod: requested=$(node_conf_get ENABLE_XANMOD 1) cpu_level=$(node_cpu_xlevel) installed=$({ dpkg -l 'linux-image*xanmod*' 2>/dev/null || true; } | awk '/^ii/{sub(/^linux-image-/, "", $2); o = o (o ? "," : "") $2} END{print o ? o : "none"}')$( [ "$(node_bbr_generation)" = 3 ] && echo ' | BBRv3 в текущем ядре' || true)"
     # 2026-09-24 (v1.1.5): XanMod, поставленный НЕ по запросу (другим инструментом/вручную),
     # в записи GRUB по умолчанию — следующий reboot молча сменит ядро (ограничение №2)
     local gk; gk="$(node_grub_default_kernel)"
@@ -109,7 +109,7 @@ node_status() {
         echo "reboot: ТРЕБУЕТСЯ (новое ядро установлено $(cat /run/node/reboot-required 2>/dev/null), активно $(uname -r))"
     fi
     source "$NODE_DIR/lib/xray.sh"
-    echo "xray/remnanode sockets: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
+    echo "VPN-ядро слушает: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
     echo "----------------------------------------------------------------------"
     declare -F node_perf_report >/dev/null 2>&1 && node_perf_report "$NODE_STATE_DIR/perf-baseline.txt"
     # 2026-09-27 (v1.2.2): UDP/QUIC — буферы и потери сокетов Xray, память UDP (только чтение)

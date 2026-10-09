@@ -14,6 +14,14 @@ if [ "$(id -u)" -eq 0 ] && [ "${NODE_TEST_IN_NS:-0}" != "1" ] && unshare -mn tru
     NODE_TEST_IN_NS=1 exec unshare -mn bash "$0" "$@"
 fi
 IN_NS="${NODE_TEST_IN_NS:-0}"
+# 2026-10-08: изоляция fail-closed. Раньше при неудаче unshare под root (или без root) тест шёл
+# дальше по ЖИВЫМ путям: node_rollback сносит node-rt-tweaks.sh/udev-правило/юнит ноды.
+if [ "${NODE_TEST_IN_NS:-0}" != "1" ]; then
+    [ "$(id -u)" -eq 0 ] && { echo "SKIP: нет изоляции (unshare) — под root тест тронул бы живую ноду"; exit 77; }
+    for _f in /usr/local/sbin/node-rt-tweaks.sh /etc/udev/rules.d/99-node-rt-hotplug.rules /etc/systemd/system/node-rt-tweaks.service; do
+        [ -e "$_f" ] && { echo "SKIP: на хосте установлен node ($_f) — без изоляции не гоняем"; exit 77; }
+    done
+fi
 if [ "$IN_NS" = "1" ]; then
     for d in /etc/sysctl.d /etc/udev/rules.d /usr/local/sbin; do mkdir -p "$d"; mount -t tmpfs t "$d"; done
 fi

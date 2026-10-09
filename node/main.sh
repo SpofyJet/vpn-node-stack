@@ -3,7 +3,7 @@
 # Modes: apply (default) | status | rollback [id] | detect | uninstall
 set -euo pipefail
 
-NODE_VERSION="1.2.4"
+NODE_VERSION="1.2.5"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NODE_DIR="$SCRIPT_DIR"
 export NODE_STATE_DIR="/var/lib/node"
@@ -18,8 +18,9 @@ ROLLBACK_ID=""
 export DRY_RUN
 
 usage() {
+    # 2026-10-08: версия из NODE_VERSION (была вписана в текст справки и отставала)
+    echo "node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v$NODE_VERSION"
     cat <<'EOF'
-node — оптимизатор ОС/сети для VPN-нод (Remnawave/Xray). v1.2.4
 
 Использование: node [опции] <команда> [аргумент]
 

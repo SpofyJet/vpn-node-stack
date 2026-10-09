@@ -381,8 +381,22 @@ node_kernel_reboot_offer() {
 # node_xanmod_remove — откат ядра (явный вызов, требует reboot для полного эффекта).
 node_xanmod_remove() {
     [ "${DRY_RUN:-0}" = "1" ] && { log info "dry-run" "would purge XanMod kernel"; return 0; }
-    apt-get purge -y 'linux-image*xanmod*' 2>/dev/null || true
+    # 2026-10-09 (v1.2.5): удалять работающее ядро нельзя — prerm пакета отказывает, а `|| true`
+    # глотал отказ: репозиторий и pin снимались, в лог шло «XanMod удалён», ядро оставалось. И без
+    # штатного ядра в системе purge оставил бы GRUB без загружаемого ядра.
+    if node_kernel_is_xanmod; then
+        die "работает ядро XanMod ($(uname -r)) — на ходу не удаляется. Загрузись в штатное ядро (GRUB → Advanced options → …-generic) и повтори"
+    fi
+    dpkg -l 'linux-image-[0-9]*' 2>/dev/null | awk '/^ii/ && $2 !~ /xanmod/ {f = 1} END {exit !f}' \
+        || die "штатного ядра (linux-image-*, не xanmod) в системе нет — без него после purge не загрузиться; поставь linux-image-generic и повтори"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y 'linux-image*xanmod*' 'linux-headers*xanmod*' \
+        || die "apt-get purge XanMod не удался — ничего не снято (репозиторий и GRUB как были)"
     rm -f "$XANMOD_REPO_LIST" "$XANMOD_GPG" "$XANMOD_GPG_LEGACY" /etc/apt/preferences.d/xanmod-kernel
+    # пробная загрузка (98-vpn-node-kernel.cfg: GRUB_DEFAULT=saved + saved_entry на XanMod) и её
+    # подтверждающий юнит больше не нужны — иначе GRUB ищет удалённую запись
+    systemctl disable node-kernel-confirm.service >/dev/null 2>&1 || true
+    rm -f /etc/default/grub.d/98-vpn-node-kernel.cfg /etc/systemd/system/node-kernel-confirm.service /usr/local/sbin/node-kernel-confirm.sh
+    command -v grub-editenv >/dev/null 2>&1 && grub-editenv - unset saved_entry next_entry 2>/dev/null || true
     # восстанавливаем grub-файл из нашего последнего backup (if-guard: &&-цепочка
     # под set -e убила бы скрипт при отсутствии бэкапа)
     local g; g="$(ls -1t /etc/default/grub.pre-node-* 2>/dev/null | head -1 || true)"

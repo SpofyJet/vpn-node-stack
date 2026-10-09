@@ -193,6 +193,8 @@ UUID=bbbb /boot/efi vfat rw,relatime,fmask=0022,discard 0 1
 UUID=cccc none swap sw 0 0
 UUID=dddd /data xfs rw,noatime 0 0
 UUID=eeee /var ext4 defaults 0 2
+UUID=ffff /srv ext4 rw,strictatime 0 2
+UUID=gggg /opt ext4 rw,norelatime,discard=async 0 2
 EOF
 NODE_FSTAB="$FAKE_FSTAB" node_noatime_apply   # persist реально пишет fixture (в /tmp)
 t "fstab: relatime+discard -> noatime, discard снят" bash -c "grep -qE '/ ext4 rw,noatime,errors=remount-ro' '$FAKE_FSTAB'"
@@ -200,6 +202,9 @@ t "fstab: efi discard снят, noatime встал" bash -c "grep -qE '/boot/efi
 t "fstab: swap не тронут" bash -c "grep -qE 'none swap sw 0 0' '$FAKE_FSTAB'"
 t "fstab: уже-noatime строка не изменилась" bash -c "grep -qE '/data xfs rw,noatime 0 0' '$FAKE_FSTAB'"
 t "fstab: defaults получил noatime (раньше был молчаливый no-op)" bash -c "grep -qE '/var ext4 defaults,noatime' '$FAKE_FSTAB'"
+# 2026-10-09 (v1.2.5): опции — целыми токенами (раньше подстроки: strictnoatime/nonoatime/«=async»)
+t "fstab: strictatime -> noatime (не strictnoatime)" bash -c "grep -qE '/srv ext4 rw,noatime 0 2' '$FAKE_FSTAB'"
+t "fstab: norelatime -> noatime, discard=async снят целиком" bash -c "grep -qE '/opt ext4 rw,noatime 0 2' '$FAKE_FSTAB' && ! grep -qE 'nonoatime|strictnoatime|=async' '$FAKE_FSTAB'"
 
 # --- сценарий 10b: полностью готовый fstab — файл не трогаем (нет backup/no-op) ---
 FAKE_FSTAB2="$(mktemp)"

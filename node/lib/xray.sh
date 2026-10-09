@@ -58,12 +58,16 @@ node_xray_verify_unchanged() {
     return 0
 }
 
-# node_xray_sockets_summary — сколько сокетов держит процесс xray/remnanode (read-only).
+# node_xray_sockets_summary — сколько слушающих сокетов держит VPN-ядро (rw-core/xray; read-only).
 # Используется в status: факт «сервис жив и слушает» без чтения его конфигурации (ТЗ §30).
 node_xray_sockets_summary() {
     command -v ss >/dev/null 2>&1 || { echo "ss missing"; return 0; }
     local t u
-    t="$(ss -tlnp 2>/dev/null | awk '/xray|remnanode/{n++} END{print n+0}')"
-    u="$(ss -ulnp 2>/dev/null | awk '/xray|remnanode/{n++} END{print n+0}')"
+    # 2026-10-08 (v1.2.5): в remnawave/node ядро Xray — процесс «rw-core» (API ноды — «rw-node»);
+    # прежний шаблон xray|remnanode на живой ноде всегда давал tcp:0 udp:0. UDP: только порты ниже
+    # ip_local_port_range — остальные UNCONN-сокеты rw-core это исходящие потоки клиентов (тысячи).
+    local lo; lo="$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || true)"
+    t="$(ss -tlnp 2>/dev/null | awk '/"(xray|rw-core|sing-box|hysteria|v2ray)"/{n++; p = $4; sub(/.*:/, "", p); l = l (l ? "," : "") p} END{print n+0 (l ? " [" l "]" : "")}')"
+    u="$(ss -ulnp 2>/dev/null | awk -v lo="${lo:-32768}" '/"(xray|rw-core|sing-box|hysteria|v2ray)"/{p = $4; sub(/.*:/, "", p); if (p + 0 < lo) {n++; l = l (l ? "," : "") p}} END{print n+0 (l ? " [" l "]" : "")}')"
     echo "tcp:$t udp:$u"
 }

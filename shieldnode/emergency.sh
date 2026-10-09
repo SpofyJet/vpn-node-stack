@@ -44,6 +44,12 @@ EOF
     for p in $ssh_ports; do
         echo "        tcp dport $p ct state new accept"
     done
+    # 2026-10-09 (v1.2.5): VPN продолжает принимать клиентов (EMERGENCY_KEEP_VPN=1, дефолт), API ноды —
+    # только панели. Раньше новые подключения к инбаундам резались тоже: авто-emergency (apply упал и
+    # backup не поднялся) превращался в отказ VPN для всех новых клиентов и потерю связи с панелью.
+    [ -n "${EMERG_VPN_TCP:-}" ] && echo "        tcp dport { ${EMERG_VPN_TCP// /, } } ct state new accept"
+    [ -n "${EMERG_VPN_UDP:-}" ] && echo "        udp dport { ${EMERG_VPN_UDP// /, } } accept"
+    [ -n "${EMERG_API_PORT:-}" ] && [ -n "${EMERG_API_ALLOW:-}" ] && echo "        tcp dport ${EMERG_API_PORT} ip saddr { ${EMERG_API_ALLOW// /, } } accept"
     cat <<'EOF'
         ip protocol tcp drop
         ip protocol udp drop
@@ -55,11 +61,39 @@ EOF
 EOF
 }
 
+# shield_emergency_vpn_ports — порты, которые аварийный режим оставляет открытыми (EMERG_*):
+# инбаунды VPN-ядра (детект как у apply; в контексте apply — уже готовый), иначе контракт
+# [shieldnode] последнего apply; API ноды — только TRUSTED_IPS + источники UFW (как в apply).
+shield_emergency_vpn_ports() {
+    EMERG_VPN_TCP="" EMERG_VPN_UDP="" EMERG_API_PORT="" EMERG_API_ALLOW=""
+    [ "$(shield_conf_get EMERGENCY_KEEP_VPN 1)" = "1" ] || { log warn "emergency" "EMERGENCY_KEEP_VPN=0 — новые подключения к VPN тоже режутся"; return 0; }
+    [ "${SH_IB_DONE:-0}" = 1 ] || { declare -F shield_detect_inbounds >/dev/null && shield_detect_inbounds >/dev/null 2>&1 || true; }
+    local t="${SH_IB_TCP:-}" u="${SH_IB_UDP:-}" api="${SH_IB_API_PORT:-}" c="${SHIELD_CONTRACT:-/etc/node-profile.d/stack.conf}" p a
+    if [ -z "$t$u" ] && [ -r "$c" ]; then
+        t="$(awk -F= '/^\[/{s=($0=="[shieldnode]")} s && $1=="inbound_tcp"{print $2}' "$c" | tr ',' ' ')"
+        u="$(awk -F= '/^\[/{s=($0=="[shieldnode]")} s && $1=="inbound_udp"{print $2}' "$c" | tr ',' ' ')"
+        [ -n "$api" ] || api="$(awk -F= '/^\[/{s=($0=="[shieldnode]")} s && $1=="node_api_port"{print $2}' "$c")"
+    fi
+    for p in $t; do shield_port_valid "$p" && [ "$p" != "$api" ] && EMERG_VPN_TCP="$EMERG_VPN_TCP $p"; done
+    for p in $u; do shield_port_valid "$p" && EMERG_VPN_UDP="$EMERG_VPN_UDP $p"; done
+    if [ -n "$api" ] && shield_port_valid "$api"; then
+        EMERG_API_PORT="$api"
+        for a in $(shield_conf_get TRUSTED_IPS "") $(shield_detect_ufw_sources tcp "$api" 2>/dev/null); do
+            case "$a" in *:*) continue ;; esac
+            shield_valid_cidr "$a" || continue
+            case " $EMERG_API_ALLOW " in *" $a "*) ;; *) EMERG_API_ALLOW="$EMERG_API_ALLOW $a" ;; esac
+        done
+    fi
+    EMERG_VPN_TCP="${EMERG_VPN_TCP# }" EMERG_VPN_UDP="${EMERG_VPN_UDP# }" EMERG_API_ALLOW="${EMERG_API_ALLOW# }"
+    export EMERG_VPN_TCP EMERG_VPN_UDP EMERG_API_PORT EMERG_API_ALLOW
+    log warn "emergency" "VPN остаётся доступен: tcp=[${EMERG_VPN_TCP}] udp=[${EMERG_VPN_UDP}]; API ноды :${EMERG_API_PORT:-—} — только [${EMERG_API_ALLOW}]"
+}
+
 shield_emergency() {
     local action="${1:-}" reason="${2:-manual}"
     case "$action" in
         on)
-            log warn "emergency" "ВКЛЮЧЁН аварийный режим ($reason): только established/whitelist/SSH"
+            log warn "emergency" "ВКЛЮЧЁН аварийный режим ($reason): established/whitelist/SSH + инбаунды VPN, всё прочее новое — drop"
             shield_nft_available
             # резолвим минимум: SSH-порты и admin IP (если limits_resolve не отрабатывал)
             [ -z "${SH_F_SSH_PORTS:-}" ] && SH_F_SSH_PORTS="$(shield_detect_ssh_ports)"
@@ -71,6 +105,7 @@ shield_emergency() {
                     *)   SH_F_ADMIN_V4="$a" ;;
                 esac
             fi
+            shield_emergency_vpn_ports
             local tmp bdump
             tmp="$(mktemp /run/shieldnode-emerg.XXXXXX.nft)"
             shield_emergency_ruleset > "$tmp"
