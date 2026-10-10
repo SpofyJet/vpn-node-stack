@@ -609,7 +609,9 @@ t "crowdsec-agent: минимум для локальной БД = 0 (feed — 5
 # при «застрявшем» демоне (>10 мин, зарегистрирован) — один рестарт в час, максимум 3.
 mkdir -p "$OUT/bin-cs"
 printf '#!/bin/bash\ncase "$*" in "decisions list"*) echo null ;; "capi status") exit 0 ;; *) exit 1 ;; esac\n' > "$OUT/bin-cs/cscli"
-printf '#!/bin/bash\necho "$*" >> "%s/systemctl.calls"\ncase "$1" in is-active) exit 0 ;; show) echo 0 ;; esac\nexit 0\n' "$OUT" > "$OUT/bin-cs/systemctl"
+printf '#!/bin/bash\necho "$*" >> "%s/systemctl.calls"\ncase "$1" in is-active) exit 0 ;; show) awk "{print int((\\$1 - 700) * 1000000)}" /proc/uptime ;; esac\nexit 0\n' "$OUT" > "$OUT/bin-cs/systemctl"
+# 2026-10-10: «демон работает 700 с» — всегда, независимо от аптайма хоста (раньше echo 0: since = аптайм
+# хоста, и тест падал на машине, загруженной меньше 10 минут назад: cs_kick_if_stuck ждёт >= 600 с)
 chmod +x "$OUT/bin-cs/"*
 echo "185.220.101.9/32" > "$OUT/nftdb/set_crowdsec_blocklist_v4"
 rm -f "$SHIELD_BLOCKLIST_STATE/fails-crowdsec.cnt" "$SHIELD_BLOCKLIST_STATE/.alert-crowdsec" "$SHIELD_BLOCKLIST_STATE/cs-restarts" "$OUT/systemctl.calls"

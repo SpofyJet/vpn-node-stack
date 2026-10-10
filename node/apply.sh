@@ -290,7 +290,14 @@ node_rt_boot_persist() {
         # старт docker-контейнера, netns тестов), bridge и dummy — не NIC и noqueue: раньше
         # каждый veth = полный rt-reapply с перезаписью файлов node (найдено на живой ноде).
         # По драйверу (ID_NET_DRIVER из 80-net-setup-link), не по имени: имена произвольны.
-        echo 'ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}!="veth|bridge|dummy", TAG+="systemd", ENV{SYSTEMD_WANTS}="node-rt-tweaks.service", RUN+="/bin/systemctl restart node-rt-tweaks.service"'
+        # 2026-10-10 (v1.2.6): --no-block ОБЯЗАТЕЛЕН. Раньше RUN+="systemctl restart …" блокировал
+        # udev-воркер до конца юнита, а юнит стоит After=network-online.target; network-online ждёт
+        # networking.service -> ifupdown-pre.service -> `udevadm settle` (ждёт пустую очередь udev):
+        # взаимная блокировка до таймаута settle 120 с — каждая перезагрузка +2 минуты без сети
+        # (журнал: «Spawned process '/bin/systemctl restart node-rt-tweaks.service' is taking longer
+        # than 59s», ifupdown-pre: «Timed out for waiting the udev queue being empty»). С --no-block
+        # systemctl ставит задание в очередь и сразу возвращается; порядок After= сохраняется.
+        echo 'ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}!="veth|bridge|dummy", TAG+="systemd", ENV{SYSTEMD_WANTS}="node-rt-tweaks.service", RUN+="/bin/systemctl --no-block restart node-rt-tweaks.service"'
     } | node_persist "$udev"
     # /run — tmpfs: после reboot /run/node нет, а под ProtectSystem=strict unit
     # сам его не создаст (flock-путь). systemd-tmpfiles-setup создаёт его рано при

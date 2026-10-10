@@ -32,13 +32,18 @@ node_udp_health() {
     local mem pressure rcvbuf ring
     mem="$(awk '/^UDP:/ { for (i = 1; i < NF; i++) if ($i == "mem") print $(i + 1) }' /proc/net/sockstat 2>/dev/null || true)"
     pressure="$(awk '{print $2}' /proc/sys/net/ipv4/udp_mem 2>/dev/null || true)"
+    local indg share
     rcvbuf="$(awk '/^Udp:/ { c++; if (c == 1) for (i = 2; i <= NF; i++) h[i] = $i; else for (i = 2; i <= NF; i++) if (h[i] == "RcvbufErrors") print $i }' /proc/net/snmp 2>/dev/null || true)"
+    # 2026-10-10 (v1.2.6): доля потерь — голое «814983 с загрузки» без знаменателя выглядело аварией,
+    # а на живой ноде это 0.03–0.07% UDP (исходящие потоки клиентов, QUIC сам перепосылает)
+    indg="$(awk '/^Udp:/ { c++; if (c == 1) for (i = 2; i <= NF; i++) h[i] = $i; else for (i = 2; i <= NF; i++) if (h[i] == "InDatagrams") print $i }' /proc/net/snmp 2>/dev/null || true)"
+    share="$(awk -v e="${rcvbuf:-0}" -v d="${indg:-0}" 'BEGIN { if (d + e > 0) printf "%.3f%%", 100 * e / (d + e); else print "?" }')"
     ring="$(command -v ethtool >/dev/null 2>&1 && ethtool -g "$(node_default_iface)" 2>/dev/null \
         | awk '/Pre-set maximums/ {s = "max"} /Current hardware settings/ {s = "cur"} $1 == "RX:" && s != "" && !seen[s]++ { v[s] = $2 } END { if (v["cur"] != "") print v["cur"] "/" v["max"] }' || true)"
     # ^ || true: ethtool -g не поддерживается частью виртуальных NIC — под set -e status обрывался (тест)
-    printf 'UDP (QUIC/Hysteria2): память UDP %s стр. из порога давления %s (%s%%); RcvbufErrors с загрузки: %s; NIC RX-кольцо %s\n' \
+    printf 'UDP (QUIC/Hysteria2): память UDP %s стр. из порога давления %s (%s%%); RcvbufErrors с загрузки: %s (%s принятого UDP; < 0.5%% — норма); NIC RX-кольцо %s\n' \
         "${mem:-?}" "${pressure:-?}" "$(awk -v m="${mem:-0}" -v p="${pressure:-0}" 'BEGIN { printf (p > 0 ? "%.1f" : "?"), (p > 0 ? m * 100 / p : 0) }')" \
-        "${rcvbuf:-?}" "${ring:-нет данных}"
+        "${rcvbuf:-?}" "$share" "${ring:-нет данных}"
     # UDP-сокеты прокси: пара строк ss — «UNCONN … local … users:((\"rw-core\",…))» + «skmem:(r…,rb…,…,d…)»
     # 2026-10-08 (v1.2.5): сводка вместо строки на сокет. На живой ноде у rw-core ~3000 UDP-сокетов —
     # это исходящие потоки клиентов (DNS/QUIC через freedom), status разрастался до 3000+ строк.
@@ -62,8 +67,14 @@ node_udp_health() {
             server = (port > 0 && port < lo)
             if (d > 0 || (rb > 0 && r * 2 >= rb) || server) {
                 if (d > 0) {
-                    hint = (rb < 16777216) ? " — буфер меньше, чем просит quic-go (8 МиБ): rmem_max >= 8388608 или cap NET_ADMIN у контейнера" \
-                                           : " — буфер полный по размеру: Xray не успевает читать (CPU/steal), не память"
+                    # 2026-10-10 (v1.2.6): подсказка про quic-go/NET_ADMIN — только для СЕРВЕРНЫХ сокетов
+                    # (инбаунд Hysteria2). Эфемерный сокет — исходящий UDP-поток клиента (QUIC/видео):
+                    # всплеск сверх дефолтного буфера; поднимать rmem_default = задержка real-time трафика
+                    if (!server)
+                        hint = " — исходящий UDP-поток клиента (QUIC/видео): кратковременный всплеск, QUIC перепосылает сам; буфер не поднимаем (задержка звонков/игр)"
+                    else
+                        hint = (rb < 16777216) ? " — буфер меньше, чем просит quic-go (8 МиБ): rmem_max >= 8388608 или cap NET_ADMIN у контейнера" \
+                                               : " — буфер полный по размеру: Xray не успевает читать (CPU/steal), не память"
                     line = sprintf("  ПОТЕРИ: сокет %s (%s): буфер %s, в очереди %d Б, потеряно %d пакетов%s", loc, proc, human(rb), r, d, hint)
                 } else
                     line = sprintf("  сокет %s (%s%s): буфер %s, в очереди %d Б, потерь 0 — ok", loc, proc, server ? ", инбаунд" : "", human(rb), r)

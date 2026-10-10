@@ -111,7 +111,10 @@ t "logrotate: copytruncate + size" 'grep -q "copytruncate" /tmp/node-irt-test/ou
 # node_rt_boot_persist уже вызван выше (FQ_TUNE=1) — правило должно было эмититься
 t "udev: hotplug rule создано" 'test -f /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules'
 t "udev: ловит add net и триггерит unit" 'grep -q "ACTION==\"add\"" /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules && grep -q "SUBSYSTEM==\"net\"" /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules && grep -q "node-rt-tweaks.service" /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules'
-t "udev: restart для уже-активного unit" 'grep -q "systemctl restart node-rt-tweaks.service" /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules'
+# 2026-10-10 (v1.2.6): restart в RUN+= БЕЗ --no-block блокирует udev на время After=network-online.target
+# -> взаимная блокировка с ifupdown-pre (udevadm settle): +2 минуты к каждой загрузке
+t "udev: restart для уже-активного unit — с --no-block" 'grep -q "RUN+=\"/bin/systemctl --no-block restart node-rt-tweaks.service\"" /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules'
+t "udev: нет блокирующего restart (иначе дедлок с ifupdown-pre на загрузке)" '! grep -qE "RUN\+=\"/bin/systemctl restart" /tmp/node-irt-test/out/etc/udev/rules.d/99-node-rt-hotplug.rules'
 # 2026-09-24 (v1.1.5): veth (старт каждого docker-контейнера, netns тестов), bridge, dummy
 # не NIC — раньше каждый veth = полный rt-reapply; фильтр по драйверу (имена произвольны),
 # tun/tap VPN по-прежнему ловятся
