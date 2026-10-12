@@ -80,7 +80,7 @@ printf 'HOME=/home/a\0SSH_CONNECTION=203.0.113.7 51000 10.0.0.5 22\0' > "$FP/40/
 SSH_CONNECTION= SHIELD_PROC="$FP" SHIELD_ADMIN_PID=100 shield_limits_resolve >/dev/null 2>&1
 t "UDP: protected_udp = локальный порт 8443 (не 0.0.0.0:*)" '[ "$SH_F_PROTECTED_UDP" = 8443 ]'
 t "whitelist_v4 содержит admin"                 '[ "$SH_F_ADMIN_V4" = 203.0.113.7 ]'
-SH_F_IPV6=1 shield_nft_build_ruleset > "$OUT/rs.nft"
+shield_nft_build_ruleset > "$OUT/rs.nft"
 t "ruleset: в сетах только адреса/порты"       '! awk "/elements = \\{/{sub(/.*elements = \\{ */,\"\"); sub(/ *\\}.*/,\"\"); n=split(\$0,a,/, */); for(i=1;i<=n;i++) if (a[i] !~ /^([0-9.]+(\\/[0-9]+)?|[0-9a-fA-F:]+(\\/[0-9]+)?|[0-9]+)\$/) {print a[i]; bad=1}} END{exit !bad}" "$OUT/rs.nft"'
 
 # ---------- scrub ----------

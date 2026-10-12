@@ -146,7 +146,9 @@ HEADER_EOF
         printf 'BL_MIN_spamhaus="%s"\n' "$(_bl_num MIN_ENTRIES_SPAMHAUS "$(shield_conf_get MIN_ENTRIES_SPAMHAUS 50)" 50)"
         printf 'BL_MIN_cins="%s"\n' "$(_bl_num MIN_ENTRIES_CINS "$(shield_conf_get MIN_ENTRIES_CINS 2000)" 2000)"
         printf 'BL_MAX_scanner=100000\nBL_MAX_threat=200000\nBL_MAX_tor=10000\nBL_MAX_custom=50000\nBL_MAX_crowdsec=400000\nBL_MAX_spamhaus=20000\nBL_MAX_cins=200000\n'
-        # размер сетов (для tmp-сета при атомарном swap — должен совпадать с firewall)
+        # размер сетов — ёмкость в ЗАПИСЯХ (после CIDR-агрегации). Генератор объявляет
+        # сеты size 2*<X>_BLOCKLIST_SIZE+1 (interval-сет: узел начала + узел конца,
+        # см. lib/nft.sh); updater сверяет ёмкость ДО заливки (8b): больше — set не тронут
         printf 'BL_SIZE_scanner="%s"\nBL_SIZE_threat="%s"\nBL_SIZE_tor="%s"\nBL_SIZE_custom="%s"\nBL_SIZE_crowdsec="%s"\nBL_SIZE_spamhaus="%s"\nBL_SIZE_cins="%s"\n' \
             "${SH_R_SCANNER_BLOCKLIST_SIZE:-262144}" "${SH_R_THREAT_BLOCKLIST_SIZE:-131072}" \
             "${SH_R_TOR_BLOCKLIST_SIZE:-16384}" "${SH_R_CUSTOM_BLOCKLIST_SIZE:-65536}" \
@@ -154,9 +156,11 @@ HEADER_EOF
             "${SH_R_CINS_BLOCKLIST_SIZE:-65536}"
         # min-prefix v4/v6: threat — /16 (анти-compromise), scanner/custom — /8,
         # tor — только /32 (single IPs) / v6 /128, crowdsec — /24 (CAPI отдаёт
-        # одиночные IP, но консольные листы могут содержать CIDR)
+        # одиночные IP, но консольные листы могут содержать CIDR).
+        # BL_MINP6_cins нет: CINS — v4-only фид, сет cins_blocklist_v6 не создаётся
+        # (lib/nft.sh) — v6-парсинг для cins мёртв и updater его пропускает (шаг 5)
         printf 'BL_MINP4_scanner=8 BL_MINP4_threat=16 BL_MINP4_tor=32 BL_MINP4_custom=8 BL_MINP4_crowdsec=24 BL_MINP4_spamhaus=16 BL_MINP4_cins=20\n'
-        printf 'BL_MINP6_scanner=24 BL_MINP6_threat=29 BL_MINP6_tor=128 BL_MINP6_custom=24 BL_MINP6_crowdsec=64 BL_MINP6_spamhaus=32 BL_MINP6_cins=64\n'
+        printf 'BL_MINP6_scanner=24 BL_MINP6_threat=29 BL_MINP6_tor=128 BL_MINP6_custom=24 BL_MINP6_crowdsec=64 BL_MINP6_spamhaus=32\n'
         # crowdsec interval: feed — community-тариф не чаще 1 pull/24ч (иначе 429);
         # agent — читаем ЛОКАЛЬНУЮ БД демона (демон сам тянет CAPI ~раз/2ч),
         # дефолт 30 мин без риска рейт-лимита. Ключи разведены: у feed своё,
@@ -566,33 +570,41 @@ update_list() { # update_list <name>
         return 1
     fi
 
-    # 5) парсинг v6 (v6-часть часто 0 — это не ошибка, min-check к v6 не применяем)
-    grep -oiE '^[[:space:]]*([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(/[0-9]{1,3})?' "$tmp/all.raw" 2>/dev/null | \
-        awk '{ sub(/^[[:space:]]+/, ""); print tolower($0) }' | \
-        awk -v minp="$minp6" '
-        {
-            raw = $0; addr = raw; pfx = 128; hascidr = 0
-            if (index(raw, "/") > 0) { split(raw, a, "/"); addr = a[1]; pfx = a[2] + 0; hascidr = 1 }
-            if (pfx < minp || pfx > 128) next
-            if (addr == "::" || addr == "::1") next
-            if (addr ~ /^fe[89ab]/) next
-            if (addr ~ /^f[cd]/)    next
-            if (addr ~ /^ff/)       next
-            if (addr ~ /^2001:0?db8:/) next
-            if (addr ~ /^::ffff:/)  next
-            if (addr ~ /^64:ff9b:/) next
-            if (addr !~ /:/) next
-            if (addr ~ /:$/ && addr !~ /::$/) next
-            if (addr ~ /^:/  && addr !~ /^::/) next
-            tmp = addr; ncol = gsub(/:/, ":", tmp)
-            if (addr ~ /::/) { if (ncol > 7) next } else { if (ncol != 7) next }
-            print (hascidr ? addr "/" pfx : addr)
-        }' | sort -u > "$tmp/parsed6.list"
-    local v6_count
-    v6_count=$(wc -l < "$tmp/parsed6.list"); v6_count="${v6_count:-0}"
-    if [ "$v6_count" -gt "$max_entries" ]; then
-        bl_log warn "$name: v6 count=$v6_count > cap — v6 пропущен"
-        : > "$tmp/parsed6.list"; v6_count=0
+    # 5) парсинг v6 — только если в таблице есть v6-компаньон сета (проверка та же,
+    #    что у заливки в шаге 9). v6-часть часто 0 — это не ошибка, min-check к v6
+    #    не применяем. CINS — v4-only фид: сет cins_blocklist_v6 by design не создаётся
+    #    (lib/nft.sh), парсить его v6 — мёртвая работа (результат некуда заливать);
+    #    таблица от старой версии (v6-сеты ещё есть) — v6 по-прежнему наполняется.
+    local v6_count=0
+    if nft list set $TABLE "$set_v6" >/dev/null 2>&1; then
+        grep -oiE '^[[:space:]]*([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(/[0-9]{1,3})?' "$tmp/all.raw" 2>/dev/null | \
+            awk '{ sub(/^[[:space:]]+/, ""); print tolower($0) }' | \
+            awk -v minp="$minp6" '
+            {
+                raw = $0; addr = raw; pfx = 128; hascidr = 0
+                if (index(raw, "/") > 0) { split(raw, a, "/"); addr = a[1]; pfx = a[2] + 0; hascidr = 1 }
+                if (pfx < minp || pfx > 128) next
+                if (addr == "::" || addr == "::1") next
+                if (addr ~ /^fe[89ab]/) next
+                if (addr ~ /^f[cd]/)    next
+                if (addr ~ /^ff/)       next
+                if (addr ~ /^2001:0?db8:/) next
+                if (addr ~ /^::ffff:/)  next
+                if (addr ~ /^64:ff9b:/) next
+                if (addr !~ /:/) next
+                if (addr ~ /:$/ && addr !~ /::$/) next
+                if (addr ~ /^:/  && addr !~ /^::/) next
+                tmp = addr; ncol = gsub(/:/, ":", tmp)
+                if (addr ~ /::/) { if (ncol > 7) next } else { if (ncol != 7) next }
+                print (hascidr ? addr "/" pfx : addr)
+            }' | sort -u > "$tmp/parsed6.list"
+        v6_count=$(wc -l < "$tmp/parsed6.list"); v6_count="${v6_count:-0}"
+        if [ "$v6_count" -gt "$max_entries" ]; then
+            bl_log warn "$name: v6 count=$v6_count > cap — v6 пропущен"
+            : > "$tmp/parsed6.list"; v6_count=0
+        fi
+    else
+        : > "$tmp/parsed6.list"
     fi
 
     # 6) min-check: меньше ожидаемого — деградировавший фид, НЕ применяем

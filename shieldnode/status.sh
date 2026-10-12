@@ -36,8 +36,7 @@ _h_port_in() {
     return 1
 }
 _h_set_elems() { # <set> -> элементы через пробел (многострочный вывод nft)
-    nft -n list set inet shieldnode "$1" 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")}
-        f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
+    nft_set_elems_raw "$1" | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
 }
 
 shield_health() {
@@ -62,14 +61,16 @@ shield_health() {
     for ch in prerouting v6_output; do   # v1.2.0: цепочки input больше нет (пустой хук)
         if nft list chain inet shieldnode "$ch" >/dev/null 2>&1; then _hc PASS "chain $ch есть"; else _hc FAIL "chain $ch отсутствует"; fi
     done
-    n="$(awk '/ drop( |$)/ {c++} END {print c + 0}' <<<"$pre")"
+    # 2026-10-12: комментарии ruleset'а тоже матчат « drop» (генератор пишет «-> drop») —
+    # без отсечения # счётчики врали на единицу
+    n="$(awk '!/^[[:space:]]*#/ && / drop( |$)/ {c++} END {print c + 0}' <<<"$pre")"
     if [ "$n" -gt 0 ]; then _hc PASS "prerouting: $n drop-правил"; else _hc FAIL "prerouting без drop-правил — политика пуста"; fi
 
     # порядок: accept'ы до первого drop
     local d est lo wl
     # 2026-09-25 (v1.2.0): IPv6 fail-safe и ограничение API ноды стоят ДО established/whitelist
-    # намеренно — в «первый drop» не считаются
-    d="$(awk '!f && / drop( |$)/ && !/c_drops_ipv6_failsafe|c_drops_nodeapi/ {print NR; f = 1}' <<<"$pre")"; d="${d:-999999}"
+    # намеренно — в «первый drop» не считаются; строки-комментарии — тоже (2026-10-12)
+    d="$(awk '!/^[[:space:]]*#/ && !f && / drop( |$)/ && !/c_drops_ipv6_failsafe|c_drops_nodeapi/ {print NR; f = 1}' <<<"$pre")"; d="${d:-999999}"
     est="$(awk '!f && /ct state established,related accept/ {print NR; f = 1}' <<<"$pre")"
     lo="$(awk '!f && /iif(name)? "lo" accept/ {print NR; f = 1}' <<<"$pre")"
     wl="$(awk '!f && /@whitelist_v4 accept/ {print NR; f = 1}' <<<"$pre")"
@@ -159,7 +160,7 @@ shield_health() {
     fi
     # 2026-09-25 (v1.2.0): реальные инбаунды — тем же детектором, что apply/ports-sync (конфиг
     # Xray через API). Эфемерные UDP-сокеты исходящих потоков — НЕ слушатели (DIAGNOSIS P0-1).
-    SH_IB_DONE=0; shield_detect_inbounds
+    # SH_IB_* — из shield_detect_inbounds выше (между вызовами только читаются — дубль не нужен)
     lt="$SH_IB_TCP${SH_IB_API_PORT:+ $SH_IB_API_PORT}"; lu="$SH_IB_UDP"
     for p in $lt; do _h_port_in "$p" "$pt" || { _hc WARN "инбаунд $p/tcp не в protected_tcp — без abuse-лимитов (подхватится автоматически за ≤1 мин; иначе: sudo vpn-node → «Применить фаервол»)"; bad=1; }; done
     for p in $lu; do _h_port_in "$p" "$pu" || { _hc WARN "инбаунд $p/udp не в protected_udp — без abuse-лимитов (подхватится автоматически за ≤1 мин)"; bad=1; }; done

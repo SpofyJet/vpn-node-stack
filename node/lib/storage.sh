@@ -30,10 +30,14 @@ node_storage_apply() {
         else
             log info "storage" "THP sysfs недоступен — пропуск"
         fi
-        {
-            echo "# node: THP=madvise (boot-persist, managed by node)"
-            echo "w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise"
-        } | node_persist /etc/tmpfiles.d/node-thp-madvise.conf
+        # tmpfiles.d-пERSIST — только если THP в ядре есть: иначе файл писался
+        # на несуществующий путь (ядра без /sys/kernel/mm/transparent_hugepage)
+        if [ -d /sys/kernel/mm/transparent_hugepage ]; then
+            {
+                echo "# node: THP=madvise (boot-persist, managed by node)"
+                echo "w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise"
+            } | node_persist /etc/tmpfiles.d/node-thp-madvise.conf
+        fi
     fi
 
     # --- I/O scheduler=none для non-rotational (гипервизор уже шедулит) ---
@@ -59,7 +63,10 @@ node_storage_apply() {
         # ТОЛЬКО разделы (у разделов нет queue/scheduler) и не покрывал
         # vd*/xvd*/nvme* — правило было мёртвым.
         # Правило 1: virtio (vd/xvd) — без проверки rotational (бывает misreport=1).
-        # Правило 2: sd/nvme/mmcblk — только rotational==0 (реальные HDD не трогаем).
+        # Правило 2: sd/nvme/mmcblk/dm/md — только rotational==0 (реальные HDD не трогаем).
+        # dm-*|md* добавлены 2026-10-12: runtime-цикл выше ставит none на ЛЮБОЙ
+        # non-rotational девайс, включая dm/md, — без правила после reboot scheduler
+        # на dm-нодах молча откатывался к дефолту ядра.
         # Guard ATTR{queue/scheduler}=="*none*": только если none поддерживается.
         {
             echo "# node: I/O scheduler=none для SSD/virtio дисков VPS (managed by node)"
@@ -67,7 +74,7 @@ node_storage_apply() {
             echo 'ACTION=="add|change", KERNEL=="vd[a-z]|xvd[a-z]", \'
             echo '    ATTR{queue/scheduler}=="*none*", \'
             echo '    ATTR{queue/scheduler}="none"'
-            echo 'ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]n[0-9]|mmcblk[0-9]", \'
+            echo 'ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]n[0-9]|mmcblk[0-9]|dm-*|md*", \'
             echo '    ATTR{queue/rotational}=="0", ATTR{queue/scheduler}=="*none*", \'
             echo '    ATTR{queue/scheduler}="none"'
         } | node_persist /etc/udev/rules.d/99-node-io-scheduler.rules

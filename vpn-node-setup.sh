@@ -48,8 +48,12 @@ SHIELD_CONF="${VPN_STACK_SHIELD_CONF:-/etc/shieldnode/config.conf}"
 NODE_CONF="${VPN_STACK_NODE_CONF:-/etc/node/node.conf}"
 
 say()  { printf '%s\n' "$*"; }
-die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
-warn() { printf 'ВНИМАНИЕ: %s\n' "$*" >&2; }
+die()  {
+    # открытая строка этапа (компактный режим) — закрываем ✘, чтобы ошибка не прилипла к ней
+    [ "${STAGE_OPEN:-0}" = 1 ] && { printf '%s✘%s\n' "${C_R:-}" "${C_0:-}"; STAGE_OPEN=0; }
+    printf '%sОШИБКА:%s %s\n' "${C_R:-}" "${C_0:-}" "$*" >&2; exit 1
+}
+warn() { printf '%sВНИМАНИЕ:%s %s\n' "${C_Y:-}" "${C_0:-}" "$*" >&2; }
 
 # sanity WORK_DIR (после die()): не даём rm -rf снести корень или системную
 # папку — WORK_DIR обязан быть путём минимум из двух компонентов (/opt/vpn-node-stack)
@@ -79,7 +83,7 @@ stack_main() {
         esac
     done
     case "$CMD" in
-        apply|status|detect|rollback|uninstall|install|emergency|guard) : ;;
+        apply|status|detect|rollback|uninstall|emergency|guard) : ;;
         *) die "неизвестная команда '$CMD' (ожидалось: menu|apply|status|detect|rollback|emergency|guard|diag|uninstall)" ;;
     esac
     # --verbose — только установщику (стеки его не знают: shieldnode отвечает exit 64)
@@ -91,7 +95,7 @@ stack_main() {
     # стеков — в файл, хвост журнала — при ошибке. В терминале по умолчанию; --verbose или
     # VPN_STACK_QUIET=0 — полный вывод; без терминала (CI) — полный вывод, как прежде.
     QUIET=0
-    if [ "$CMD" = apply ] || [ "$CMD" = install ]; then
+    if [ "$CMD" = apply ]; then
         case "${VPN_STACK_QUIET:-auto}" in
             1) [ "$verbose" = 0 ] && QUIET=1 ;;   # --verbose сильнее
             auto) [ "$verbose" = 0 ] && [ -t 1 ] && QUIET=1 ;;
@@ -103,13 +107,6 @@ stack_main() {
         printf '\n===== %s vpn-node-setup v%s: %s =====\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$VERSION" "$*" >> "$SETUP_LOG"
         # в компактном режиме стеки не спрашивают (stdin=/dev/null): reboot предлагает установщик в итоге
         export NODE_NO_REBOOT_PROMPT=1
-    fi
-    # 2026-09-23: `install` не знает ни один из стеков — shieldnode падал, авто-откат
-    # снимал рабочий фаервол. Это алиас apply: подменяем слово в пробрасываемых аргументах.
-    if [ "$CMD" = "install" ]; then
-        CMD="apply"; _args=()
-        for a in "$@"; do if [ "$a" = "install" ]; then _args+=("apply"); else _args+=("$a"); fi; done
-        set -- "${_args[@]}"
     fi
 
     # ---------- root ----------
@@ -317,13 +314,7 @@ C_0="" C_B="" C_D="" C_G="" C_Y="" C_R="" C_C=""
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
     C_0=$'\033[0m' C_B=$'\033[1m' C_D=$'\033[2m' C_G=$'\033[32m' C_Y=$'\033[33m' C_R=$'\033[31m' C_C=$'\033[36m'
 fi
-die()  {
-    # открытая строка этапа (компактный режим) — закрываем ✘, чтобы ошибка не прилипла к ней
-    [ "${STAGE_OPEN:-0}" = 1 ] && { printf '%s✘%s\n' "$C_R" "$C_0"; STAGE_OPEN=0; }
-    printf '%sОШИБКА:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1
-}
 vsay() { [ "${QUIET:-0}" = 1 ] || say "$@"; }   # служебные строки — только в подробном режиме
-warn() { printf '%sВНИМАНИЕ:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
 
 # run_stage <n/N> <название> <команда...> — этап установки. Компактный режим: строка с
 # индикатором и ✔/✘, вывод команды — в журнал, при ошибке — хвост журнала. Подробный — как прежде.
@@ -823,7 +814,7 @@ stack_diag() {
 
     # 00 — общее
     _dsh 00-meta.txt "echo installer=$VERSION; date -u; uptime; cat /etc/os-release | grep -E '^(PRETTY_NAME|VERSION_ID)='"
-    _dsh 00-meta.txt "for f in $WORK_DIR/node/VERSION $WORK_DIR/shieldnode/VERSION; do [ -f \$f ] && echo \$f: \$(cat \$f); done; grep -E '^(version|updated)=' /etc/node-profile.d/stack.conf 2>/dev/null"
+    _dsh 00-meta.txt "grep -E '^(version|updated)=' /etc/node-profile.d/stack.conf 2>/dev/null"
     _dsh 00-meta.txt "nproc; free -m; df -h / /boot 2>/dev/null"
     # 01 — фаервол: ruleset без элементов наборов (-t), размеры наборов, счётчики
     _dg 01-nft-ruleset.txt nft -t list ruleset

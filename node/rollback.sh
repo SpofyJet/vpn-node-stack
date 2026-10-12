@@ -153,14 +153,9 @@ node_rollback() {
     source "$NODE_DIR/lib/services.sh"
     node_services_rollback
 
-    # 4. службы
+    # 4. службы: disable --now этих юнитов — в шаге 0 (пока файлы на месте);
+    # здесь — перечитывание systemd и остатки скриптов/udev-правил
     systemctl daemon-reload 2>/dev/null || true
-    if systemctl cat node-mss-clamp.service >/dev/null 2>&1; then
-        systemctl disable --now node-mss-clamp.service >/dev/null 2>&1 || true
-    fi
-    if systemctl cat node-rt-tweaks.service >/dev/null 2>&1; then
-        systemctl disable --now node-rt-tweaks.service >/dev/null 2>&1 || true
-    fi
     rm -f /usr/local/sbin/node-rt-tweaks.sh /etc/udev/rules.d/99-node-rt-hotplug.rules
     udevadm control --reload >/dev/null 2>&1 || true
     nft delete table inet node_mss_clamp 2>/dev/null || true

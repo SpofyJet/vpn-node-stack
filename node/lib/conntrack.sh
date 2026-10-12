@@ -35,17 +35,20 @@ node_conntrack_plan() {
     hashsize="$max"
     loose="$(node_conf_get CONNTRACK_TCP_LOOSE 1)"
 
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_max "$max"
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_established 14400
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_time_wait 30
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_close_wait 30
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_fin_wait 30
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_last_ack 30
+    # 2026-10-12: writable, не plain add — все ключи зависят от модуля nf_conntrack;
+    # в LXC/контейнере без modprobe/ключей sysctl -p на файле уронил бы весь apply
+    # (проверка «ключ существует и записываем» — lib/sysctl.sh, как tcp_rmem/wmem).
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_max "$max"
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_established 14400
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_time_wait 30
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_close_wait 30
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_fin_wait 30
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_timeout_last_ack 30
     # 2026-09-24 (v1.1.7): udp_timeout 180 / udp_timeout_stream 600 убраны — дефолты ядра 30/120
     # (nf_conntrack-sysctl.rst). Длиннее — только дольше держим мёртвые UDP/QUIC-записи
     # (idle QUIC ~30с) и unreplied-мусор сканов; истёкший поток shieldnode снова примет как new.
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_generic_timeout 300
-    node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_loose "$loose"
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_generic_timeout 300
+    node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_loose "$loose"
     # NOTE: nf_conntrack_helper НЕ пишем в sysctl-файл: этот sysctl зависит от
     # CONFIG_NF_CONNTRACK_HELPER ядра — на части конфигов (баг на prod-ноде
     # 2026-09-22) файла нет даже после modprobe nf_conntrack, и sysctl -p
@@ -53,7 +56,7 @@ node_conntrack_plan() {
     # стабильность под нагрузкой: conntrack НЕ дропает легитимные ретрансмиты,
     # попавшие «мимо окна» (типично для VPN-потоков с MTU-проблемами)
     if [ "$(node_conf_get ENABLE_CONNTRACK_LIBERAL 1)" = "1" ]; then
-        node_sysctl_add "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_be_liberal 1
+        node_sysctl_add_writable "$NODE_SYSCTL_CONNTRACK" net.netfilter.nf_conntrack_tcp_be_liberal 1
     fi
 
     export NODE_CONNTRACK_MAX="$max" NODE_CONNTRACK_HASHSIZE="$hashsize"

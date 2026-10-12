@@ -16,8 +16,7 @@ set -euo pipefail
 # _ports_norm "<список через пробел/запятую>" -> отсортированный уникальный через запятую
 _ports_norm() { tr ', ' '\n\n' <<<"${1:-}" | awk 'NF' | sort -u | sort -t- -k1,1n | paste -sd, -; }
 _ports_live() { # элементы набора (как в health)
-    nft -n list set inet shieldnode "$1" 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")}
-        f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
+    nft_set_elems_raw "$1" | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true
 }
 
 # _ports_patch_conf <file> — заменить элементы 4 наборов в сохранённом ruleset'е (для boot)

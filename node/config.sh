@@ -13,15 +13,20 @@ node_conf_user_set() { [ -f "${NODE_CONFIG:-/etc/node/node.conf}" ] && grep -qE 
 
 node_conf_get() {
     # $1=key $2=default. Empty value in config => default (auto semantics).
-    # Inline-комментарии после значения отрезаем ("KEY=1 # why" -> "1").
+    # 2026-10-12: сначала определяем, закавычено ли значение (первый и последний
+    # непробельные символы — кавычки); «пробел+#…» отрезаем ТОЛЬКО у незакавыченных:
+    # раньше комментарий резался после снятия кавычек и KEY="a # b" превращалось в «a».
     local key="$1" def="$2" val=""
     if [ -n "${CONFIG_CACHE:-}" ] && [ -f "$CONFIG_CACHE" ]; then
         val="$(awk -F= -v k="$key" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$CONFIG_CACHE")"
     fi
-    val="${val#\"}"; val="${val%\"}"
-    val="${val#\'}"; val="${val%\'}"
-    val="${val%%[[:space:]]#*}"
-    val="${val%"${val##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"   # ведущие пробелы
+    val="${val%"${val##*[![:space:]]}"}"   # хвостовые пробелы
+    case "$val" in
+        \"*\"|\'*\') val="${val#?}"; val="${val%?}" ;;   # в кавычках: # не трогаем
+        *) val="${val%%[[:space:]]#*}"                    # не в кавычках: отрезаем «пробел#…»
+           val="${val%"${val##*[![:space:]]}"}" ;;        # и снова хвостовые (те, что до комментария)
+    esac
     if [ -z "$val" ]; then echo "$def"; else echo "$val"; fi
 }
 

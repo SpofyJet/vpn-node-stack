@@ -7,6 +7,18 @@ SHIELD_PROTECTED_STATE="$SHIELD_STATE_DIR/protected-ports.txt"
 # rw-core — имя Xray в образе remnawave/node; sing-box/hysteria — отдельные Hysteria2-серверы.
 SHIELD_VPN_PROC_RE='xray|rw-core|remnanode|sing-box|hysteria|v2ray'
 
+# nft_set_elems_raw <set> — содержимое блока «elements = { … }» сета как есть (nft
+# печатает его многострочно с отступами и метаданными timeout/expires). Единый
+# парсер для guard/status/ports — копии awk-разошлись в пяти местах (2026-10-12).
+# Живёт здесь, а не в lib/common.sh (запинен test-shared-helpers на идентичность
+# node↔shieldnode) и не в lib/nft.sh (main.sh не source'ит его в ветках
+# guard/status/ports — только apply/emergency); detect.sh — в каждой из них.
+nft_set_elems_raw() {
+    nft -n list set inet shieldnode "$1" 2>/dev/null | awk '
+        /elements = \{/ { f = 1; sub(/.*elements = \{/, "") }
+        f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' || true
+}
+
 # shield_detect_ufw_sources <tcp|udp> <порт> — 2026-09-25 (v1.2.0): IPv4-источники правил UFW
 # «allow from X to any port P» (оператор явно ограничил порт) — для ограничения API ноды панелью.
 shield_detect_ufw_sources() {

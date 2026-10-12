@@ -229,7 +229,10 @@ rm -f "$FAKE_FSTAB" "$FAKE_FSTAB2" "$FAKE_FSTAB3"
 # --- сценарий 11: udev-правила scheduler (порт старого стека) ---
 # раньше было мёртвое KERNEL=="sd*[0-9]" (матчит только разделы без queue/scheduler)
 t "udev: правило vd/xvd без проверки rotational" bash -c "grep -q 'KERNEL==\"vd\[a-z\]|xvd\[a-z\]\"' '$NODE_DIR/lib/storage.sh'"
-t "udev: правило sd/nvme/mmcblk с rotational==0" bash -c "grep -q 'KERNEL==\"sd\[a-z\]|nvme\[0-9\]n\[0-9\]|mmcblk\[0-9\]\"' '$NODE_DIR/lib/storage.sh' && grep -q 'ATTR{queue/rotational}==\"0\"' '$NODE_DIR/lib/storage.sh'"
+t "udev: правило sd/nvme/mmcblk/dm/md с rotational==0" bash -c "grep -q 'KERNEL==\"sd\[a-z\]|nvme\[0-9\]n\[0-9\]|mmcblk\[0-9\]|dm-\*|md\*\"' '$NODE_DIR/lib/storage.sh' && grep -q 'ATTR{queue/rotational}==\"0\"' '$NODE_DIR/lib/storage.sh'"
+# 2026-10-12: runtime-цикл ставит none на любой non-rotational девайс, включая dm/md;
+# без dm-*|md* в udev-правиле после reboot scheduler на dm-нодах молча откатывался
+t "udev: dm-*|md* — в том же правиле, с guard rotational==0" bash -c "grep -A1 'KERNEL==\"sd\[a-z\]|nvme\[0-9\]n\[0-9\]|mmcblk\[0-9\]|dm-\*|md\*\"' '$NODE_DIR/lib/storage.sh' | grep -q 'ATTR{queue/rotational}==\"0\"'"
 t "udev: guard scheduler содержит none" bash -c "grep -q 'ATTR{queue/scheduler}==\"\*none\*\"' '$NODE_DIR/lib/storage.sh'"
 t "udev: мёртвое sd*[0-9] удалено из правил" bash -c "! grep -q 'KERNEL==\"sd\*\[0-9\]\"' '$NODE_DIR/lib/storage.sh'"
 

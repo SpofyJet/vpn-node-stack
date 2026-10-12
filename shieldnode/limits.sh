@@ -188,18 +188,10 @@ shield_limits_resolve() {
     export SH_F_EXCL_V4="${excl_v4# } ${t_v4# }" SH_F_EXCL_V6="${excl_v6# } ${t_v6# }"
     SH_F_EXCL_V4="${SH_F_EXCL_V4# }"; SH_F_EXCL_V6="${SH_F_EXCL_V6# }"
 
-    # IPv6-флаг (читалка из детекта); node мог отключить IPv6 (HARDEN_IPV6=1) —
-    # тогда v6-правила не генерируем: трафика нет, ruleset компактнее
-    # 2026-09-25 (v1.2.0): IPv6 на ноде выключен ОБЯЗАТЕЛЬНО (node: ipv6.disable=1 + sysctl).
-    # v6-правил лимитов больше нет: любой IPv6-пакет режет fail-safe в начале prerouting
-    # (и на выходе/транзите) — даже если IPv6 вернулся (DIAGNOSIS P1-4). Прежде при
-    # ipv6_disabled=1 не генерировалось НИ ОДНОГО v6-правила, и вернувшийся IPv6 шёл мимо.
-    export SH_F_IPV6=0
-
     # 2026-09-25 (v1.2.0): API ноды (remnanode) — только панели: TRUSTED_IPS (v4) + источники
     # UFW «allow from X to any port <порт>». Не известно ни одного — порт не ограничиваем
     # (не отрезаем панель), health/guard громко предупреждают (DIAGNOSIS P0-2).
-    shield_detect_inbounds
+    # SH_IB_* — из shield_detect_inbounds выше (повторный вызов — no-op по кэшу SH_IB_DONE)
     export SH_F_NODE_API_PORT="${SH_IB_API_PORT:-}" SH_F_NODE_API_ALLOW_V4="" SH_F_NODE_API_PORT_SET=""
     if [ -n "$SH_F_NODE_API_PORT" ]; then
         local a allow=""
@@ -217,12 +209,12 @@ shield_limits_resolve() {
         fi
     fi
 
-    # admin IP сессии (whitelist, §20) — только если не loopback
+    # admin IP сессии (whitelist, §20) — только если не loopback; IPv6 сюда не резолвим:
+    # на ноде он выключен обязательно и весь режется fail-safe (lib/nft.sh)
     local admin; admin="$(shield_detect_admin_ip || true)"
-    export SH_F_ADMIN_V4="" SH_F_ADMIN_V6=""
+    export SH_F_ADMIN_V4=""
     case "$admin" in
-        ""|127.*|::1|localhost) : ;;  # loopback не добавляем
-        *:*) SH_F_ADMIN_V6="$admin" ;;
+        ""|127.*|::1|localhost|:*) : ;;  # loopback/v6 не добавляем
         *)   SH_F_ADMIN_V4="$admin" ;;
     esac
 
@@ -249,7 +241,7 @@ shield_limits_resolve() {
             SH_F_EXTENSIONS="/etc/shieldnode/extensions.d/*.nft"
         fi
     fi
-    log info "limits" "resolved: ssh=[$SH_F_SSH_PORTS] tcp=[$SH_F_PROTECTED_TCP] udp=[$SH_F_PROTECTED_UDP] admin4=[$SH_F_ADMIN_V4] admin6=[$SH_F_ADMIN_V6] ipv6=$SH_F_IPV6"
+    log info "limits" "resolved: ssh=[$SH_F_SSH_PORTS] tcp=[$SH_F_PROTECTED_TCP] udp=[$SH_F_PROTECTED_UDP] admin4=[$SH_F_ADMIN_V4]"
 }
 
 # shield_abuse_journal_append — дамп abusers/temporary_blocklist в журнал (ТЗ §24).
@@ -258,7 +250,7 @@ shield_abuse_journal_append() {
     {
         echo "### $ts"
         local s out
-        for s in ssh_abusers ssh_abusers_v6 tcp_abusers tcp_abusers_v6 udp_abusers udp_abusers_v6 temporary_blocklist temporary_blocklist_v6; do
+        for s in ssh_abusers tcp_abusers udp_abusers temporary_blocklist; do
             # 2026-09-23 (v1.1.2): вывод читаем ОДИН раз. Было `nft list set | grep -q`
             # под pipefail: на большом сете grep -q выходит на первом совпадении, nft
             # получает SIGPIPE (rc 141) -> условие ложно, и именно КРУПНЫЕ сеты молча

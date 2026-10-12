@@ -21,15 +21,13 @@ source "$SHIELD_DIR/config.sh"
 source "$SHIELD_DIR/lib/nft.sh"
 source "$SHIELD_DIR/emergency.sh"
 
-# фабрика окружения для генератора (как после limits_resolve)
+# фабрика окружения для генератора (как после limits_resolve); входы v6 нет:
+# IPv6 на ноде выключен обязательно — генератор v4-only (fail-safe в lib/nft.sh)
 export SH_F_SSH_PORTS="22 2222"
 export SH_F_PROTECTED_TCP="443 8443"
 export SH_F_PROTECTED_UDP="443"
 export SH_F_ADMIN_V4="203.0.113.10"
-export SH_F_ADMIN_V6=""
 export SH_F_EXCL_V4="198.51.100.0/24"
-export SH_F_EXCL_V6=""
-export SH_F_IPV6=0
 export SH_F_EXTENSIONS=""
 export SH_F_WAN_IFACE="eth0"
 export SH_F_ENABLE_ANTISPOOF=0
@@ -111,11 +109,7 @@ t "антиспуф выключен по умолчанию" bash -c "! grep -q
 SH_F_ENABLE_ANTISPOOF=1
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-spoof.nft
 t "антиспуф opt-in работает" bash -c "grep -q '10.0.0.0/8' /tmp/shieldnode-test/ruleset-spoof.nft"
-t "антиспуф v6 НЕ эмитится при IPv6=0" bash -c "! grep -q 'c_drops_antispoof_v6 drop' /tmp/shieldnode-test/ruleset-spoof.nft"
-SH_F_IPV6=1
-shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-spoof6.nft
-t "антиспуф v6 opt-in при IPv6=1 (loopback/ULA/link-local/multicast/doc)" bash -c "grep -q 'ip6 saddr { ::1, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32 } counter name c_drops_antispoof_v6 drop' /tmp/shieldnode-test/ruleset-spoof6.nft"
-SH_F_IPV6=0
+t "антиспуф v6 не эмитится никогда (IPv6 выключен обязательно — fail-safe)" bash -c "! grep -q 'c_drops_antispoof_v6 drop' /tmp/shieldnode-test/ruleset-spoof.nft"
 SH_F_ENABLE_ANTISPOOF=0
 
 # --- отсутствие абьюз-лимитинга при ENABLE_ABUSE_LIMITING=0 ---
@@ -161,33 +155,16 @@ t "crowdsec: по умолчанию выключен — сетов/прави�
 SH_F_ENABLE_CROWDSEC_LIST=1
 SH_R_CROWDSEC_BLOCKLIST_SIZE=262144
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-cs.nft
-t "crowdsec: сеты v4/v6 + drop-правила с counter" bash -c "grep -q 'set crowdsec_blocklist_v4' /tmp/shieldnode-test/ruleset-cs.nft && grep -q 'ip saddr @crowdsec_blocklist_v4 counter name c_drops_crowdsec_v4 drop' /tmp/shieldnode-test/ruleset-cs.nft"
+t "crowdsec: сеты v4 + drop-правила с counter" bash -c "grep -q 'set crowdsec_blocklist_v4' /tmp/shieldnode-test/ruleset-cs.nft && grep -q 'ip saddr @crowdsec_blocklist_v4 counter name c_drops_crowdsec_v4 drop' /tmp/shieldnode-test/ruleset-cs.nft"
 t "crowdsec: drop ПОСЛЕ whitelist-accept" bash -c "awk '/ip saddr @whitelist_v4 accept/{f=1; next} f && /ip saddr @crowdsec_blocklist_v4 counter name/{print; exit}' /tmp/shieldnode-test/ruleset-cs.nft | grep -q drop"
 t "crowdsec: drop-правило несёт counter (инвариант счётчиков)" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' /tmp/shieldnode-test/ruleset-cs.nft) = \$(grep -c 'counter name c_drops_' /tmp/shieldnode-test/ruleset-cs.nft)"
-SH_F_IPV6=1
-shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-cs6.nft
-t "crowdsec: v6-компаньон при IPv6" bash -c "grep -q 'set crowdsec_blocklist_v6' /tmp/shieldnode-test/ruleset-cs6.nft && grep -q 'c_drops_crowdsec_v6' /tmp/shieldnode-test/ruleset-cs6.nft"
-SH_F_IPV6=0
+t "crowdsec: v6-компаньона нет (IPv6 выключен обязательно)" bash -c "! grep -q 'crowdsec_blocklist_v6\|c_drops_crowdsec_v6' /tmp/shieldnode-test/ruleset-cs.nft"
 SH_F_ENABLE_CROWDSEC_LIST=0
 unset SH_R_CROWDSEC_BLOCKLIST_SIZE
 
-# --- IPv6: блоклист-компаньоны _v6 ---
-SH_F_IPV6=1
-SH_F_ADMIN_V6="2001:db8::42"
-SH_F_BLOCK_TOR=1
-shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-v6bl.nft
-t "IPv6: блоклисты _v6 + drop v6" bash -c "grep -q 'set scanner_blocklist_v6' /tmp/shieldnode-test/ruleset-v6bl.nft && grep -q 'ip6 saddr @threat_blocklist_v6 counter name' /tmp/shieldnode-test/ruleset-v6bl.nft && grep -q 'ip6 saddr @tor_exit_blocklist_v6 counter name' /tmp/shieldnode-test/ruleset-v6bl.nft"
-SH_F_IPV6=0
-SH_F_BLOCK_TOR=0
-SH_F_ADMIN_V6=""
-
-# --- IPv6-компаньоны при SH_F_IPV6=1 ---
-SH_F_ENABLE_ABUSE_LIMITING=1
-SH_F_IPV6=1
-SH_F_ADMIN_V6="2001:db8::42"
-shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-v6.nft
-t "IPv6: whitelist_v6 + admin6" bash -c "grep -q 'set whitelist_v6' /tmp/shieldnode-test/ruleset-v6.nft && grep -q '2001:db8::42' /tmp/shieldnode-test/ruleset-v6.nft"
-t "IPv6: abuse-компаньоны _v6" bash -c "grep -q 'ssh_abusers_v6' /tmp/shieldnode-test/ruleset-v6.nft && grep -q 'tcp_abusers_v6' /tmp/shieldnode-test/ruleset-v6.nft && grep -q 'udp_abusers_v6' /tmp/shieldnode-test/ruleset-v6.nft"
+# --- IPv6: генератор v4-only — ни одного v6-сета/правила/счётчика _v6 ---
+t "IPv6: v6-блоклистов нет (ни при каких флагах)" bash -c "! grep -qE 'set (scanner|threat|tor_exit|custom|crowdsec|spamhaus)_blocklist_v6|ip6 saddr @' '$RS'"
+t "IPv6: whitelist_v6 и abuse-компаньонов _v6 нет" bash -c "! grep -q 'whitelist_v6\|ssh_abusers_v6\|tcp_abusers_v6\|udp_abusers_v6\|temporary_blocklist_v6\|_connlimit_v6' '$RS'"
 
 # --- emergency ruleset ---
 SH_F_ADMIN_V4="203.0.113.10"
@@ -222,16 +199,17 @@ t "persist: log_martians в плане нет (UFW всё равно стави�
 t "persist: net.netfilter.* в security-sysctl плане НЕТ (владелец node)" bash -c "! grep -q 'sysctl net.netfilter\.' /tmp/shieldnode-test/security-sysctl.log"
 
 echo
-# базовый цикл = 23 (22 + antispoof_v6); +spamhaus_v4 (v6 нет — SH_F_IPV6=0), +cins_v4, +amp, +icmp = 27
-t "counters: 35 именованных счётчиков (23 базовых + spamhaus/cins/amp/icmp + ipv6_failsafe/nodeapi v1.2.0 + syn_limit/newconn_limit v1.2.1 + udp_limit v1.2.2)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 35"
+# базовый цикл = 16 (v4-only, IPv6 выключен обязательно — fail-safe); +spamhaus_v4,
+# +cins_v4 (v6-счётчиков у них нет), +amp, +icmp, +ipv6_failsafe/nodeapi (v1.2.0) = 22
+t "counters: 22 именованных счётчика (16 базовых v4 + spamhaus/cins/amp/icmp + ipv6_failsafe/nodeapi)" bash -c "test \$(grep -c '^    counter c_drops_' '$RS') = 22"
 t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "grep -q 'c_drops_spamhaus_v4' '$RS' && grep -q 'c_drops_cins_v4' '$RS' && grep -q 'c_drops_amp' '$RS' && grep -q 'c_drops_icmp' '$RS'"
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
 # 2026-09-24 (v1.1.4): backlog #4 — лимит стал per-source (meter по saddr); литерал глобальной
 # формы заменён шаблоном для обеих форм + проверка порядка, обещанного названием проверки
 t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -qE 'icmp type echo-request (meter icmp_echo4 \{ ip saddr )?limit rate over 10/second' '$RS' && awk '/packet-too-big/{p=NR} /echo-request.*limit rate/{if(!l)l=NR} END{exit !(p && l && p<l)}' '$RS'"
 t "counters: КАЖДОЕ drop-правило несёт counter name" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' '$RS') = \$(grep -c 'counter name c_drops_' '$RS')"
-t "counters: scanner/threat/tor/custom v4+v6 имеют свои счётчики" bash -c "grep -q 'c_drops_scanner_v4' '$RS' && grep -q 'c_drops_threat_v6' '$RS' && grep -q 'c_drops_custom_v4' '$RS'"
-t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof (v4+v6)" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS' && grep -q 'c_drops_antispoof_v6' '$RS'"
+t "counters: scanner/threat/tor/custom — свои счётчики v4, v6-счётчиков нет" bash -c "grep -q 'c_drops_scanner_v4' '$RS' && grep -q 'c_drops_threat_v4' '$RS' && grep -q 'c_drops_custom_v4' '$RS' && ! grep -qE 'c_drops_(scanner|threat|tor|custom)_v6' '$RS'"
+t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof (v4-only, v6 нет)" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS' && ! grep -qE 'c_drops_[a-z_]+_v6' '$RS'"
 t "counters: LOG-флуда нет — log statement отсутствует" bash -c "! grep -qE ' counter name c_drops_.* log |log prefix| nflog' '$RS'"
 
 if [ "$fails" -eq 0 ]; then echo "PASS: template (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi

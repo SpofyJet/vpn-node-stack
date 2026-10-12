@@ -95,7 +95,7 @@ node_status() {
     echo "runtime tweaks: $([ -f "$NODE_RT_TWEAKS" ] && wc -l < "$NODE_RT_TWEAKS" || echo 0) (откат: bash $NODE_DIR/install.sh rollback)"
     # 2026-09-27 (v1.2.2): начальное окно TCP — атрибут маршрута по умолчанию (lib/route.sh)
     echo "initcwnd: план=$(node_conf_get TCP_INITCWND 32) (0 = окно ядра 10) факт=$(ip -4 -o route show table main default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "initcwnd") { v = $(i + 1); exit } } END { print (v != "" ? v : "ядро (10)") }')"
-    # runtime-твики и reboot-напоминание — против молчаливой потери после reboot
+    # runtime-твики — против молчаливой потери после reboot
     if node_rt_boot_needed 2>/dev/null; then
         if systemctl is-enabled node-rt-tweaks.service >/dev/null 2>&1; then
             echo "rt boot re-apply: node-rt-tweaks.service enabled (runtime-твики переживут reboot)"
@@ -105,16 +105,10 @@ node_status() {
     else
         echo "rt boot re-apply: не нужен (runtime-твики выключены)"
     fi
-    if { [ -f /run/node/reboot-required ] || node_xanmod_reboot_pending; } && ! node_kernel_is_xanmod; then
-        echo "reboot: ТРЕБУЕТСЯ (новое ядро установлено $(cat /run/node/reboot-required 2>/dev/null), активно $(uname -r))"
-    fi
     source "$NODE_DIR/lib/xray.sh"
     echo "VPN-ядро слушает: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
     echo "----------------------------------------------------------------------"
-    declare -F node_perf_report >/dev/null 2>&1 && node_perf_report "$NODE_STATE_DIR/perf-baseline.txt"
+    node_perf_report "$NODE_STATE_DIR/perf-baseline.txt"
     # 2026-09-27 (v1.2.2): UDP/QUIC — буферы и потери сокетов Xray, память UDP (только чтение)
-    if [ -f "$NODE_DIR/lib/udp.sh" ]; then
-        # shellcheck source=lib/udp.sh
-        source "$NODE_DIR/lib/udp.sh"; node_udp_health || true
-    fi
+    node_udp_health || true
 }

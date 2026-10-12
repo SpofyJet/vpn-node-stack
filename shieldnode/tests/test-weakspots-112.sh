@@ -75,7 +75,7 @@ for i in $(seq 1 20000); do echo "             198.18.$((i/250)).$((i%250)),"; d
 EOF
 chmod +x "$OUT/big/nft"; : > "$SHIELD_ABUSE_JOURNAL"
 PATH="$OUT/big:$PATH" shield_abuse_journal_append >/dev/null 2>&1 || true
-t "journal: все 8 КРУПНЫХ сетов попали в журнал (нет SIGPIPE-потерь)" '[ "$(grep -c "^## " "$SHIELD_ABUSE_JOURNAL")" = 8 ]'
+t "journal: все 4 КРУПНЫХ сета попали в журнал (нет SIGPIPE-потерь; наборы v4-only)" '[ "$(grep -c "^## " "$SHIELD_ABUSE_JOURNAL")" = 4 ]'
 t "journal/crowdsec: нет «list | grep -q» на больших выводах" '! grep -nE "nft list set[^|]*\| *grep -q|cscli decisions list[^|]*\| *grep -q" "$SHIELD_DIR/limits.sh" "$SHIELD_DIR/lib/crowdsec.sh" | grep -vqE "^[0-9]+:[[:space:]]*#|:[0-9]+:[[:space:]]*#"'
 t "guard/journal: нет фиксированного «.tmp»" '! grep -nE "(SNAPSHOT|JOURNAL)\.tmp" "$SHIELD_DIR/guard.sh" "$SHIELD_DIR/limits.sh"'
 

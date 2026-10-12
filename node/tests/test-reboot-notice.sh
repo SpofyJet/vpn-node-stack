@@ -106,7 +106,11 @@ else
     t "status: баннер «kernel: XanMod установлен (…), ОЖИДАЕТ REBOOT»" 'grep -q "^>>> kernel: XanMod установлен (linux-xanmod-lts-x64v3), ОЖИДАЕТ REBOOT" "$OUT/st.txt"'
     n=$(grep -n "^>>> kernel: XanMod" "$OUT/st.txt" | cut -d: -f1); h=$(grep -n "^node v1" "$OUT/st.txt" | cut -d: -f1)
     t "status: баннер сразу под заголовком (самый верх)"         '[ -n "$n" ] && [ -n "$h" ] && [ $((n - h)) -le 2 ]'
-    t "status: нижняя строка «reboot: ТРЕБУЕТСЯ» без /run-маркера" 'grep -q "^reboot: ТРЕБУЕТСЯ" "$OUT/st.txt"'
+    # 2026-10-12: третий (дублирующий верхний) reboot-баннер в конце status убран —
+    # уведомление о reboot в этом сценарии — верхний баннер (проверки выше);
+    # закрепляем дедупликацию: упоминание «ОЖИДАЕТ REBOOT» — ровно одно, строки
+    # «reboot: ТРЕБУЕТСЯ» в выводе больше нет
+    t "status: уведомление о reboot — ровно один баннер (дубль убран)" '[ "$(grep -c "ОЖИДАЕТ REBOOT" "$OUT/st.txt")" = 1 ] && ! grep -q "^reboot: ТРЕБУЕТСЯ" "$OUT/st.txt"'
     # (обычные warn-строки проекта окрашены логгером всегда — это прежнее поведение;
     #  проверяем именно баннер: рамка и строка «>>> … <<<» без ANSI вне TTY)
     t "status в файл: баннер без ANSI" '! grep -E "^(>>> kernel|={70})" "$OUT/st.txt" | grep -q "$ESC"'

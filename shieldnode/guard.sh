@@ -21,6 +21,20 @@ guard_set_elems() { nft_set_elem_count "$1"; }
 _g_health() { ( source "$SHIELD_DIR/ssh.sh"; source "$SHIELD_DIR/lib/crowdsec.sh"; source "$SHIELD_DIR/status.sh"; shield_health ) 2>/dev/null || true; }
 _g_verify() { ( source "$SHIELD_DIR/lib/ports.sh"; shield_verify ) 2>/dev/null || true; }
 
+# --- кэш проблем для redraw меню: раньше каждый Enter гонял _g_health (в api-режиме
+# это docker exec … api lsi — 1-2 с CPU на 1-vCPU ноде) и _g_verify заново.
+# Результат кэшируется на SHIELD_GUARD_PROB_TTL сек (дефолт 45), раздел «проблемы»
+# рисуется из кэша; действия меню 2/3/4/6 (unban/доверенные/обновление/emergency)
+# меняют состояние — кэш сбрасывают; новый запуск guard всегда собирает свежее.
+G_PROB_TS=0 G_HEALTH="" G_VOUT=""
+_g_problems_collect() {
+    G_HEALTH="$(_g_health)"
+    G_VOUT=""
+    if [ "${G_FW:-}" = "ACTIVE" ]; then G_VOUT="$(_g_verify)"; fi
+    printf -v G_PROB_TS '%(%s)T' -1
+}
+_g_problems_reset() { G_PROB_TS=0; }
+
 # --- оформление: цвета только в терминале, без NO_COLOR ---
 _g_colors() {
     G_0="" G_B="" G_D="" G_G="" G_Y="" G_R="" G_C=""
@@ -114,8 +128,8 @@ _g_draw() {
     esac
     if [ "$G_FW" != "ABSENT" ]; then
         local pt pu
-        pt="$(nft -n list set inet shieldnode protected_tcp 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")} f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true)"
-        pu="$(nft -n list set inet shieldnode protected_udp 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")} f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true)"
+        pt="$(nft_set_elems_raw protected_tcp | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true)"
+        pu="$(nft_set_elems_raw protected_udp | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true)"
         printf '  Под защитой %sTCP %s%s   %sUDP %s%s\n' "$G_B" "${pt:-—}" "$G_0" "$G_B" "${pu:-—}" "$G_0"
     fi
     echo
@@ -181,18 +195,20 @@ _g_draw() {
 
     # 5) проблемы — 2026-09-25 (v1.2.0, E5): ЕДИНЫЙ источник — health (+ verify). Раньше guard
     # проверял своё подмножество и писал «Проблем не найдено» при health WARN=12.
-    local probs="" f G_HEALTH="" admin_ip
+    # 2026-10-12: health/verify берутся из кэша с TTL (см. _g_problems_collect) — redraw меню
+    # иначе заново гонял docker exec … api lsi (~1-2 с CPU на 1-vCPU ноде) на каждый Enter
+    local probs="" f admin_ip
     if [ "$G_FW" != "ABSENT" ]; then
-        G_HEALTH="$(_g_health)"
+        local now; printf -v now '%(%s)T' -1
+        if [ $(( now - G_PROB_TS )) -ge "${SHIELD_GUARD_PROB_TTL:-45}" ]; then _g_problems_collect; fi
         probs="$(sed -n 's/^  \[\(FAIL\|WARN\)\] \(.*\)$/\1: \2/p' <<<"$G_HEALTH" | sed 's/^FAIL: /✘ /; s/^WARN: //')"
         if [ -z "$(sed -n 's/^  health: \(FAIL=[0-9]* WARN=[0-9]*\).*/\1/p' <<<"$G_HEALTH")" ]; then
             probs="${probs:+$probs$'\n'}полная проверка не выполнилась — запусти: sudo vpn-node → «Полная проверка»"
         fi
         if [ "$G_FW" = ACTIVE ]; then
-            local vout; vout="$(_g_verify)"
             while IFS= read -r f; do
                 case "$f" in *✘*) probs="${probs:+$probs$'\n'}✘ ${f#*✘ }" ;; esac
-            done <<<"$vout"
+            done <<<"${G_VOUT:-}"
         fi
         admin_ip="$(shield_detect_admin_ip 2>/dev/null || true)"
         case "$admin_ip" in ''|*:*) ;; *) nft get element inet shieldnode whitelist_v4 "{ $admin_ip }" >/dev/null 2>&1 && G_ADMIN_OK="$admin_ip" ;; esac
@@ -221,8 +237,7 @@ _g_need_root() { [ "$(id -u)" -eq 0 ] && return 0; printf '  %sНужен root: 
 _g_pause() { printf '\n  %sEnter — назад%s' "$G_D" "$G_0"; IFS= read -r _ || true; }
 _g_list_set() { # <set> <заголовок>
     local out
-    out="$(nft -n list set inet shieldnode "$1" 2>/dev/null | awk '/elements = \{/ {f = 1; sub(/.*elements = \{/, "")} f { l = $0; e = sub(/\}.*/, "", l); print l; if (e) f = 0 }' \
-        | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF' || true)"
+    out="$(nft_set_elems_raw "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF' || true)"
     [ -n "$out" ] || return 0
     printf '  %s%s%s (%s)\n' "$G_B" "$2" "$G_0" "$(wc -l <<<"$out")"
     head -20 <<<"$out" | sed 's/ expires / — осталось /; s/ timeout [^ ]*//' | sed 's/^/    /'
@@ -256,6 +271,7 @@ _g_act_unban() {
     fi
     if [ "$n" -gt 0 ]; then printf '  %s✔ %s разбанен (наборов: %s)%s\n' "$G_G" "$ip" "$n" "$G_0"; log info "guard" "unban $ip ($n sets)"
     else printf '  %s не найден среди банов (блок-листы сканеров/угроз так не снимаются — для своего IP используй «Доверенные IP»)\n' "$ip"; fi
+    _g_problems_reset
     _g_pause
 }
 _g_trusted_write() { # <новый список через пробел> — атомарно в config.conf, с backup
@@ -288,6 +304,7 @@ _g_act_trusted() {
     printf '  сохранено: TRUSTED_IPS="%s" — применяю фаервол…\n' "$new"
     if bash "$SHIELD_DIR/main.sh" apply >/dev/null 2>&1; then printf '  %s✔ применено%s\n' "$G_G" "$G_0"
     else printf '  %s✘ применение не удалось — прежние правила сохранены (подробности: sudo vpn-node → «Статус»)%s\n' "$G_R" "$G_0"; fi
+    _g_problems_reset
     _g_pause
 }
 _g_act_update() {
@@ -298,6 +315,7 @@ _g_act_update() {
     if [ -e "${SHIELD_UNIT_DIR:-/etc/systemd/system}/shieldnode-blocklist-crowdsec.service" ]; then
         systemctl start shieldnode-blocklist-crowdsec.service 2>/dev/null && printf '  %s✔ CrowdSec обновлён%s\n' "$G_G" "$G_0" || true
     fi
+    _g_problems_reset
     _g_pause
 }
 _g_act_check() {
@@ -318,6 +336,7 @@ _g_act_emergency() {
         case "$a" in y|Y|д|Д) ;; *) return 0 ;; esac
         bash "$SHIELD_DIR/main.sh" emergency on >/dev/null 2>&1 && printf '  %s✔ аварийный режим включён%s\n' "$G_R" "$G_0" || printf '  %s✘ не удалось (журнал)%s\n' "$G_R" "$G_0"
     fi
+    _g_problems_reset
     _g_pause
 }
 
@@ -334,6 +353,7 @@ shield_guard() {
     local mode="${SHIELD_GUARD_MODE:-auto}"
     [ "$mode" = auto ] && { if [ -t 0 ] && [ -t 1 ]; then mode=menu; else mode=once; fi; }
     G_ADMIN_OK=""
+    _g_problems_reset   # каждый запуск guard собирает health/verify заново (кэш — только внутри сеанса меню)
     if [ "$mode" = raw ]; then _g_collect; _g_raw; return 0; fi
     if [ "$mode" != menu ]; then
         _g_collect; _g_draw; _g_save_snapshot; return 0

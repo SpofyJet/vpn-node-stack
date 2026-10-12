@@ -71,7 +71,7 @@ fails=0
 t() { local name="$1" cmd="$2"
     if eval "$cmd" >/dev/null 2>&1; then echo "ok   - $name"; else echo "FAIL - $name"; fails=$((fails+1)); fi; }
 cfg()  { printf '%b' "$1" > "$OUT/cfg.conf"; SHIELD_CONFIG="$OUT/cfg.conf" shield_load_config; }
-gen()  { cfg "$1"; ( shield_limits_resolve >/dev/null 2>&1; SH_F_IPV6=1; shield_nft_build_ruleset ) > "$LIVE"; }
+gen()  { cfg "$1"; ( shield_limits_resolve >/dev/null 2>&1; shield_nft_build_ruleset ) > "$LIVE"; }
 H()    { shield_health > "$OUT/h.txt" 2>&1; }
 has()  { grep -qF -- "$1" "$OUT/h.txt"; }
 sumf() { grep -oE "health: FAIL=[0-9]+ WARN=[0-9]+" "$OUT/h.txt"; }

@@ -43,6 +43,14 @@ printf 'NETDEV_BUDGET="444"\n' > "$NODE_CONFIG"
 node_load_config
 t "кавычки снимаются" 'test "$(node_conf_get NETDEV_BUDGET 0)" = 444'
 
+# --- 4b. 2026-10-12: # внутри кавычек НЕ комментарий — значение сохраняется целиком ---
+printf 'NETDEV_BUDGET="600 # мой комментарий"\n' > "$NODE_CONFIG"
+node_load_config
+t "кавычки: # внутри значения сохранён" 'test "$(node_conf_get NETDEV_BUDGET 0)" = "600 # мой комментарий"'
+printf "NETDEV_BUDGET='700 # одинарные кавычки'\n" > "$NODE_CONFIG"
+node_load_config
+t "одинарные кавычки: # внутри сохранён" 'test "$(node_conf_get NETDEV_BUDGET 0)" = "700 # одинарные кавычки"'
+
 # --- 5. пустое значение => default (авто-семантика) ---
 printf 'NETDEV_BUDGET=\n' > "$NODE_CONFIG"
 node_load_config

@@ -27,6 +27,8 @@ usage() {
   verify              проверка «фаервол жив»: хуки, правила, наборы, IPv6 fail-safe, whitelist SSH
   ports-sync          разово сверить защищаемые порты с реальностью (инбаунды Xray, UFW)
                       (--once — только снимок, --raw — технические счётчики)
+  ports-watch         цикл непрерывной синхронизации портов (для shieldnode-ports.service;
+                      вручную не запускают)
   rollback [id]       откат к backup-набору (без id — последний/удаление своих)
   emergency on|off    аварийный минимальный режим
   uninstall           полный откат + удаление своих файлов
@@ -58,7 +60,7 @@ done
 cmd="${POSITIONAL[0]:-apply}"
 subarg="${POSITIONAL[1]:-}"
 
-# вызов как `guard` (symlink /usr/local/sbin/guard → install.sh) = дашборд
+# вызов как `guard` (symlink /usr/local/sbin/guard → main.sh, см. persist.sh) = дашборд
 if [ "$cmd" = "apply" ] && [ "$(basename "$0")" = "guard" ]; then
     cmd="guard"
 fi

@@ -5,15 +5,12 @@
 set -euo pipefail
 
 # shield_ssh_whitelist_admin_runtime — немедленно добавить admin IP в whitelist-set.
+# v4-only: whitelist_v6 нет (IPv6 на ноде выключен обязательно — fail-safe в lib/nft.sh)
 shield_ssh_whitelist_admin_runtime() {
     [ "${DRY_RUN:-0}" = "1" ] && return 0
     if [ -n "$SH_F_ADMIN_V4" ]; then
         nft add element inet shieldnode whitelist_v4 "{ $SH_F_ADMIN_V4 }" 2>/dev/null \
             && log info "ssh" "admin $SH_F_ADMIN_V4 добавлен в whitelist_v4 (runtime)" || true
-    fi
-    if [ -n "${SH_F_ADMIN_V6:-}" ]; then
-        nft add element inet shieldnode whitelist_v6 "{ $SH_F_ADMIN_V6 }" 2>/dev/null \
-            && log info "ssh" "admin $SH_F_ADMIN_V6 добавлен в whitelist_v6 (runtime)" || true
     fi
 }
 

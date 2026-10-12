@@ -100,7 +100,8 @@ shield_self_test() {
 # (table/delete/table) обнуляла динамические сеты — каждый apply/emergency off
 # снимал все баны abusers и ручные temporary_blocklist (живая нода: бан
 # 133.18.122.63 пропал). Дамп: адрес + ОСТАТОК срока (expires) -> батч на сет.
-SHIELD_CARRY_SETS="ssh_abusers ssh_abusers_v6 tcp_abusers tcp_abusers_v6 udp_abusers udp_abusers_v6 temporary_blocklist temporary_blocklist_v6"
+# Наборы v4-only: IPv6 на ноде выключен обязательно, v6-сетов в таблице нет (fail-safe)
+SHIELD_CARRY_SETS="ssh_abusers tcp_abusers udp_abusers temporary_blocklist"
 shield_bans_carry_dump() { # <dir> — файл <dir>/<set>.nft на каждый непустой сет
     local dir="$1" s out
     mkdir -p "$dir"
@@ -237,6 +238,6 @@ shield_apply() {
     # --- контракт владения (ТЗ §15) ---
     shield_contract_write
 
-    ok "apply" "shieldnode применён: ssh=[$SH_F_SSH_PORTS] protected_tcp=[$SH_F_PROTECTED_TCP] protected_udp=[$SH_F_PROTECTED_UDP] admin4=[$SH_F_ADMIN_V4] admin6=[$SH_F_ADMIN_V6]"
+    ok "apply" "shieldnode применён: ssh=[$SH_F_SSH_PORTS] protected_tcp=[$SH_F_PROTECTED_TCP] protected_udp=[$SH_F_PROTECTED_UDP] admin4=[$SH_F_ADMIN_V4]"
     log info "apply" "backup ruleset: $bdump ; снапшот: $SHIELD_LAST_SNAPSHOT"
 }

@@ -19,12 +19,10 @@ mkdir -p "$SHIELD_STATE_DIR"; : > "$OUT/c"; : > "$OUT/log"
 nft -f - <<'NFT'
 table inet shieldnode {
     set ssh_abusers { type ipv4_addr; size 65536; flags dynamic,timeout; timeout 1h; }
-    set tcp_abusers_v6 { type ipv6_addr; size 65536; flags dynamic,timeout; timeout 15m; }
     set temporary_blocklist { type ipv4_addr; size 32768; flags dynamic,timeout; timeout 1h; }
 }
 NFT
 nft add element inet shieldnode ssh_abusers '{ 133.18.122.63, 198.51.100.7, 203.0.113.9 }'
-nft add element inet shieldnode tcp_abusers_v6 '{ 2001:db8::5, fd00::17 }'
 source "$SHIELD_DIR/lib/common.sh"; source "$SHIELD_DIR/config.sh"; shield_load_config >/dev/null 2>&1 || true
 source "$SHIELD_DIR/limits.sh"
 shield_abuse_journal_append
@@ -35,7 +33,7 @@ t() { local name="$1"; shift
 t "журнал: только ###/## заголовки и адреса (без elements/timeout/expires/скобок)" \
   "! grep -vE '^(### |## |[0-9a-f:.]+(/[0-9]+)?\$)' $J"
 t "журнал: ssh_abusers — все 3 адреса" "grep -qx 133.18.122.63 $J && grep -qx 198.51.100.7 $J && grep -qx 203.0.113.9 $J"
-t "журнал: v6 (в т.ч. на букву: fd00::17)" "grep -qx 2001:db8::5 $J && grep -qx fd00::17 $J"
+t "журнал: v6-сетов и v6-адресов нет (журнал v4-only, как и наборы)" "! grep -q '^## .*_v6' $J && ! grep -qE '^[^#]+:' $J"
 t "журнал: пустые сеты не пишутся" "! grep -qx '## temporary_blocklist' $J"
 # большой сет: явный предел 100 адресов, честный итог в заголовке
 nft add set inet shieldnode udp_abusers '{ type ipv4_addr; size 65536; flags dynamic,timeout; timeout 15m; }'

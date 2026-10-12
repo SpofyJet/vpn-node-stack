@@ -13,18 +13,6 @@ XANMOD_GPG_LEGACY=/etc/apt/trusted.gpg.d/xanmod-kpg.gpg
 
 node_kernel_is_xanmod() { uname -r | grep -qi xanmod; }
 
-# node_kernel_version_ge — сравнение версии текущего ядра: node_kernel_version_ge 6 15
-# Разбирает uname -r (форматы "6.15.2", "6.15.2-1-xanmod1", "5.15.0-105-generic").
-node_kernel_version_ge() {
-    local want_maj="$1" want_min="$2" cur_maj cur_min
-    cur_maj="$(uname -r | cut -d. -f1)"
-    cur_min="$(uname -r | cut -d. -f2 | cut -d- -f1)"
-    [[ "$cur_maj" =~ ^[0-9]+$ ]] || return 1
-    [[ "$cur_min" =~ ^[0-9]+$ ]] || return 1
-    if [ "$cur_maj" -gt "$want_maj" ]; then return 0; fi
-    [ "$cur_maj" -eq "$want_maj" ] && [ "$cur_min" -ge "$want_min" ]
-}
-
 # node_bbr_generation — "3" если модуль tcp_bbr ядра — BBRv3, иначе "1".
 # 2026-09-24 (v1.1.7): раньше «ядро >= 6.15 -> BBRv3 в мейнлайне» — ЛОЖНО: мейнлайн
 # (torvalds/master, 7.3-rc) содержит BBRv1 (tcp_bbr.c без inflight_lo и без версии).
