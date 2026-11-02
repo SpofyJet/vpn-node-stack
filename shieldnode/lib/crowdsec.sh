@@ -42,6 +42,61 @@ shield_crowdsec_whitelist_ips() {
     echo "$out" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
+# shield_crowdsec_feedonly_ensure — 2026-11-02 (v1.2.6): crowdsec на VPN-ноде — ТОЛЬКО
+# фетчер community blocklist (CAPI), без локальной детекции. Прод: демон парсил
+# kern.log/syslog — миллионы строк флода UFW/torrent-blocker в ноль срабатываний
+# (cscli metrics: 2.3M+2.3M lines read, 100% unparsed) — чистый расход CPU/RAM/IO.
+# Локальные ssh-баны дублируют rate/conn-limit'ы shieldnode на 22 порту. Сами списки
+# сообщества не зависят от acquisition: CAPI-синк демона идёт по таймеру независимо,
+# shieldnode-blocklist читает локальную БД (cscli decisions list -a) как раньше.
+# Идемпотентно: acquis.d/*.yaml генерирует `cscli setup` при установке/обновлении
+# пакета — на каждом apply источники вычищаются заново (бэкапы .pre-shieldnode-*).
+# НЮАНС (проверено на проде, 2026-11-02): crowdsec не стартует БЕЗ datasource
+# («FATAL: no datasource enabled») — поэтому вместо пустого acquisition оставляем
+# ОДИН источник-заглушку: пустой файл, в который никто не пишет. Демон доволен,
+# парсинга — ноль.
+shield_crowdsec_feedonly_ensure() {
+    local etc="${SHIELD_CROWDSEC_ETC:-/etc/crowdsec}" changed=0 f stub stub_yaml
+    stub="${SHIELD_FEEDONLY_STUB:-/var/log/shieldnode/crowdsec-feedonly.log}"
+    stub_yaml="$etc/acquis.d/99-shieldnode-feedonly.yaml"
+    [ -d "$etc" ] || return 0
+    # стоковый acquis.yaml (источники syslog) — очищаем
+    if [ -s "$etc/acquis.yaml" ]; then
+        backup "$etc/acquis.yaml" || true
+        : > "$etc/acquis.yaml"; changed=1
+    fi
+    # чужие источники (setup.linux/sshd от cscli setup) — удаляем, нашу заглушку не трогаем
+    for f in "$etc"/acquis.d/*.yaml; do
+        [ -e "$f" ] || continue
+        [ "$f" = "$stub_yaml" ] && continue
+        backup "$f" || true
+        rm -f "$f"; changed=1
+    done
+    # источник-заглушка: файл-дырка + yaml-дескриптор (контент фиксирован — перезаписи нет)
+    if ! [ -e "$stub_yaml" ]; then
+        mkdir -p "${stub%/*}" 2>/dev/null || true
+        [ -e "$stub" ] || : > "$stub" 2>/dev/null || true
+        printf '# shieldnode: crowdsec работает ТОЛЬКО как фетчер community blocklist (CAPI).\n# Локальные логи парсить не должен — см. lib/crowdsec.sh, shield_crowdsec_feedonly_ensure.\nfilenames:\n  - %s\nlabels:\n  type: syslog\nsource: file\n' "$stub" > "$stub_yaml"
+        changed=1
+    fi
+    # файл-заглушку мог съесть logrotate/чистка — восстанавливаем молча (restart не нужен)
+    [ -e "$stub" ] || : > "$stub" 2>/dev/null || true
+    if [ "$changed" = "1" ]; then
+        if systemctl is-active --quiet crowdsec.service 2>/dev/null; then
+            systemctl restart crowdsec.service >/dev/null 2>&1 \
+                || warn "crowdsec" "restart после отключения acquisition не удался — journalctl -u crowdsec"
+        elif systemctl is-enabled --quiet crowdsec.service 2>/dev/null; then
+            # сервис упал/не поднялся (наш прошлый restart с «no datasource») — поднимаем
+            systemctl start crowdsec.service >/dev/null 2>&1 \
+                || warn "crowdsec" "start crowdsec не удался — journalctl -u crowdsec"
+        fi
+        log info "crowdsec" "feed-only: локальный парсинг логов отключён (демон тянет только community blocklist по CAPI)"
+    else
+        log debug "crowdsec" "feed-only: acquisition уже в заглушке — не тронуто"
+    fi
+    return 0
+}
+
 # shield_crowdsec_agent_ensure — установить/починить crowdsec-агент (idempotent).
 # Только Debian/Ubuntu (apt). Остальное — честный warn с инструкцией.
 shield_crowdsec_agent_ensure() {
@@ -99,6 +154,10 @@ shield_crowdsec_agent_ensure() {
     fi
 
     [ "${DRY_RUN:-0}" = "1" ] || shield_crowdsec_lapi_port_fix || true
+    # 2026-11-02 (v1.2.6): agent = фетчер community blocklist, НЕ детектор (подробности
+    # в шапке shield_crowdsec_feedonly_ensure). Порядок важен: ДО регистрации/whitelist'а,
+    # чтобы демон стартовал уже без источников логов.
+    [ "${DRY_RUN:-0}" = "1" ] || shield_crowdsec_feedonly_ensure || true
 
     # CAPI-регистрация (анонимная — аккаунт консоли НЕ нужен)
     if ! _cscli capi status >/dev/null 2>&1; then
