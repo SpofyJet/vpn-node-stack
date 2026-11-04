@@ -16,6 +16,14 @@ node_udp_plan() {
         4) udp_mem="743988 991988 1487976" ;;  # ~6 GB ceiling
         *) udp_mem="89385 119181 178770" ;;    # неизвестный tier — безопасный средний (T2)
     esac
+    # 2026-11-04 (v1.2.7): потолок по tier — абсолютное число, и внизу tier он занимал до 69% RAM
+    # (T3 на 4.1 ГБ → 2.84 ГБ; вместе с tcp_mem 25% буферы могли взять >90% памяти до OOM-killer'а,
+    # если rw-core «встал» с тысячами UDP-сокетов). Теперь каждое из трёх значений ≤ 12/16/20% RAM.
+    # Живые ноды (7.8 ГБ, 2026-11-04): UDP mem 1–4 тыс. страниц при потолке 744 тыс.; после cap — 406 тыс.
+    udp_mem="$(awk -v t="$udp_mem" '/^MemTotal:/ { pg = $2 / 4; split(t, v, " ");
+        c[1] = int(pg * 0.12); c[2] = int(pg * 0.16); c[3] = int(pg * 0.20)
+        for (i = 1; i <= 3; i++) if (c[i] > 0 && v[i] > c[i]) v[i] = c[i]
+        printf "%d %d %d", v[1], v[2], v[3] }' "${NODE_PROC_ROOT:-/proc}/meminfo" 2>/dev/null || echo "$udp_mem")"
     # UDP шарит rmem/wmem_max с TCP (net.core.*) — здесь только udp_mem + min
     udp_mem="$(node_conf_get UDP_MEM "$udp_mem")"
     node_sysctl_add "$NODE_SYSCTL_BASE" net.ipv4.udp_mem "$udp_mem"

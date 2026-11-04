@@ -80,7 +80,10 @@ node_softnet_value() {
     [ "$(node_conf_get AUTO_SOFTNET_TUNE 1)" = "1" ] || { echo "$v"; return 0; }
     node_conf_user_set "$key" && { echo "$v"; return 0; }
     case "$kind" in
-        drop)    [ "${_NODE_SN_DROP:-0}" -gt 0 ] && v=$((v * 2)) ;;
+        # 2026-11-04 (v1.2.7): как squeeze (v1.2.0) — единичные drop'''ы в первые минуты после boot (счётчики
+        # softnet обнуляются на reboot) раскачивали backlog 8192<->16384 между apply (B3). Требуем
+        # ≥100 000 обработанных пакетов и долю drop > 0.01%, иначе оставляем базовое значение.
+        drop)    [ "${_NODE_SN_PROC:-0}" -ge 100000 ] && [ "${_NODE_SN_DROP:-0}" -gt 0 ] && [ $(( ${_NODE_SN_DROP:-0} * 10000 )) -gt "${_NODE_SN_PROC:-0}" ] && v=$((v * 2)) ;;
         # squeeze > 0.1% processed: единичные исторические squeeze не в счёт
         # 2026-09-26 (v1.2.0): и не меньше 100 000 обработанных пакетов — на лабе после rollback решение
         # принималось по 32 squeeze из 4558 пакетов (шум первых минут после boot): budget прыгал
