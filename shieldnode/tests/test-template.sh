@@ -85,7 +85,7 @@ t "protected_tcp/udp с портами" bash -c "grep -q 'set protected_tcp' '$R
 # 2026-10-09 (v1.2.5): бан SSH-подбора режет только SSH-порты — не VPN-трафик CGNAT-соседей
 t "ssh_abusers: drop только на SSH-портах (не весь трафик IP)" bash -c "grep -qE 'tcp dport \\{ 22,2222 \\} ip saddr @ssh_abusers .* drop' '$RS' && ! grep -qE '^[[:space:]]+ip saddr @ssh_abusers ' '$RS'"
 t "API ноды: панель принимается до блок-листов (только порт API)" bash -c "awk '/tcp dport @node_api_port ip saddr @node_api_allow_v4 accept/{a=NR} /@scanner_blocklist_v4 counter/{b=NR} END{exit !(a && b && a<b)}' '$RS'"
-t "per-src rate-limit ТОЛЬКО через meter" bash -c "grep -q 'meter ssh_new_22' '$RS' && grep -q 'meter tcp_syn' '$RS' && grep -q 'meter udp_rate' '$RS'"
+t "per-src rate-limit ТОЛЬКО через meter" bash -c "grep -q 'update @ssh_new_22' '$RS' && grep -q 'update @tcp_syn' '$RS' && grep -q 'update @udp_rate' '$RS'"
 t "plain limit только для global ceiling" bash -c "grep -q 'limit rate over 8000/minute counter name c_drops_global_tcp drop' '$RS' && grep -q 'limit rate over 20000/second counter name c_drops_global_udp drop' '$RS'"
 t "global ceiling scope: SYN-потолок только на protected_tcp (SSH не задевает)" grep -q 'tcp dport @protected_tcp tcp flags syn ct state new limit rate over 8000/minute' "$RS"
 # --- глобальные потолки: дефолт 0 (off, опасны на CGNAT) — правила НЕ эмитятся ---
@@ -115,26 +115,30 @@ SH_F_ENABLE_ANTISPOOF=0
 # --- отсутствие абьюз-лимитинга при ENABLE_ABUSE_LIMITING=0 ---
 SH_F_ENABLE_ABUSE_LIMITING=0
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-noabuse.nft
-t "выключение abuse-limiting убирает политики" bash -c "! grep -q 'meter tcp_syn' /tmp/shieldnode-test/ruleset-noabuse.nft"
+# 2026-11-04 (v1.2.7): rate-limit наборы с timeout — inline meter без timeout переполнялся (65535)
+# и новые источники проходили мимо лимита
+t "rate-limit наборы объявлены с timeout (не переполняются навсегда)" bash -c "for s in icmp_echo4 ssh_new_22 tcp_syn tcp_new udp_rate; do awk -v s=\"set \$s {\" '\$0 ~ s {on=1} on && /timeout [0-9]+s/ {f=1} on && /^    }/ {exit} END{exit !f}' '$RS' || exit 1; done"
+t "ни одного inline meter (без timeout) в правилах" bash -c "! grep -qE '(^|[^#]) meter [a-z_0-9]+ \\{' '$RS'"
+t "выключение abuse-limiting убирает политики" bash -c "! grep -q 'update @tcp_syn' /tmp/shieldnode-test/ruleset-noabuse.nft"
 SH_F_ENABLE_ABUSE_LIMITING=1
 
 # --- ENABLE_SYN_PROTECTION: мастер-выключатель только SYN-rate правила ---
 SH_F_ENABLE_SYN_PROTECTION=0
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-nosyn.nft
 t "SYN_PROTECTION=0 убирает syn-meter, НЕ трогает new-rate/conn-limit" \
-    bash -c "! grep -q 'meter tcp_syn' /tmp/shieldnode-test/ruleset-nosyn.nft && grep -q 'meter tcp_new' /tmp/shieldnode-test/ruleset-nosyn.nft && grep -q 'ct count over 15000' /tmp/shieldnode-test/ruleset-nosyn.nft"
+    bash -c "! grep -q 'update @tcp_syn' /tmp/shieldnode-test/ruleset-nosyn.nft && grep -q 'update @tcp_new' /tmp/shieldnode-test/ruleset-nosyn.nft && grep -q 'ct count over 15000' /tmp/shieldnode-test/ruleset-nosyn.nft"
 SH_F_ENABLE_SYN_PROTECTION=1
 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-synback.nft
-t "SYN_PROTECTION=1 возвращает syn-meter" bash -c "grep -q 'meter tcp_syn' /tmp/shieldnode-test/ruleset-synback.nft"
+t "SYN_PROTECTION=1 возвращает syn-meter" bash -c "grep -q 'update @tcp_syn' /tmp/shieldnode-test/ruleset-synback.nft"
 t "транзит (daddr не нода) пропускается ДО API-ноды/whitelist/лимитов" bash -c "awk '/iif \"lo\" accept/{l=NR} /fib daddr type unicast accept/{f=NR} /tcp dport @node_api_port/{a=NR} END{exit !(l && f && a && l < f && f < a)}' '$RS'"
 # 2026-09-27 (v1.2.2): как старый shield 4.1.0 (CGNAT-safe) — по умолчанию per-IP лимиты НЕ банят никого
-t "по умолчанию нет ни одного авто-бана по частоте (add @tcp_abusers / add @udp_abusers)" bash -c "! grep -q 'add @tcp_abusers' '$RS' && ! grep -q 'add @udp_abusers' '$RS' && ! grep -q 'meter tcp_synflood' '$RS'"
-t "TCP: мягкий SYN-лимит 2000/с burst 3000 без бана" bash -c "grep -q 'meter tcp_syn { ip saddr limit rate over 2000/second burst 3000 packets } counter name c_drops_syn_limit_v4 drop' '$RS'"
-t "TCP: мягкий лимит новых 40000/мин burst 60000 без бана" bash -c "grep -q 'meter tcp_new { ip saddr limit rate over 40000/minute burst 60000 packets } counter name c_drops_newconn_limit_v4 drop' '$RS'"
-t "UDP: 20000/с burst 40000 без бана" bash -c "grep -q 'meter udp_rate { ip saddr limit rate over 20000/second burst 40000 packets } counter name c_drops_udp_limit_v4 drop' '$RS'"
+t "по умолчанию нет ни одного авто-бана по частоте (add @tcp_abusers / add @udp_abusers)" bash -c "! grep -q 'add @tcp_abusers' '$RS' && ! grep -q 'add @udp_abusers' '$RS' && ! grep -q 'update @tcp_synflood' '$RS'"
+t "TCP: мягкий SYN-лимит 2000/с burst 3000 без бана" bash -c "grep -q 'update @tcp_syn { ip saddr limit rate over 2000/second burst 3000 packets } counter name c_drops_syn_limit_v4 drop' '$RS'"
+t "TCP: мягкий лимит новых 40000/мин burst 60000 без бана" bash -c "grep -q 'update @tcp_new { ip saddr limit rate over 40000/minute burst 60000 packets } counter name c_drops_newconn_limit_v4 drop' '$RS'"
+t "UDP: 20000/с burst 40000 без бана" bash -c "grep -q 'update @udp_rate { ip saddr limit rate over 20000/second burst 40000 packets } counter name c_drops_udp_limit_v4 drop' '$RS'"
 t "abuse-наборы остаются и их drop-правила (перенос банов, ручные баны)" bash -c "grep -q 'ip saddr @tcp_abusers counter name c_drops_tcp_abusers_v4 drop' '$RS' && grep -q 'ip saddr @udp_abusers counter name c_drops_udp_abusers_v4 drop' '$RS'"
 SH_R_TCP_SYN_BAN_RATE=20000 shield_nft_build_ruleset > /tmp/shieldnode-test/ruleset-synban.nft
-t "опц. TCP_SYN_BAN_RATE=20000: ровно одно бан-правило, ДО мягкого лимита" bash -c "test \$(grep -c 'add @tcp_abusers ' /tmp/shieldnode-test/ruleset-synban.nft) = 1 && grep -q 'meter tcp_synflood { ip saddr limit rate over 20000/second burst 20000 packets } add @tcp_abusers' /tmp/shieldnode-test/ruleset-synban.nft && awk '/meter tcp_synflood /{f=NR} /meter tcp_syn \\{/{s=NR} END{exit !(f && s && f < s)}' /tmp/shieldnode-test/ruleset-synban.nft"
+t "опц. TCP_SYN_BAN_RATE=20000: ровно одно бан-правило, ДО мягкого лимита" bash -c "test \$(grep -c 'add @tcp_abusers ' /tmp/shieldnode-test/ruleset-synban.nft) = 1 && grep -q 'update @tcp_synflood { ip saddr limit rate over 20000/second burst 20000 packets } add @tcp_abusers' /tmp/shieldnode-test/ruleset-synban.nft && awk '/update @tcp_synflood /{f=NR} /update @tcp_syn \\{/{s=NR} END{exit !(f && s && f < s)}' /tmp/shieldnode-test/ruleset-synban.nft"
 
 # --- агрегаторские блоклисты: сеты + drop-правила ПОСЛЕ whitelist ---
 t "blocklist: наборы scanner/threat/custom (tor выключен)" bash -c "grep -q 'set scanner_blocklist_v4' '$RS' && grep -q 'set threat_blocklist_v4' '$RS' && grep -q 'set custom_blocklist_v4' '$RS' && ! grep -q 'set tor_exit_blocklist_v4' '$RS'"
@@ -206,7 +210,7 @@ t "counters: spamhaus/cins/amp/icmp счётчики на месте" bash -c "g
 t "amp-guard: NEW UDP с amplifier source-портами дропается" bash -c "grep -q 'udp sport { 53, 123, 1900, 11211, 389 }' '$RS'"
 # 2026-09-24 (v1.1.4): backlog #4 — лимит стал per-source (meter по saddr); литерал глобальной
 # формы заменён шаблоном для обеих форм + проверка порядка, обещанного названием проверки
-t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -qE 'icmp type echo-request (meter icmp_echo4 \{ ip saddr )?limit rate over 10/second' '$RS' && awk '/packet-too-big/{p=NR} /echo-request.*limit rate/{if(!l)l=NR} END{exit !(p && l && p<l)}' '$RS'"
+t "icmp-guard: v6 PMTUD-exceptions (packet-too-big) accept'ятся ДО rate-limit" bash -c "grep -q 'icmpv6 type { packet-too-big, time-exceeded, parameter-problem } accept' '$RS' && grep -qE 'icmp type echo-request (update @icmp_echo4 \{ ip saddr )?limit rate over 10/second' '$RS' && awk '/packet-too-big/{p=NR} /echo-request.*limit rate/{if(!l)l=NR} END{exit !(p && l && p<l)}' '$RS'"
 t "counters: КАЖДОЕ drop-правило несёт counter name" bash -c "test \$(grep -cE '^[[:space:]]*[^#[:space:]].* drop$' '$RS') = \$(grep -c 'counter name c_drops_' '$RS')"
 t "counters: scanner/threat/tor/custom — свои счётчики v4, v6-счётчиков нет" bash -c "grep -q 'c_drops_scanner_v4' '$RS' && grep -q 'c_drops_threat_v4' '$RS' && grep -q 'c_drops_custom_v4' '$RS' && ! grep -qE 'c_drops_(scanner|threat|tor|custom)_v6' '$RS'"
 t "counters: syn/tcp/udp/ssh-abusers + global + invalid + antispoof (v4-only, v6 нет)" bash -c "grep -q 'c_drops_syn_v4' '$RS' && grep -q 'c_drops_global_tcp' '$RS' && grep -q 'c_drops_global_udp' '$RS' && grep -q 'c_drops_invalid' '$RS' && grep -q 'c_drops_antispoof' '$RS' && ! grep -qE 'c_drops_[a-z_]+_v6' '$RS'"

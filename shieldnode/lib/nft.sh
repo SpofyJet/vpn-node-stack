@@ -77,6 +77,24 @@ EOF
         printf '' | shield_nft_emit_set ssh_connlimit ipv4_addr "size $SH_R_SSH_ABUSERS_SIZE" "flags dynamic"
         printf '' | shield_nft_emit_set tcp_connlimit ipv4_addr "size $SH_R_TCP_ABUSERS_SIZE" "flags dynamic"
 
+        # --- per-source rate-limit наборы (v1.2.7). Раньше это были inline `meter` без timeout:
+        # элементы не истекали до apply/reboot, и когда meter доходил до size 65535 (Germany —
+        # за 24 дня аптайма), НОВЫЕ источники проходили мимо limit вообще (замер в netns, nft 1.0.9:
+        # полный meter → 5/5 пакетов прошли при лимите 1). `update @set` продлевает timeout на каждом
+        # пакете, поэтому активный источник сохраняет состояние, а ушедшие истекают.
+        # timeout ≥ периода лимита: /second → 60 s, /minute → 300 s.
+        echo "    # --- per-source rate-limit sets (dynamic, timeout)"
+        printf '' | shield_nft_emit_set icmp_echo4 ipv4_addr "size 65535" "flags dynamic,timeout" "timeout 60s"
+        printf '' | shield_nft_emit_set icmp_echo6 ipv6_addr "size 65535" "flags dynamic,timeout" "timeout 60s"
+        local _p
+        for _p in $SH_F_SSH_PORTS; do
+            printf '' | shield_nft_emit_set "ssh_new_$_p" ipv4_addr "size 65535" "flags dynamic,timeout" "timeout 300s"
+        done
+        printf '' | shield_nft_emit_set tcp_synflood ipv4_addr "size 65535" "flags dynamic,timeout" "timeout 60s"
+        printf '' | shield_nft_emit_set tcp_syn ipv4_addr "size 65535" "flags dynamic,timeout" "timeout 60s"
+        printf '' | shield_nft_emit_set tcp_new ipv4_addr "size 65535" "flags dynamic,timeout" "timeout 300s"
+        printf '' | shield_nft_emit_set udp_rate ipv4_addr "size 65535" "flags dynamic,timeout" "timeout 60s"
+
         echo "    # --- защищаемые порты (ssh + Xray-detected; exclude §30 вычтен)"
         for p in $SH_F_PROTECTED_TCP; do echo "$p"; done | shield_nft_emit_set protected_tcp inet_service "flags interval" "auto-merge"
         for p in $SH_F_PROTECTED_UDP; do echo "$p"; done | shield_nft_emit_set protected_udp inet_service "flags interval" "auto-merge"
@@ -231,8 +249,8 @@ EOF
         # флуд одного источника резал легитимный ping остальных. Лимит видит только
         # НОВЫЕ ICMP-потоки: echo в рамках одного id — ct established и принимается выше
         # (accept established до любого drop — жёсткое ограничение anti-lockout).
-        ip protocol icmp icmp type echo-request meter icmp_echo4 { ip saddr limit rate over 10/second burst 20 packets } counter name c_drops_icmp drop
-        icmpv6 type echo-request meter icmp_echo6 { ip6 saddr limit rate over 10/second burst 20 packets } counter name c_drops_icmp drop
+        ip protocol icmp icmp type echo-request update @icmp_echo4 { ip saddr limit rate over 10/second burst 20 packets } counter name c_drops_icmp drop
+        icmpv6 type echo-request update @icmp_echo6 { ip6 saddr limit rate over 10/second burst 20 packets } counter name c_drops_icmp drop
 EOF
         fi
 
@@ -276,7 +294,7 @@ EOF
             for port in $SH_F_SSH_PORTS; do
                 cat <<EOF
         # SSH port $port: новые > $SH_R_SSH_NEW_RATE/min burst $SH_R_SSH_NEW_BURST (per-src) -> ban
-        tcp dport $port ct state new meter ssh_new_$port { ip saddr limit rate over $SH_R_SSH_NEW_RATE/minute burst $SH_R_SSH_NEW_BURST packets } add @ssh_abusers { ip saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } counter name c_drops_ssh_abusers_v4 drop
+        tcp dport $port ct state new update @ssh_new_$port { ip saddr limit rate over $SH_R_SSH_NEW_RATE/minute burst $SH_R_SSH_NEW_BURST packets } add @ssh_abusers { ip saddr timeout ${SH_R_SSH_ABUSERS_TIMEOUT}s } counter name c_drops_ssh_abusers_v4 drop
 EOF
                 cat <<EOF
         # SSH port $port: > $SH_R_SSH_CONN_MAX одновременных conntrack с одного src -> drop
@@ -300,18 +318,18 @@ EOF
                 # (TCP_SYN_BAN_RATE > 0), по умолчанию выключен.
                 [ "$SH_R_TCP_SYN_BAN_RATE" -gt 0 ] && cat <<EOF
         # опц. бан за SYN-флуд: > $SH_R_TCP_SYN_BAN_RATE SYN/с (burst $SH_R_TCP_SYN_BAN_BURST) с одного IP -> бан на ${SH_R_TCP_ABUSERS_TIMEOUT} с
-        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_synflood { ip saddr limit rate over $SH_R_TCP_SYN_BAN_RATE/second burst $SH_R_TCP_SYN_BAN_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v4 drop
+        tcp dport @protected_tcp tcp flags syn ct state new update @tcp_synflood { ip saddr limit rate over $SH_R_TCP_SYN_BAN_RATE/second burst $SH_R_TCP_SYN_BAN_BURST packets } add @tcp_abusers { ip saddr timeout ${SH_R_TCP_ABUSERS_TIMEOUT}s } counter name c_drops_syn_v4 drop
 EOF
                 cat <<EOF
         # мягкий лимит SYN > $SH_R_TCP_SYN_RATE/с (burst $SH_R_TCP_SYN_BURST) с одного IP: лишние SYN отбрасываются БЕЗ бана
         # (старый shield: 2000/с; CGNAT 200 абонентов при reconnect-шторме ≈ 2000 SYN/с; флуд — 50k-500k/с)
-        tcp dport @protected_tcp tcp flags syn ct state new meter tcp_syn { ip saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } counter name c_drops_syn_limit_v4 drop
+        tcp dport @protected_tcp tcp flags syn ct state new update @tcp_syn { ip saddr limit rate over $SH_R_TCP_SYN_RATE/second burst $SH_R_TCP_SYN_BURST packets } counter name c_drops_syn_limit_v4 drop
 EOF
             fi
             cat <<EOF
         # мягкий лимит новых соединений per-src > $SH_R_TCP_NEW_RATE/мин burst $SH_R_TCP_NEW_BURST — лишние отбрасываются, без бана
         # (старый shield: 40000/мин burst 60000 — reconnect-шторм CGNAT 200 абонентов ≈ 10000/мин)
-        tcp dport @protected_tcp ct state new meter tcp_new { ip saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } counter name c_drops_newconn_limit_v4 drop
+        tcp dport @protected_tcp ct state new update @tcp_new { ip saddr limit rate over $SH_R_TCP_NEW_RATE/minute burst $SH_R_TCP_NEW_BURST packets } counter name c_drops_newconn_limit_v4 drop
 EOF
             cat <<EOF
         # TCP-политика: > $SH_R_TCP_CONN_MAX одновременных conntrack с одного src (CGNAT-лояльно)
@@ -331,7 +349,7 @@ EOF
         # UDP-политика (§23, v1.2.2): per-src > $SH_R_UDP_RATE/s burst $SH_R_UDP_BURST — лишние пакеты отбрасываются
         # БЕЗ бана (как старый shield, CGNAT-safe); видит только НОВЫЕ UDP-потоки — established (сессии
         # Hysteria2/QUIC после ответа сервера) приняты выше и лимитом не режутся
-        udp dport @protected_udp meter udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } counter name c_drops_udp_limit_v4 drop
+        udp dport @protected_udp update @udp_rate { ip saddr limit rate over $SH_R_UDP_RATE/second burst $SH_R_UDP_BURST packets } counter name c_drops_udp_limit_v4 drop
 EOF
             if [ "$SH_R_UDP_GLOBAL_CEIL" -gt 0 ]; then
                 cat <<EOF
