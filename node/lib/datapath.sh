@@ -227,12 +227,24 @@ node_datapath_plan() {
     [ "$memp" -ge 256 ] || memp=256
     node_sysctl_add "$f" net.ipv4.tcp_mem "$((memp*3/4)) $((memp*7/8)) $memp"
 
-    # 2026-09-24 (v1.1.7): rmem_default/wmem_default — дефолтный буфер ВСЕХ не-TCP сокетов
-    # (UDP, netlink, ...). Прежние 8 МБ (T3/T4) давали каждому UDP-сокету Xray-relay
-    # очередь до ~5500 пакетов = до секунд задержки real-time трафика; QUIC (quic-go)
-    # ставит свой буфер сам (нужен лишь rmem_max, см. tcp.sh). Дефолт ядра, если не задано явно.
+    # 2026-11-04 (v1.2.8): rmem_default 2 МиБ по умолчанию — ПРИЁМНЫЙ буфер всех не-TCP
+    # сокетов (UDP/netlink). Замер на боевых нодах (/proc/net/snmp): node-hy RcvbufErrors
+    # ~0.9%, node-nl2 ~2.1% от InDatagrams — проксируемый клиентский UDP (freedom-исходящий:
+    # QUIC/HTTP3 к сайтам) получал дефолтные ~208 КБ и переполнялся на всплеске/паузе
+    # планировщика (single-queue virtio: softirq вытесняется, читатель замирает на ~15 мс).
+    # Лаб-подтверждение (netns, один читатель+флуд, меняется только SO_RCVBUF): 208КБ=3.85%
+    # потерь, 2МБ=0.00%, 4/8МБ — без улучшения. 2 МБ = «золотая середина»: поглощает паузу
+    # ~15 мс (~1700 пакетов), но НЕ даёт отставшему читателю копить секунды, как прежние 8 МБ
+    # (T3/T4, откачены в v1.1.7 — верно для ТОГО значения). Для loss-sensitive QUIC буфер
+    # строго лучше дропа: дроп = ретрансмит ≥1 RTT (100 мс+) против ≤паузы здесь; в норме
+    # (читатель успевает) буфер почти пуст = +0 задержки. ВАЖНО — это приёмный буфер, не
+    # передающий: bufferbloat/задержка на отправке лечится fq/pacing (wmem_default НЕ трогаем).
+    # Память безопасна: агрегат UDP ограничен udp_mem (см. udp.sh, MemErrors=0 на всех нодах).
+    # quic-go (слушающий сокет Hysteria) ставит свой буфер сам — ему нужен лишь rmem_max.
+    # Откат — из rt-реестра (node_sysctl_add). Явный NET_RMEM_DEFAULT переопределяет.
     local tier; tier="$(node_ram_tier)"
-    node_conf_user_set NET_RMEM_DEFAULT && node_sysctl_add "$NODE_SYSCTL_BASE" net.core.rmem_default "$(node_conf_get NET_RMEM_DEFAULT 212992)"
+    [ "$(node_conf_get ENABLE_RMEM_DEFAULT_TUNE 1)" = "1" ] && \
+        node_sysctl_add "$NODE_SYSCTL_BASE" net.core.rmem_default "$(node_conf_get NET_RMEM_DEFAULT 2097152)"
     node_conf_user_set NET_WMEM_DEFAULT && node_sysctl_add "$NODE_SYSCTL_BASE" net.core.wmem_default "$(node_conf_get NET_WMEM_DEFAULT 212992)"
 
     # --- vm/fs-блок (порт прод-значений старого стека, v5.12.0/v6.0.0) ---

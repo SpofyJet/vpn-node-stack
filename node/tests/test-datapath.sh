@@ -85,8 +85,9 @@ t "plan: tcp_mem по формуле 25% RAM" bash -c "grep -q \"net.ipv4.tcp_me
 printf 'MemTotal:        4009152 kB\n' > /tmp/node-dp-test/mi1; printf 'MemTotal:        4009136 kB\n' > /tmp/node-dp-test/mi2
 tm() { ( NODE_PROC_MEMINFO="$1"; replan; awk -F'\t' '$1 == "net.ipv4.tcp_mem" {print $2}' "$PLAN" ) 2>/dev/null; }
 t "v1.2.1: tcp_mem не меняется от колебания MemTotal на 16 КБ" bash -c "[ \"$(tm /tmp/node-dp-test/mi1)\" = \"$(tm /tmp/node-dp-test/mi2)\" ] && [ -n \"$(tm /tmp/node-dp-test/mi1)\" ]"
-# 2026-09-24 (v1.1.7): ревизия тюнинга — rmem/wmem_default по умолчанию НЕ пишутся (дефолт ядра)
-t "plan: rmem_default/wmem_default по умолчанию не трогаются" bash -c "! grep -qE 'net.core.[rw]mem_default' '$PLAN'"
+# 2026-11-04 (v1.2.8): rmem_default -> 2 МиБ по умолчанию (UDP RcvbufErrors, замер); wmem_default — НЕТ
+t "plan: rmem_default=2МиБ по умолчанию (v1.2.8)" bash -c "grep -q 'net.core.rmem_default	2097152' '$PLAN'"
+t "plan: wmem_default по умолчанию не трогается" bash -c "! grep -q 'net.core.wmem_default' '$PLAN'"
 t "plan: dirty_background_bytes=64MB" bash -c "grep -q 'vm.dirty_background_bytes	67108864' '$PLAN'"
 t "plan: dirty_bytes=256MB" bash -c "grep -q 'vm.dirty_bytes	268435456' '$PLAN'"
 t "plan: dirty_ratio ОТСУТСТВУЮТ (bytes перекрывают ratio)" bash -c "! grep -qE 'vm.dirty_background_ratio|vm.dirty_ratio	' '$PLAN'"
