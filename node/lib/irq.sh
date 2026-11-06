@@ -14,14 +14,39 @@ node_cpumask_hex() {
     if [ "$hi" -eq 0 ]; then printf '%x' "$lo"; else printf '%x,%08x' "$hi" "$lo"; fi
 }
 
+# node_rx_irq_cpus <ifname> — 2026-11-06 (v1.2.9): CPU, на которых реально стоят прерывания
+# приёма (stdout, по одному). Ядро выбирает CPU при загрузке, поэтому он бывает любым:
+# на живых 4-ядерных нодах input-IRQ стоял на CPU0, а на se1 на CPU2. Пусто, если метка
+# очереди не опознана или нет effective_affinity_list: тогда node_rps_mask угадывает как раньше.
+node_rx_irq_cpus() {
+    local ifname="$1" procroot="${NODE_PROC_ROOT:-/proc}" irq label list part a b c
+    while read -r irq; do
+        [ -n "$irq" ] || continue
+        label="$(awk -v n="$irq:" '$1 == n { print $NF }' "$procroot/interrupts" 2>/dev/null || true)"
+        case "$label" in
+            *-input.*|*[Rr][Xx]-*|*-[Rr][Xx]*) ;;
+            *) continue ;;
+        esac
+        list="$(cat "$procroot/irq/$irq/effective_affinity_list" 2>/dev/null || true)"
+        for part in ${list//,/ }; do
+            a="${part%-*}"; b="${part#*-}"
+            [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || continue
+            for ((c=a; c<=b; c++)); do echo "$c"; done
+        done
+    done < <(node_nic_irq_candidates "$ifname" 2>/dev/null || true)
+}
+
 # node_rps_mask <ifname> <rx-очередей> <cpus> — 2026-09-24 (v1.1.7): битмаска rps_cpus (десятичная).
 # По Documentation/networking/scaling.rst: CPU того же NUMA-узла, что и NIC
-# (/sys/class/net/<if>/device/numa_node; -1/нет файла — все CPU), и без CPU 0..queues-1,
-# обычно обслуживающих прерывания очередей («at high interrupt rate, it might be wise to
-# exclude the interrupting CPU»). Если после исключения пусто — берём NUMA-локальные целиком.
+# (/sys/class/net/<if>/device/numa_node; -1/нет файла — все CPU), и без CPU с прерываниями
+# очередей («at high interrupt rate, it might be wise to exclude the interrupting CPU»).
+# 2026-11-06 (v1.2.9): от 4 CPU исключаем реальные CPU из node_rx_irq_cpus. На 2 CPU
+# правка только перенесла бы нагрузку и добавила около 5 тысяч IPI/с, поэтому там, и когда
+# реальный CPU неизвестен, исключаем CPU 0..queues-1. Если после исключения пусто — берём
+# NUMA-локальные целиком.
 # CAP=64: одно hex-слово на группу — node_cpumask_hex покрывает только CPU 0..63.
 node_rps_mask() {
-    local ifname="$1" queues="$2" cpus="$3" sr="${NODE_SYS_ROOT:-/sys}" eff numa list part a b c local_m=0 mask
+    local ifname="$1" queues="$2" cpus="$3" sr="${NODE_SYS_ROOT:-/sys}" eff numa list part a b c local_m=0 mask irq_cpus=""
     eff=$cpus; [ "$eff" -gt 64 ] && eff=64
     numa="$(cat "$sr/class/net/$ifname/device/numa_node" 2>/dev/null || echo -1)"
     list=""
@@ -35,7 +60,14 @@ node_rps_mask() {
     fi
     [ "$local_m" -ne 0 ] || for ((c=0; c<eff; c++)); do local_m=$((local_m | 1 << c)); done
     mask=$local_m
-    for ((c=0; c<queues && c<eff; c++)); do mask=$((mask & ~(1 << c))); done
+    [ "$eff" -lt 4 ] || irq_cpus="$(node_rx_irq_cpus "$ifname")"
+    if [ -n "$irq_cpus" ]; then
+        for c in $irq_cpus; do
+            if [ "$c" -lt "$eff" ]; then mask=$((mask & ~(1 << c))); fi
+        done
+    else
+        for ((c=0; c<queues && c<eff; c++)); do mask=$((mask & ~(1 << c))); done
+    fi
     [ "$mask" -ne 0 ] || mask=$local_m
     echo "$mask"
 }
@@ -82,7 +114,7 @@ node_irq_apply() {
     # 2026-09-24 (v1.1.7): RPS по умолчанию (ENABLE_RPS=1) — только когда RX-очередей меньше,
     # чем CPU (типичный virtio-net VPS: 1 очередь на 2-8 vCPU — весь стек UDP/TCP на одном ядре).
     # При queues >= cpus RSS уже раскладывает по ядрам и RPS избыточен (scaling.rst) — пропуск.
-    # Маска — node_rps_mask (NUMA-локальные CPU, без обслуживающих очереди).
+    # Маска — node_rps_mask (NUMA-локальные CPU, без CPU с прерываниями приёма).
     if [ "$(node_conf_get ENABLE_RPS 1)" = "1" ]; then
         if [ "$queues" -ge 1 ] && [ "$queues" -lt "$cpus" ]; then
             local mask q qn orig sr="${NODE_SYS_ROOT:-/sys}"

@@ -168,6 +168,8 @@ RX=/tmp/node-irt-test/rps
 mkdir -p "$RX/class/net/eth0/device" "$RX/class/net/eth0/queues/rx-0" "$RX/devices/system/node/node1"
 echo 0 > "$RX/class/net/eth0/queues/rx-0/rps_cpus"
 echo -1 > "$RX/class/net/eth0/device/numa_node"
+# Реальный /proc хоста не должен влиять на проверки ниже: без фикстуры IRQ неизвестны.
+export NODE_PROC_ROOT="$RX/proc-empty"; mkdir -p "$NODE_PROC_ROOT"
 t "rps_mask: 1 очередь, 4 CPU, без NUMA -> CPU1-3 (e)"   '[ "$(NODE_SYS_ROOT=$RX node_rps_mask eth0 1 4)" = 14 ]'
 t "rps_mask: 1 очередь, 2 CPU -> CPU1 (2)"               '[ "$(NODE_SYS_ROOT=$RX node_rps_mask eth0 1 2)" = 2 ]'
 echo 1 > "$RX/class/net/eth0/device/numa_node"; echo "4-7" > "$RX/devices/system/node/node1/cpulist"
@@ -177,6 +179,35 @@ t "rps_mask: node1=0-1,8-9, 2 очереди -> 8-9 (0x300)"    '[ "$(NODE_SYS_R
 echo "0" > "$RX/devices/system/node/node1/cpulist"
 t "rps_mask: после исключения пусто -> NUMA-локальные целиком" '[ "$(NODE_SYS_ROOT=$RX node_rps_mask eth0 1 4)" = 1 ]'
 echo -1 > "$RX/class/net/eth0/device/numa_node"
+
+# ---------- RPS (v1.2.9): маска по реальному CPU прерывания приёма ----------
+IP="$RX/proc-irq"
+mkdir -p "$RX/class/net/ens3/device" "$IP/irq/29" "$IP/irq/30"
+echo -1 > "$RX/class/net/ens3/device/numa_node"
+cat > "$IP/interrupts" <<'PIEOF'
+            CPU0       CPU1       CPU2       CPU3
+  29:          0          0  559052224          0   PCI-MSI 49153-edge      ens3-input.0
+  30:          0          0          0  656354749   PCI-MSI 49154-edge      ens3-output.0
+PIEOF
+echo 2 > "$IP/irq/29/effective_affinity_list"; echo 3 > "$IP/irq/30/effective_affinity_list"
+mask_ip() { NODE_SYS_ROOT=$RX NODE_PROC_ROOT=$IP node_rps_mask "$@"; }
+t "rx_irq_cpus: только input-очередь -> 2" '[ "$(NODE_SYS_ROOT=$RX NODE_PROC_ROOT=$IP node_rx_irq_cpus ens3)" = 2 ]'
+t "rps_mask: IRQ на CPU2 из 4 -> CPU0,1,3 (b)" '[ "$(mask_ip ens3 1 4)" = 11 ]'
+echo 0 > "$IP/irq/29/effective_affinity_list"
+t "rps_mask: IRQ на CPU0 из 4 -> CPU1-3 (e), как на de и nl2" '[ "$(mask_ip ens3 1 4)" = 14 ]'
+echo 1 > "$IP/irq/29/effective_affinity_list"
+t "rps_mask: 2 CPU, IRQ на CPU1 -> старая маска CPU1 (2)" '[ "$(mask_ip ens3 1 2)" = 2 ]'
+echo "" > "$IP/irq/29/effective_affinity_list"
+t "rps_mask: пустая effective_affinity_list -> старая маска (e)" '[ "$(mask_ip ens3 1 4)" = 14 ]'
+rm -f "$IP/irq/29/effective_affinity_list"
+t "rps_mask: нет effective_affinity_list -> старая маска (e)" '[ "$(mask_ip ens3 1 4)" = 14 ]'
+echo 2 > "$IP/irq/29/effective_affinity_list"
+sed -i 's/ens3-input.0/ens3-misc.0/' "$IP/interrupts"
+t "rps_mask: метка не очередь приёма -> старая маска (e)" '[ "$(mask_ip ens3 1 4)" = 14 ]'
+sed -i 's/ens3-misc.0/ens3-rx-0/' "$IP/interrupts"
+t "rps_mask: метка rx-0 тоже распознаётся (b)" '[ "$(mask_ip ens3 1 4)" = 11 ]'
+echo "0-3" > "$IP/irq/29/effective_affinity_list"
+t "rps_mask: IRQ на всех CPU -> все CPU, маска не пустая (f)" '[ "$(mask_ip ens3 1 4)" = 15 ]'
 rps_run() { ( _n="$1"; node_default_iface() { echo eth0; }; node_cpu_count() { echo "$_n"; }
               printf '%b' "$2" > /tmp/node-irt-test/rps.conf; export NODE_CONFIG=/tmp/node-irt-test/rps.conf NODE_SYS_ROOT=$RX DRY_RUN=0
               node_load_config >/dev/null 2>&1; : > "$NODE_RT_TWEAKS"; node_irq_apply ) >/dev/null 2>&1 || echo "rps_run rc=$?"; }
