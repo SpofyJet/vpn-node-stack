@@ -105,10 +105,11 @@ node_xanmod_pkg() {
 node_xanmod_install() {
     [ "$(node_conf_get ENABLE_XANMOD 0)" = "1" ] || return 0
     node_kernel_is_xanmod && { log info "kernel" "ядро уже XanMod ($(uname -r))"; return 0; }
-    # 2026-09-24 (v1.1.6): ENABLE_XANMOD=1 стал дефолтом. Дефолт (ключа нет в node.conf) —
-    # «мягкий»: где XanMod не нужен/невозможен — info/warn и пропуск, apply не падает
-    # (иначе каждый apply на ARM, jammy (нет suite — 404) или при сбое сети кончался бы
-    # ошибкой). Явный ENABLE_XANMOD=1 в node.conf — строгий режим, как прежде.
+    # Дефолт ENABLE_XANMOD=0 (с v1.2.0 — XanMod только по запросу): без ключа в node.conf сюда
+    # не доходим (return выше). Ниже два режима для значения 1. «Мягкий» — 1 пришла не из
+    # node.conf: где XanMod не нужен/невозможен — info/warn и пропуск, apply не падает (иначе
+    # apply на ARM, jammy (нет suite — 404) или при сбое сети кончался бы ошибкой).
+    # Явный ENABLE_XANMOD=1 в node.conf — строгий режим.
     # явный = ключ задан в node.conf: в CONFIG_CACHE строки пользователя идут ПЕРВЫМИ,
     # defaults дописаны следом (ключ там всегда) — два вхождения и первое = 1
     local explicit=0 uv=""
