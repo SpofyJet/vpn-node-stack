@@ -58,7 +58,8 @@ node_udp_health() {
     # Поштучно — только «серверные» сокеты (порт ниже ip_local_port_range: эфемерным он не бывает)
     # и сокеты с потерями/заполненной очередью (не больше 10).
     local lport_lo
-    lport_lo="$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || true)"
+    # NODE_PORT_RANGE_FILE — для тестов: в контейнере диапазон дефолтный (32768+), на нодах 10240+
+    lport_lo="$(awk '{print $1}' "${NODE_PORT_RANGE_FILE:-/proc/sys/net/ipv4/ip_local_port_range}" 2>/dev/null || true)"
     { ss -uamnp 2>/dev/null || true; } | awk -v lo="${lport_lo:-32768}" '
         function human(b) { return (b >= 1048576) ? sprintf("%d МиБ", b / 1048576) : sprintf("%d КиБ", b / 1024) }
         /^(UNCONN|ESTAB)/ { loc = $4; proc = ""; if (match($0, /users:\(\("[^"]+"/)) proc = substr($0, RSTART + 9, RLENGTH - 10); next }

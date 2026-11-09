@@ -7,6 +7,8 @@ OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 mkdir -p "$OUT/bin"
 export NODE_DIR NODE_STATE_DIR="$OUT/state" NODE_LOG="$OUT/log"
 : > "$OUT/log"
+# диапазон эфемерных портов как на ноде (node ставит 10240 65535); раньше тест зависел от хоста
+printf '10240\t65535\n' > "$OUT/port_range"; export NODE_PORT_RANGE_FILE="$OUT/port_range"
 cat > "$OUT/bin/ss" <<'EOF'
 #!/bin/bash
 cat <<'X'

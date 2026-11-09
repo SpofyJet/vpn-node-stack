@@ -175,7 +175,7 @@ t "install: custom.txt засеян" test -f "$SHIELD_LISTS_DIR/custom.txt"
 t "install: hardening юнита (NoNewPrivileges/ProtectSystem/Timeout)" bash -c "grep -q 'NoNewPrivileges=true' '$OUT/etc/systemd/system/shieldnode-blocklist.service' && grep -q 'ProtectSystem=strict' '$OUT/etc/systemd/system/shieldnode-blocklist.service' && grep -q 'TimeoutStartSec=600' '$OUT/etc/systemd/system/shieldnode-blocklist.service'"
 t "install: custom path-триггер (PathChanged, без PathExists)" bash -c "grep -q 'PathChanged=.*custom.txt' '$OUT/etc/systemd/system/shieldnode-blocklist-custom.path' && ! grep -q 'PathExists' '$OUT/etc/systemd/system/shieldnode-blocklist-custom.path'"
 t "install: custom.service зовёт updater с аргументом custom" grep -q "ExecStart=/usr/local/sbin/shieldnode-blocklist custom" "$OUT/etc/systemd/system/shieldnode-blocklist-custom.service"
-t "install: scanner URLs запечены (13 источников)" bash -c "grep -q '^BL_URLS_scanner=.*antiscanner.list' '$OUT/usr/local/sbin/shieldnode-blocklist' && test \$(grep '^BL_URLS_scanner=' '$OUT/usr/local/sbin/shieldnode-blocklist' | grep -o 'https://' | wc -l) = \$(grep '^BLOCKLIST_SCANNER_URLS=' '$SHIELD_DIR/shieldnode.defaults.conf' | grep -o 'https://' | wc -l)"
+t "install: scanner URLs запечены (все из defaults, сейчас 11)" bash -c "grep -q '^BL_URLS_scanner=.*antiscanner.list' '$OUT/usr/local/sbin/shieldnode-blocklist' && test \$(grep '^BL_URLS_scanner=' '$OUT/usr/local/sbin/shieldnode-blocklist' | grep -o 'https://' | wc -l) = \$(grep '^BLOCKLIST_SCANNER_URLS=' '$SHIELD_DIR/shieldnode.defaults.conf' | grep -o 'https://' | wc -l)"
 t "install: threat URLs: spamhaus DROP v4/v6 + firehol" bash -c "grep -q '^BL_URLS_threat=.*drop_v4.json' '$OUT/usr/local/sbin/shieldnode-blocklist' && grep -q 'firehol_level1.netset' '$OUT/usr/local/sbin/shieldnode-blocklist'"
 t "install: tor выключен по умолчанию (BL_ENABLED_tor=0)" grep -q '^BL_ENABLED_tor="0"' "$SHIELD_BLOCKLIST_SCRIPT"
 t "install: BLOCKLIST_CUSTOM_URLS запечён в updater" grep -q '^BL_URLS_custom="file://.*/fixtures/custom-central.txt"' "$SHIELD_BLOCKLIST_SCRIPT"
@@ -789,7 +789,7 @@ t "зеркало: для gist зеркала нет (один запрос)" te
 mkdir -p "$OUT/bin-nocs"
 for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
     [ -d "$d" ] || continue
-    for x in "$d"/*; do b="${x##*/}"; [ "$b" = cscli ] || [ -e "$OUT/bin-nocs/$b" ] || ln -s "$x" "$OUT/bin-nocs/$b"; done
+    for x in "$d"/*; do [ -e "$x" ] || [ -L "$x" ] || continue; b="${x##*/}"; [ "$b" = cscli ] || [ -e "$OUT/bin-nocs/$b" ] || ln -s "$x" "$OUT/bin-nocs/$b"; done
 done
 ln -sf "$OUT/bin/nft" "$OUT/bin-nocs/nft"; ln -sf "$OUT/bin/systemctl" "$OUT/bin-nocs/systemctl"
 cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
