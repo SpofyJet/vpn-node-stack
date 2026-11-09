@@ -230,6 +230,11 @@ shield_health() {
         fi
     done <<<"$SHIELD_HEALTH_LISTS"
     [ -r "$st" ] || _hc INFO "нет доступа к $st — свежесть блоклистов не проверена (запусти через sudo)"
+    # 2026-11-09 (v1.2.9): чужой crowdsec-firewall-bouncer — вторая блокировка мимо shieldnode
+    if declare -F shield_crowdsec_foreign_bouncer >/dev/null 2>&1; then
+        local fb; fb="$(shield_crowdsec_foreign_bouncer)"
+        [ -z "$fb" ] || _hc WARN "crowdsec: $(shield_crowdsec_foreign_bouncer_msg "$fb")"
+    fi
 
     # таймер и boot-служба
     if command -v systemctl >/dev/null 2>&1; then
@@ -330,6 +335,8 @@ shield_status() {
     if [ "$(shield_conf_get ENABLE_CROWDSEC_LIST 1)" = "1" ]; then
         echo "mode: $(shield_crowdsec_resolve_mode)"
         echo "agent: $(shield_crowdsec_agent_status)"
+        local fb_s; fb_s="$(shield_crowdsec_foreign_bouncer 2>/dev/null || true)"
+        [ -z "$fb_s" ] || echo "ВНИМАНИЕ: $(shield_crowdsec_foreign_bouncer_msg "$fb_s")"
     else
         echo "disabled (ENABLE_CROWDSEC_LIST=0)"
     fi

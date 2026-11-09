@@ -60,7 +60,7 @@ esac; exit 0
 EOF
 cat > "$OUT/bin/systemctl" <<'EOF'
 #!/bin/sh
-case "$*" in *is-active*timer*) [ "${FAKE_TIMER:-1}" = 1 ] ;; *is-enabled*shieldnode.service*) [ "${FAKE_SVC:-1}" = 1 ] ;; *) exit 0 ;; esac
+case "$*" in *crowdsec-firewall-bouncer*) [ "${FAKE_BOUNCER:-0}" = 1 ] ;; *bouncer*) exit 1 ;; *is-active*timer*) [ "${FAKE_TIMER:-1}" = 1 ] ;; *is-enabled*shieldnode.service*) [ "${FAKE_SVC:-1}" = 1 ] ;; *) exit 0 ;; esac
 EOF
 chmod +x "$OUT/bin"/*; export PATH="$OUT/bin:$PATH"
 
@@ -140,6 +140,12 @@ printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/cscli"; chmod +x "$OUT/bin/cscli"
 ( shield_crowdsec_resolve_mode() { echo agent; }; PATH="$OUT/bin:$OUT/nocs"; H )
 t "cscli есть, набор пуст -> прежняя проверка (негативный контроль)" 'has "[WARN] crowdsec: set ПУСТ" && ! has "не установлен (cscli нет)"'
 rm -f "$OUT/bin/cscli" "$OUT/bl/.alert-crowdsec"
+# v1.2.9: чужой crowdsec-firewall-bouncer включён -> WARN с готовой командой; сами не отключаем
+gen ''; healthy; rm -f "$OUT/bl/.alert-"*
+( source "$SHIELD_DIR/lib/crowdsec.sh"; export FAKE_BOUNCER=1; H )
+t "чужой bouncer включён -> WARN с командой отключения" 'has "[WARN] crowdsec: включён чужой crowdsec-firewall-bouncer.service" && has "Отключить: systemctl disable --now crowdsec-firewall-bouncer.service"'
+( source "$SHIELD_DIR/lib/crowdsec.sh"; H )
+t "bouncer не включён -> предупреждения нет (негативный контроль)" '! has "чужой crowdsec-firewall-bouncer"'
 # бывшие проверки guard (guard теперь = health): SSH не слушает
 gen 'SSH_PORT=2201\n'; healthy; H
 t "SSH_PORT=2201 не слушает -> WARN «SSH не слушает»" 'has "[WARN] SSH не слушает порт 2201"'

@@ -97,6 +97,26 @@ shield_crowdsec_feedonly_ensure() {
     return 0
 }
 
+# shield_crowdsec_foreign_bouncer — 2026-11-09 (v1.2.9): имена включённых или запущенных юнитов
+# crowdsec-firewall-bouncer (пусто = нет). shieldnode сам заливает решения crowdsec в свой набор;
+# отдельный bouncer держит СВОЮ таблицу nft/ipset мимо shieldnode: блокирует второй раз, белый
+# список shieldnode (TRUSTED_IPS) и guard unban на него не действуют. Сами не отключаем —
+# его мог поставить оператор; только предупреждаем с готовой командой.
+shield_crowdsec_foreign_bouncer() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local u out=""
+    for u in crowdsec-firewall-bouncer.service cs-firewall-bouncer.service; do
+        if systemctl is-enabled --quiet "$u" 2>/dev/null || systemctl is-active --quiet "$u" 2>/dev/null; then
+            out="$out $u"
+        fi
+    done
+    printf '%s' "${out# }"
+}
+# текст предупреждения (общий для apply и health)
+shield_crowdsec_foreign_bouncer_msg() { # <юниты через пробел>
+    printf 'включён чужой %s — он блокирует адреса своей таблицей мимо shieldnode (двойная блокировка; TRUSTED_IPS и guard unban на него не действуют). Отключить: systemctl disable --now %s' "$1" "$1"
+}
+
 # shield_crowdsec_agent_ensure — установить/починить crowdsec-агент (idempotent).
 # Только Debian/Ubuntu (apt). Остальное — честный warn с инструкцией.
 shield_crowdsec_agent_ensure() {
@@ -158,6 +178,9 @@ shield_crowdsec_agent_ensure() {
     # в шапке shield_crowdsec_feedonly_ensure). Порядок важен: ДО регистрации/whitelist'а,
     # чтобы демон стартовал уже без источников логов.
     [ "${DRY_RUN:-0}" = "1" ] || shield_crowdsec_feedonly_ensure || true
+
+    local fb; fb="$(shield_crowdsec_foreign_bouncer)"
+    [ -z "$fb" ] || warn "crowdsec" "$(shield_crowdsec_foreign_bouncer_msg "$fb")"
 
     # CAPI-регистрация (анонимная — аккаунт консоли НЕ нужен)
     if ! _cscli capi status >/dev/null 2>&1; then

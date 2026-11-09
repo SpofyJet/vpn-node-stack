@@ -63,4 +63,18 @@ t "не-yaml в acquis.d сохранён" "[ -e '$OUT/etc/acquis.d/operator-not
 SHIELD_CROWDSEC_ETC="$OUT/no-such-dir" shield_crowdsec_feedonly_ensure >/dev/null 2>&1
 t "нет /etc/crowdsec — no-op без ошибки" "[ $? -eq 0 ]"
 
+# v1.2.9: чужой crowdsec-firewall-bouncer — предупреждаем с готовой командой, сами не отключаем
+t "bouncer включён -> имена юнитов" "[ \"\$(FAKE_ENABLED=0 shield_crowdsec_foreign_bouncer)\" = 'crowdsec-firewall-bouncer.service cs-firewall-bouncer.service' ]"
+t "bouncer выключен и не запущен -> пусто" "[ -z \"\$(FAKE_ENABLED=1 FAKE_ACTIVE=3 shield_crowdsec_foreign_bouncer)\" ]"
+t "bouncer выключен, но запущен -> тоже находим" "[ -n \"\$(FAKE_ENABLED=1 FAKE_ACTIVE=0 shield_crowdsec_foreign_bouncer)\" ]"
+printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/cscli"; chmod +x "$OUT/bin/cscli"; hash -r
+shield_conf_get() { echo "${2:-}"; }
+: > "$OUT/systemctl.calls"
+ens="$(DRY_RUN=1 FAKE_ENABLED=0 shield_crowdsec_agent_ensure 2>&1 || true)"
+t "apply: предупреждение о чужом bouncer с командой отключения" "grep -q 'включён чужой crowdsec-firewall-bouncer.service.*Отключить: systemctl disable --now crowdsec-firewall-bouncer.service' <<<\"\$ens\""
+t "apply: сам bouncer не отключает" "! grep -qE '(disable|stop|mask).*bouncer' '$OUT/systemctl.calls'"
+ens="$(DRY_RUN=1 FAKE_ENABLED=1 FAKE_ACTIVE=3 shield_crowdsec_agent_ensure 2>&1 || true)"
+t "apply: bouncer нет -> предупреждения нет" "! grep -q 'чужой' <<<\"\$ens\""
+rm -f "$OUT/bin/cscli"; hash -r
+
 [ "$fails" -eq 0 ] && echo "PASS: все проверки feed-only" || { echo "FAIL: $fails провалов"; exit 1; }
