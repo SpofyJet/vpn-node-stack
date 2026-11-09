@@ -165,7 +165,8 @@ fx 1000 0 0 0 1000 0 0 10000 0; fxs 0; node_perf_snapshot > "$OUT/base-syn.txt"
 t "v1.2.10: снапшот пишет TcpExtTCPSynRetrans" 'grep -q "^TcpExtTCPSynRetrans=0$" "$OUT/base-syn.txt"'
 fx 2000 0 0 200 3000 0 0 20000 0; fxs 150; node_perf_report "$OUT/base-syn.txt" > "$OUT/r5"
 t "v1.2.10: 200 ретрансмитов, из них 150 SYN -> 2.50% (50/2000)" 'grep -q "tcp_retrans=2.50% (без SYN, syn_retrans=+150)" "$OUT/r5"'
-fx 2000 0 0 200 3000 0 0 20000 0; fxs 150; node_perf_report "$OUT/base.txt" > "$OUT/r6"
+grep -v "^TcpExtTCPSynRetrans=" "$OUT/base.txt" > "$OUT/base-old.txt"   # baseline от версии до 1.2.10: ключа нет
+fx 5000 7 3 200 3000 4 900 20000 150; fxs 150; node_perf_report "$OUT/base-old.txt" > "$OUT/r6"
 t "v1.2.10: baseline без ключа (снят до 1.2.10) -> прежняя формула 10.00%" 'grep -q "tcp_retrans=10.00%" "$OUT/r6"'
 # v1.2.1 (лаба): squeeze 2.7% на ~270 пакетах за 18 с после apply — шум, не предел
 echo "aaaaaaaa-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
