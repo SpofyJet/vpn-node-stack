@@ -30,7 +30,7 @@
 #   VPN_STACK_REF=v1.2.0   VPN_STACK_REPO=Owner/name   VPN_STACK_TARBALL_URL=https://...
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 REPO="${VPN_STACK_REPO:-SpofyJet/vpn-node-stack}"
 RAW_BASE="${VPN_STACK_RAW_BASE:-https://raw.githubusercontent.com/$REPO/main}"
 # 2026-09-24 (v1.1.3): VPN_STACK_REF — воспроизводимая установка (тег/ветка/коммит).
@@ -64,7 +64,37 @@ case "$WORK_DIR" in
 esac
 
 # ---------- команды стека (прежняя логика установщика) ----------
+stack_usage() {
+    cat <<USAGE
+vpn-node-setup v$VERSION — установка и управление стеком node + shieldnode.
+
+  sudo vpn-node                    меню (в терминале)
+  sudo vpn-node apply              скачать свежую версию и применить
+  sudo vpn-node apply --dry-run    показать план, ничего не писать
+  sudo vpn-node status | detect    состояние (только чтение)
+  sudo vpn-node rollback           откатить последнее применение
+  sudo vpn-node emergency on|off   аварийный режим фаервола
+  sudo vpn-node guard [--once|--raw]
+  sudo vpn-node diag               архив диагностики без секретов
+  sudo vpn-node uninstall
+
+Флаги: --dry-run, --verbose|-v, -h|--help.
+USAGE
+}
+
 stack_main() {
+    # 2026-11-09 (v1.5.1): раньше неизвестный флаг молча пропускался, а команда оставалась
+    # apply: `vpn-node --help` скачивал main и применял его. Справка и отказ — ДО любых
+    # проверок окружения, загрузок и записи.
+    local _a
+    for _a in "$@"; do
+        case "$_a" in
+            -h|--help) stack_usage; exit 0 ;;
+            --dry-run|--verbose|-v|--once|--raw|--id) : ;;
+            -*) printf 'ОШИБКА: неизвестный флаг %s (справка: vpn-node --help)\n' "$_a" >&2; exit 64 ;;
+        esac
+    done
+
     # ---------- окружение ----------
     command -v curl >/dev/null 2>&1 || die "нужен curl: apt-get install -y curl"
     command -v tar  >/dev/null 2>&1 || die "нужен tar"
