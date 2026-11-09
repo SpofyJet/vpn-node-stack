@@ -154,12 +154,24 @@ HEADER_EOF
             "${SH_R_TOR_BLOCKLIST_SIZE:-16384}" "${SH_R_CUSTOM_BLOCKLIST_SIZE:-65536}" \
             "${SH_R_CROWDSEC_BLOCKLIST_SIZE:-262144}" "${SH_R_SPAMHAUS_BLOCKLIST_SIZE:-8192}" \
             "${SH_R_CINS_BLOCKLIST_SIZE:-65536}"
-        # min-prefix v4/v6: threat — /16 (анти-compromise), scanner/custom — /8,
+        # min-prefix v4/v6: threat — /16 (анти-compromise), scanner — /18, custom — /16,
         # tor — только /32 (single IPs) / v6 /128, crowdsec — /24 (CAPI отдаёт
         # одиночные IP, но консольные листы могут содержать CIDR).
         # BL_MINP6_cins нет: CINS — v4-only фид, сет cins_blocklist_v6 не создаётся
         # (lib/nft.sh) — v6-парсинг для cins мёртв и updater его пропускает (шаг 5)
-        printf 'BL_MINP4_scanner=8 BL_MINP4_threat=16 BL_MINP4_tor=32 BL_MINP4_custom=8 BL_MINP4_crowdsec=24 BL_MINP4_spamhaus=16 BL_MINP4_cins=20\n'
+        # 2026-11-09 (v1.2.9): scanner /8 -> /18, custom /8 -> /16. Одна строка «x.0.0.0/8» в чужом
+        # фиде или опечатка в custom закрывала 16 млн адресов (целые страны) на всех портах.
+        # Самое широкое, что реально есть в фидах scanner на 2026-11-09, — /18 (DigitalOcean в
+        # maltrail mass_scanner_cidr, 10 записей) и /19 (government_networks, 2 записи); в custom — /22.
+        # Нужен шире — BL_MINP4_<имя>=N в /etc/shieldnode/blocklist.conf.
+        printf 'BL_MINP4_scanner=18 BL_MINP4_threat=16 BL_MINP4_tor=32 BL_MINP4_custom=16 BL_MINP4_crowdsec=24 BL_MINP4_spamhaus=16 BL_MINP4_cins=20\n'
+        # потолок суммы адресов v4 в наборе после агрегации: больше — набор не применяем (8a).
+        # 2^24 = один /8. threat и spamhaus — списки угнанных сетей по /15–/16: на проде 13,4 и
+        # 10,7 млн адресов, им потолок 2^25. Переопределение: BL_MAXADDR_<имя>=N (0 — без потолка).
+        printf 'BL_MAXADDR_scanner=16777216 BL_MAXADDR_threat=33554432 BL_MAXADDR_tor=16777216 BL_MAXADDR_custom=16777216 BL_MAXADDR_crowdsec=16777216 BL_MAXADDR_spamhaus=33554432 BL_MAXADDR_cins=16777216\n'
+        # сколько дней недоступный источник подменяется своей прошлой копией (шаг 1); дольше —
+        # источник считается закрытым, список собирается без него
+        printf 'BL_SRC_STALE_DAYS=7\n'
         printf 'BL_MINP6_scanner=24 BL_MINP6_threat=29 BL_MINP6_tor=128 BL_MINP6_custom=24 BL_MINP6_crowdsec=64 BL_MINP6_spamhaus=32\n'
         # crowdsec interval: feed — community-тариф не чаще 1 pull/24ч (иначе 429);
         # agent — читаем ЛОКАЛЬНУЮ БД демона (демон сам тянет CAPI ~раз/2ч),
@@ -368,7 +380,8 @@ update_list() { # update_list <name>
     case "$name" in tor) set_prefix="tor_exit_blocklist" ;; esac
     local set_v4="${set_prefix}_v4" set_v6="${set_prefix}_v6"
     local fail_counter="$STATE_DIR/fails-$name.cnt"
-    local tmp remote_ok=0 local_ok=0 cs_empty=0 cs_absent=0
+    local tmp remote_ok=0 local_ok=0 cs_empty=0 cs_absent=0 src_stale=0 src_missing=0 src_total=0
+    local src_cache_dir="$STATE_DIR/src-cache" stale_min=$(( ${BL_SRC_STALE_DAYS:-7} * 1440 ))
     tmp="$(mktemp -d /tmp/shieldnode-bl.XXXXXX)" || return 1
     : > "$tmp/all.raw"
 
@@ -398,7 +411,12 @@ update_list() { # update_list <name>
     local u f
     for u in $urls; do
         f="$tmp/$(echo "$u" | sha256sum | cut -c1-12).raw"
-        local curl_rc=0
+        local curl_rc=0 cache=""
+        src_total=$((src_total + 1))
+        # 2026-11-09 (v1.2.9): прошлая копия КАЖДОГО сетевого источника (кроме crowdsec — у него свой
+        # путь). Раньше сбой части адресов молча урезал набор: из 11 фидов scanner ответили 3 —
+        # набор заменялся третью, а при сбое центрального custom оставался один локальный файл.
+        case "$u" in local://*|https://admin.api.crowdsec.net/*) ;; *) cache="$src_cache_dir/$name-${f##*/}" ;; esac
         case "$u" in
             local://cscli-decisions)
                 # agent-режим: читаем ЛОКАЛЬНУЮ БД crowdsec (CAPI уже стянул демон)
@@ -463,6 +481,11 @@ update_list() { # update_list <name>
         esac
         if [ "$curl_rc" -eq 0 ] && [ -s "$f" ]; then
             remote_ok=$((remote_ok + 1))
+            if [ -n "$cache" ]; then
+                mkdir -p "$src_cache_dir" 2>/dev/null || true
+                cp "$f" "$cache.new" 2>/dev/null && mv -f "$cache.new" "$cache" 2>/dev/null || rm -f "$cache.new"
+                rm -f "$cache.miss"
+            fi
             case "$u" in
                 # lastok пишем и в agent-режиме — иначе interval-guard (BL_INTERVAL_crowdsec)
                 # не будет иметь метки и пропускать прогоны (local-чтение дёшево, но гард
@@ -487,6 +510,23 @@ update_list() { # update_list <name>
             local ulog="$u"
             case "$u" in https://admin.api.crowdsec.net/*) ulog="crowdsec-feed (integration-id скрыт)" ;; esac
             bl_log warn "$name: fetch failed (rc=$curl_rc): $ulog"
+            if [ -n "$cache" ]; then
+                if [ -s "$cache" ] && [ -z "$(find "$cache" -mmin +"$stale_min" 2>/dev/null)" ]; then
+                    # источник недоступен, но его прошлая копия свежая — набор остаётся полным
+                    src_stale=$((src_stale + 1))
+                    case "$u" in
+                        *.json|*.json\?*) extract_json_ips "$cache" >> "$tmp/all.raw" 2>/dev/null || cat "$cache" >> "$tmp/all.raw" ;;
+                        *) cat "$cache" >> "$tmp/all.raw" ;;
+                    esac
+                    bl_log warn "$name: источник недоступен — взята его прошлая копия от $(date -u -r "$cache" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?') UTC: $u"
+                elif [ -s "$cache" ] || [ -n "$(find "$cache.miss" -mmin +"$stale_min" 2>/dev/null)" ]; then
+                    # не отвечает дольше BL_SRC_STALE_DAYS — считаем закрытым, иначе список застыл бы навсегда
+                    bl_log warn "$name: источник не отвечает больше ${BL_SRC_STALE_DAYS:-7} дн. — список собирается без него (убери адрес из конфига): $u"
+                else
+                    [ -e "$cache.miss" ] || { mkdir -p "$src_cache_dir" 2>/dev/null; date +%s > "$cache.miss" 2>/dev/null; } || true
+                    src_missing=$((src_missing + 1))
+                fi
+            fi
         fi
     done
 
@@ -494,6 +534,16 @@ update_list() { # update_list <name>
     if [ -s "$LISTS_DIR/$name.txt" ]; then
         cat "$LISTS_DIR/$name.txt" >> "$tmp/all.raw"
         local_ok=1
+    fi
+
+    # 2b) 2026-11-09 (v1.2.9): часть источников не скачалась, и прошлой копии у них нет — живой
+    #     набор не заменяем урезанным (остаётся прежний). Пустой живой набор (первый запуск,
+    #     apply без снимка) — заливаем что есть: часть защиты лучше, чем ничего.
+    if [ "$src_missing" -gt 0 ] && nft list set $TABLE "$set_v4" 2>/dev/null | grep -q 'elements = '; then
+        bl_log warn "$name: не скачано источников: $src_missing из $src_total, прошлых копий нет — набор не тронут (остаётся прежний, без урезания)"
+        bump_fail "$name" "$fail_counter"
+        rm -rf "$tmp"
+        return 1
     fi
 
     # 3) всё недоступно и локального нет — keep last-known-good, bump fail counter
@@ -669,6 +719,21 @@ update_list() { # update_list <name>
         fi
     fi
 
+    # 8a) 2026-11-09 (v1.2.9): потолок суммы адресов v4. Число записей (4.1) ширину не ловит:
+    #     сотня /18 — это 1,6 млн адресов. Больше BL_MAXADDR_<имя> — фид испорчен или в список
+    #     попали сети целиком; набор не трогаем (остаётся прежний).
+    local maxaddr_var="BL_MAXADDR_${name}" maxaddr addr_total
+    maxaddr="${!maxaddr_var:-16777216}"
+    if [[ "$maxaddr" =~ ^[0-9]+$ ]] && [ "$maxaddr" -gt 0 ]; then
+        addr_total=$(awk -F/ '{ p = (NF > 1) ? $2 + 0 : 32; s += 2 ^ (32 - p) } END { printf "%.0f", s + 0 }' "$tmp/load.list" 2>/dev/null)
+        if [[ "$addr_total" =~ ^[0-9]+$ ]] && [ "$addr_total" -gt "$maxaddr" ]; then
+            bl_log warn "$name: в наборе $addr_total адресов v4 > потолка $maxaddr — подозрительно широкий список, set не тронут (потолок: BL_MAXADDR_$name в /etc/shieldnode/blocklist.conf)"
+            bump_fail "$name" "$fail_counter"
+            rm -rf "$tmp"
+            return 1
+        fi
+    fi
+
     # 8c) 2026-10-08 (v1.2.5): тот же итоговый контент (v4+v6 после агрегации), что и в прошлый
     #     успешный раз, и живой набор не пуст — nft не трогаем. На живой ноде каждый тик заново
     #     заливал десятки тысяч элементов (crowdsec — каждые 30 мин) без единого изменения; ядро
@@ -744,7 +809,7 @@ update_list() { # update_list <name>
         fi
         # v6 не залился — хэш не пишем: следующий тик повторит полную заливку
         if [ "$v6_failed" = "0" ] && [ -n "$load_hash" ]; then echo "$load_hash" > "$hash_file"; else rm -f "$hash_file"; fi
-        bl_log info "$name: updated $set_v4: $v4_count v4 + $v6_count v6 (remote=$remote_ok, local=$local_ok)"
+        bl_log info "$name: updated $set_v4: $v4_count v4 + $v6_count v6 (remote=$remote_ok, local=$local_ok$([ "$src_stale" -gt 0 ] && echo ", из прошлых копий=$src_stale"))"
     fi
     rm -rf "$tmp"
     return "$rc"

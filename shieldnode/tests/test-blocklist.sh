@@ -265,6 +265,9 @@ t "scanner: fail counter сброшен на успехе" bash -c "test \$(cat 
 # ================= 5b) 2026-10-08: тот же контент — nft не трогаем (кроме пустого живого набора) =================
 # interval-guard выключен: иначе тик пропускается ещё до fetch и новый гард не проверяется
 echo 'BL_INTERVAL_scanner=0' >> "$SHIELD_BLOCKLIST_OVERRIDE"
+# v1.2.9: мёртвый адрес без прошлой копии при непустом наборе = «набор не тронут» (раздел 14);
+# здесь проверяется другое, поэтому мёртвый адрес из списка убираем
+sed -i 's| file:///nonexistent-404||' "$SHIELD_BLOCKLIST_OVERRIDE"
 printf '#!/bin/sh\necho "$*" >> %s/logger.calls\n' "$OUT" > "$OUT/bin/logger"; chmod +x "$OUT/bin/logger"
 : > "$OUT/ops.same"; : > "$OUT/logger.calls"
 PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" FAKE_NFT_OPS="$OUT/ops.same" bash "$SHIELD_BLOCKLIST_SCRIPT" scanner
@@ -853,5 +856,96 @@ t "retry: через час после 3 сбоев — снова пробуе�
 t "retry: юниты эмитированы (каждые 10 мин, после boot/apply через 6 мин)" bash -c "grep -qx 'ExecStart=/usr/local/sbin/shieldnode-blocklist --retry-empty' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.service' && grep -qx 'OnUnitActiveSec=10min' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.timer' && grep -qx 'OnBootSec=6min' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.timer' && grep -qx 'OnActiveSec=6min' '$OUT/etc/systemd/system/shieldnode-blocklist-retry.timer'"
 t "retry: таймер включается и перезапускается при apply" bash -c "grep -qx 'enable shieldnode-blocklist-retry.timer' '$SYSTEMCTL_LOG' && grep -qx 'restart shieldnode-blocklist-retry.timer' '$SYSTEMCTL_LOG'"
 t "retry: rollback снимает таймер, uninstall удаляет файлы" bash -c "grep -q 'shieldnode-blocklist-retry.timer shieldnode-blocklist-retry.service' '$SHIELD_DIR/rollback.sh' && grep -q 'shieldnode-blocklist-retry.timer' '$SHIELD_DIR/uninstall.sh'"
+
+# ================= 14) v1.2.9: ширина списка и неполная загрузка источников =================
+SHIELD_LOG_FILE_BL="$OUT/bl-14.log"; : > "$SHIELD_LOG_FILE_BL"
+t "ширина: scanner /18, custom /16 запечены" bash -c "grep -q 'BL_MINP4_scanner=18 ' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'BL_MINP4_custom=16 ' '$SHIELD_BLOCKLIST_SCRIPT'"
+t "ширина: потолок адресов запечён (2^24, threat/spamhaus 2^25)" bash -c "grep -q 'BL_MAXADDR_scanner=16777216 BL_MAXADDR_threat=33554432 ' '$SHIELD_BLOCKLIST_SCRIPT' && grep -q 'BL_MAXADDR_custom=16777216 ' '$SHIELD_BLOCKLIST_SCRIPT'"
+bl14_conf() { cat > "$SHIELD_BLOCKLIST_OVERRIDE" <<EOF
+BL_LOCK_FILE=$OUT/blocklist.lock
+LOG_FILE=$SHIELD_LOG_FILE_BL
+BL_ENABLED_scanner=0
+BL_ENABLED_threat=0
+BL_ENABLED_tor=0
+BL_ENABLED_custom=0
+BL_ENABLED_crowdsec=0
+BL_ENABLED_spamhaus=0
+BL_ENABLED_cins=0
+BL_MIN_custom=0
+BL_MIN_scanner=1
+$1
+EOF
+}
+bl14_reset() { : > "$OUT/nftdb/set_$1_blocklist_v4"; rm -f "$SHIELD_BLOCKLIST_STATE/.applied-custom.sha256" "$SHIELD_BLOCKLIST_STATE/.applied-load-$1.sha256" "$SHIELD_BLOCKLIST_STATE/fails-$1.cnt"; }
+# одна строка /8 в custom не должна закрыть 16 млн адресов
+bl14_conf 'BL_ENABLED_custom=1
+BL_URLS_custom=""'
+printf '5.0.0.0/8\n6.6.0.0/16\n7.7.7.0/24\n' > "$SHIELD_LISTS_DIR/custom.txt"
+bl14_reset custom
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom || true
+t "ширина: /8 в custom отброшен, /16 и /24 применены" bash -c "! grep -q '^5\.0\.0\.0' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '6.6.0.0/16' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '7.7.7.0/24' '$OUT/nftdb/set_custom_blocklist_v4'"
+# 300 сетей /16 = 19,6 млн адресов (> 2^24): набор остаётся прежним
+{ for i in $(seq 0 255); do echo "11.$i.0.0/16"; done; for i in $(seq 0 43); do echo "12.$i.0.0/16"; done; } > "$SHIELD_LISTS_DIR/custom.txt"
+rc=0; PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom || rc=$?
+t "ширина: 19,6 млн адресов — набор не тронут (rc != 0)" bash -c "[ $rc != 0 ] && grep -qx '6.6.0.0/16' '$OUT/nftdb/set_custom_blocklist_v4' && ! grep -q '^11\.' '$OUT/nftdb/set_custom_blocklist_v4'"
+t "ширина: в логе — число адресов и потолок" grep -q 'custom: в наборе 19660800 адресов v4 > потолка 16777216' "$SHIELD_LOG_FILE_BL"
+bl14_conf 'BL_ENABLED_custom=1
+BL_URLS_custom=""
+BL_MAXADDR_custom=33554432'
+PATH="$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" custom || true
+t "ширина: потолок поднят в blocklist.conf — применено" bash -c "grep -q '^1[12]\.' '$OUT/nftdb/set_custom_blocklist_v4'"
+
+# неполная загрузка: fake curl отдаёт $OUT/feeds14/<файл>; адреса из $OUT/curl14.fail — сбой (rc 28)
+mkdir -p "$OUT/bin-14" "$OUT/feeds14"; : > "$OUT/curl14.fail"
+cat > "$OUT/bin-14/curl" <<CURL_EOF
+#!/bin/bash
+out=""; url=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; -*) shift ;; *) url="\$1"; shift ;; esac; done
+grep -qxF "\$url" "$OUT/curl14.fail" && exit 28
+[ -f "$OUT/feeds14/\${url##*/}" ] || exit 22
+cat "$OUT/feeds14/\${url##*/}" > "\$out"
+CURL_EOF
+chmod +x "$OUT/bin-14/curl"
+run14() { local rc=0; PATH="$OUT/bin-14:$OUT/bin:$PATH" FAKE_NFT_DB="$OUT/nftdb" bash "$SHIELD_BLOCKLIST_SCRIPT" "$1" || rc=$?; echo "$rc"; }
+bl14_conf 'BL_ENABLED_scanner=1
+BL_URLS_scanner="https://feeds.test/a.txt https://feeds.test/b.txt"'
+mv "$SHIELD_LISTS_DIR/scanner.txt" "$OUT/scanner.txt.saved14" 2>/dev/null || true
+rm -rf "$SHIELD_BLOCKLIST_STATE/src-cache"; bl14_reset scanner
+printf '20.1.1.0/24\n' > "$OUT/feeds14/a.txt"; printf '30.1.1.0/24\n30.2.2.2\n' > "$OUT/feeds14/b.txt"
+rc="$(run14 scanner)"
+t "источники: оба ответили — набор полный, копии сохранены" bash -c "[ $rc = 0 ] && [ \$(wc -l < '$OUT/nftdb/set_scanner_blocklist_v4') = 3 ] && [ \$(ls '$SHIELD_BLOCKLIST_STATE/src-cache' | grep -c '^scanner-.*\.raw\$') = 2 ]"
+# b недоступен, a обновился: набор не урезан — b из прошлой копии, a свежий
+echo "https://feeds.test/b.txt" > "$OUT/curl14.fail"; printf '20.1.1.0/24\n20.9.9.0/24\n' > "$OUT/feeds14/a.txt"
+rc="$(run14 scanner)"
+t "источники: один упал — его записи остались (прошлая копия), остальные обновились" bash -c "[ $rc = 0 ] && grep -qx '30.1.1.0/24' '$OUT/nftdb/set_scanner_blocklist_v4' && grep -qx '30.2.2.2/32' '$OUT/nftdb/set_scanner_blocklist_v4' && grep -qx '20.9.9.0/24' '$OUT/nftdb/set_scanner_blocklist_v4'"
+t "источники: в логе — «взята его прошлая копия»" grep -q 'scanner: источник недоступен — взята его прошлая копия .*feeds.test/b.txt' "$SHIELD_LOG_FILE_BL"
+# копии нет (источник ни разу не скачивался): живой набор не заменяем урезанным
+rm -rf "$SHIELD_BLOCKLIST_STATE/src-cache"; printf '20.1.1.0/24\n20.9.9.0/24\n20.8.8.0/24\n' > "$OUT/feeds14/a.txt"
+rc="$(run14 scanner)"
+t "источники: копии нет — набор не тронут (rc != 0, записи b на месте, новое из a не залито)" bash -c "[ $rc != 0 ] && grep -qx '30.1.1.0/24' '$OUT/nftdb/set_scanner_blocklist_v4' && ! grep -q '20.8.8.0' '$OUT/nftdb/set_scanner_blocklist_v4'"
+t "источники: в логе — «не скачано источников: 1 из 2»" grep -q 'scanner: не скачано источников: 1 из 2' "$SHIELD_LOG_FILE_BL"
+t "источники: сбой посчитан (fail-counter)" test "$(cat "$SHIELD_BLOCKLIST_STATE/fails-scanner.cnt" 2>/dev/null)" = 1
+# источник молчит дольше BL_SRC_STALE_DAYS — список собирается без него, а не застывает навсегда
+touch -d '-8 days' "$SHIELD_BLOCKLIST_STATE"/src-cache/scanner-*.miss
+rc="$(run14 scanner)"
+t "источники: молчит больше 7 дней — список собран без него" bash -c "[ $rc = 0 ] && grep -qx '20.8.8.0/24' '$OUT/nftdb/set_scanner_blocklist_v4' && ! grep -q '^30\.' '$OUT/nftdb/set_scanner_blocklist_v4'"
+# пустой живой набор и нет копии — заливаем что есть (часть защиты лучше, чем ничего)
+rm -rf "$SHIELD_BLOCKLIST_STATE/src-cache"; bl14_reset scanner
+rc="$(run14 scanner)"
+t "источники: пустой набор — заливается то, что скачалось" bash -c "[ $rc = 0 ] && grep -qx '20.1.1.0/24' '$OUT/nftdb/set_scanner_blocklist_v4'"
+mv "$OUT/scanner.txt.saved14" "$SHIELD_LISTS_DIR/scanner.txt" 2>/dev/null || true
+# custom: центральный список упал — в наборе не должен остаться один локальный файл
+bl14_conf 'BL_ENABLED_custom=1
+BL_URLS_custom="https://feeds.test/central.txt"'
+: > "$OUT/curl14.fail"; rm -rf "$SHIELD_BLOCKLIST_STATE/src-cache"; bl14_reset custom
+printf '40.1.1.0/24\n40.2.2.0/24\n' > "$OUT/feeds14/central.txt"; printf '50.5.5.5\n' > "$SHIELD_LISTS_DIR/custom.txt"
+rc="$(run14 custom)"
+t "custom: центральный + локальный применены" bash -c "[ $rc = 0 ] && [ \$(wc -l < '$OUT/nftdb/set_custom_blocklist_v4') = 3 ]"
+echo "https://feeds.test/central.txt" > "$OUT/curl14.fail"; printf '50.5.5.5\n50.6.6.6\n' > "$SHIELD_LISTS_DIR/custom.txt"
+rc="$(run14 custom)"
+t "custom: центральный упал — его записи остались, локальная правка применена" bash -c "[ $rc = 0 ] && grep -qx '40.1.1.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '40.2.2.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '50.6.6.6/32' '$OUT/nftdb/set_custom_blocklist_v4'"
+rm -rf "$SHIELD_BLOCKLIST_STATE/src-cache"; printf '50.5.5.5\n' > "$SHIELD_LISTS_DIR/custom.txt"
+rc="$(run14 custom)"
+t "custom: центральный упал и копии нет — набор не урезан до локального файла" bash -c "[ $rc != 0 ] && grep -qx '40.1.1.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '50.6.6.6/32' '$OUT/nftdb/set_custom_blocklist_v4'"
 
 if [ "$fails" -eq 0 ]; then echo "PASS: blocklist (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi
