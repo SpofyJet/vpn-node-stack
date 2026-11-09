@@ -217,6 +217,21 @@ echo 0 > "$RX/class/net/eth0/queues/rx-0/rps_cpus"; rps_run 1 ''
 t "RPS: 1 очередь / 1 CPU -> не трогается" '[ "$(cat $RX/class/net/eth0/queues/rx-0/rps_cpus)" = 0 ] && ! grep -q rps "$NODE_RT_TWEAKS"'
 rps_run 4 'ENABLE_RPS=0\n'
 t "ENABLE_RPS=0 -> не трогается" '[ "$(cat $RX/class/net/eth0/queues/rx-0/rps_cpus)" = 0 ]'
+# v1.2.10: RFS — opt-in (ENABLE_RFS=1), по умолчанию ничего не меняется
+RFSP=/tmp/node-irt-test/rfsproc; mkdir -p "$RFSP/sys/net/core"; export NODE_PROC_ROOT="$RFSP"
+rfs_reset() { echo 0 > "$RFSP/sys/net/core/rps_sock_flow_entries"; echo 0 > "$RX/class/net/eth0/queues/rx-0/rps_flow_cnt"; echo 0 > "$RX/class/net/eth0/queues/rx-0/rps_cpus"; }
+rfs_reset; rps_run 2 ''
+t "RFS по умолчанию выключен: rps_flow_cnt и rps_sock_flow_entries не тронуты" '[ "$(cat $RX/class/net/eth0/queues/rx-0/rps_flow_cnt)" = 0 ] && [ "$(cat $RFSP/sys/net/core/rps_sock_flow_entries)" = 0 ] && ! grep -qP "\t(rfs|procsys)\t" "$NODE_RT_TWEAKS"'
+rfs_reset; rps_run 2 'ENABLE_RFS=1\n'
+t "ENABLE_RFS=1: 32768 в обе настройки (как сейчас на lt)" '[ "$(cat $RX/class/net/eth0/queues/rx-0/rps_flow_cnt)" = 32768 ] && [ "$(cat $RFSP/sys/net/core/rps_sock_flow_entries)" = 32768 ]'
+t "ENABLE_RFS=1: исходные значения в реестре отката" 'grep -qP "^eth0\trfs\trx-0\t0$" "$NODE_RT_TWEAKS" && grep -qP "^-\tprocsys\tnet/core/rps_sock_flow_entries\t0$" "$NODE_RT_TWEAKS"'
+t "ENABLE_RFS=1: маска RPS та же, что без RFS" '[ "$(cat $RX/class/net/eth0/queues/rx-0/rps_cpus)" != 0 ]'
+rfs_reset; rps_run 2 'ENABLE_RFS=1\nRFS_FLOW_ENTRIES=65536\n'
+t "RFS_FLOW_ENTRIES=65536 применён" '[ "$(cat $RFSP/sys/net/core/rps_sock_flow_entries)" = 65536 ] && [ "$(cat $RX/class/net/eth0/queues/rx-0/rps_flow_cnt)" = 65536 ]'
+rfs_reset; rps_run 1 'ENABLE_RFS=1\n'
+t "ENABLE_RFS=1 без RPS (1 CPU) -> не трогается" '[ "$(cat $RFSP/sys/net/core/rps_sock_flow_entries)" = 0 ]'
+t "rollback знает rfs и procsys" 'grep -q "^            rfs)" "$NODE_DIR/lib/common.sh" && grep -q "^            procsys)" "$NODE_DIR/lib/common.sh"'
+unset NODE_PROC_ROOT
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: irq-rt (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi
