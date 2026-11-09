@@ -140,10 +140,10 @@ printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/cscli"; chmod +x "$OUT/bin/cscli"
 ( shield_crowdsec_resolve_mode() { echo agent; }; PATH="$OUT/bin:$OUT/nocs"; H )
 t "cscli есть, набор пуст -> прежняя проверка (негативный контроль)" 'has "[WARN] crowdsec: set ПУСТ" && ! has "не установлен (cscli нет)"'
 rm -f "$OUT/bin/cscli" "$OUT/bl/.alert-crowdsec"
-# v1.2.9: чужой crowdsec-firewall-bouncer включён -> WARN с готовой командой; сами не отключаем
+# v1.2.9: чужой crowdsec-firewall-bouncer включён -> WARN (уберёт apply)
 gen ''; healthy; rm -f "$OUT/bl/.alert-"*
 ( source "$SHIELD_DIR/lib/crowdsec.sh"; export FAKE_BOUNCER=1; H )
-t "чужой bouncer включён -> WARN с командой отключения" 'has "[WARN] crowdsec: включён чужой crowdsec-firewall-bouncer.service" && has "Отключить: systemctl disable --now crowdsec-firewall-bouncer.service"'
+t "чужой bouncer включён -> WARN с командой отключения" 'has "[WARN] crowdsec: включён чужой crowdsec-firewall-bouncer.service" && has "systemctl disable --now crowdsec-firewall-bouncer.service"'
 ( source "$SHIELD_DIR/lib/crowdsec.sh"; H )
 t "bouncer не включён -> предупреждения нет (негативный контроль)" '! has "чужой crowdsec-firewall-bouncer"'
 # бывшие проверки guard (guard теперь = health): SSH не слушает

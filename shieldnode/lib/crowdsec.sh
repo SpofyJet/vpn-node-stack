@@ -99,9 +99,8 @@ shield_crowdsec_feedonly_ensure() {
 
 # shield_crowdsec_foreign_bouncer — 2026-11-09 (v1.2.9): имена включённых или запущенных юнитов
 # crowdsec-firewall-bouncer (пусто = нет). shieldnode сам заливает решения crowdsec в свой набор;
-# отдельный bouncer держит СВОЮ таблицу nft/ipset мимо shieldnode: блокирует второй раз, белый
-# список shieldnode (TRUSTED_IPS) и guard unban на него не действуют. Сами не отключаем —
-# его мог поставить оператор; только предупреждаем с готовой командой.
+# отдельный bouncer — след прежней защиты: держит СВОЮ таблицу nft мимо shieldnode, блокирует
+# второй раз, белый список shieldnode (TRUSTED_IPS) и guard unban на него не действуют.
 shield_crowdsec_foreign_bouncer() {
     command -v systemctl >/dev/null 2>&1 || return 0
     local u out=""
@@ -112,9 +111,47 @@ shield_crowdsec_foreign_bouncer() {
     done
     printf '%s' "${out# }"
 }
-# текст предупреждения (общий для apply и health)
+# текст предупреждения (health/status и apply при CROWDSEC_REMOVE_FOREIGN_BOUNCER=0)
 shield_crowdsec_foreign_bouncer_msg() { # <юниты через пробел>
-    printf 'включён чужой %s — он блокирует адреса своей таблицей мимо shieldnode (двойная блокировка; TRUSTED_IPS и guard unban на него не действуют). Отключить: systemctl disable --now %s' "$1" "$1"
+    printf 'включён чужой %s — он блокирует адреса своей таблицей мимо shieldnode (двойная блокировка; TRUSTED_IPS и guard unban на него не действуют). Уберёт vpn-node apply; вручную: systemctl disable --now %s' "$1" "$1"
+}
+# shield_crowdsec_foreign_bouncer_remove — apply заменяет чужой bouncer собой: останавливает и
+# отключает юнит, снимает его таблицы nft (только если в них цепочка bouncer'а), удаляет его
+# регистрацию в LAPI. Пакет не трогаем. Список отключённых юнитов пишем в state — rollback
+# включает их обратно. CROWDSEC_REMOVE_FOREIGN_BOUNCER=0 — только предупреждение.
+shield_crowdsec_foreign_bouncer_remove() { # <юниты через пробел>
+    local units="$1" u t fam name
+    [ -n "$units" ] || return 0
+    if [ "$(shield_conf_get CROWDSEC_REMOVE_FOREIGN_BOUNCER 1)" != "1" ]; then
+        warn "crowdsec" "$(shield_crowdsec_foreign_bouncer_msg "$units")"; return 0
+    fi
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log info "crowdsec" "dry-run: чужой $units будет остановлен и отключён, его таблицы nft сняты"; return 0
+    fi
+    mkdir -p "$SHIELD_STATE_DIR" 2>/dev/null || true
+    for u in $units; do
+        if systemctl disable --now "$u" >/dev/null 2>&1; then
+            grep -qxF "$u" "$SHIELD_STATE_DIR/foreign-bouncer.removed" 2>/dev/null \
+                || echo "$u" >> "$SHIELD_STATE_DIR/foreign-bouncer.removed"
+        else
+            warn "crowdsec" "не удалось отключить $u — systemctl status $u"
+        fi
+    done
+    if command -v nft >/dev/null 2>&1; then
+        for t in "ip crowdsec" "ip6 crowdsec6"; do
+            fam="${t% *}"; name="${t#* }"
+            if nft list table "$fam" "$name" 2>/dev/null | grep -q 'crowdsec6\?-chain'; then
+                nft delete table "$fam" "$name" 2>/dev/null \
+                    || warn "crowdsec" "не удалось снять таблицу $fam $name — nft delete table $fam $name"
+            fi
+        done
+    fi
+    if command -v cscli >/dev/null 2>&1; then
+        for name in $(_cscli bouncers list -o raw 2>/dev/null | awk -F, 'NR>1 && $5 ~ /firewall-bouncer/ {print $1}'); do
+            _cscli bouncers delete "$name" >/dev/null 2>&1 || true
+        done
+    fi
+    ok "crowdsec" "чужой $units остановлен и отключён, его таблицы сняты: блокировку ведёт только shieldnode (rollback включит обратно)"
 }
 
 # shield_crowdsec_agent_ensure — установить/починить crowdsec-агент (idempotent).
@@ -180,7 +217,7 @@ shield_crowdsec_agent_ensure() {
     [ "${DRY_RUN:-0}" = "1" ] || shield_crowdsec_feedonly_ensure || true
 
     local fb; fb="$(shield_crowdsec_foreign_bouncer)"
-    [ -z "$fb" ] || warn "crowdsec" "$(shield_crowdsec_foreign_bouncer_msg "$fb")"
+    [ -z "$fb" ] || shield_crowdsec_foreign_bouncer_remove "$fb" || true
 
     # CAPI-регистрация (анонимная — аккаунт консоли НЕ нужен)
     if ! _cscli capi status >/dev/null 2>&1; then

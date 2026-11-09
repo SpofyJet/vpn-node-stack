@@ -40,6 +40,13 @@ shield_rollback() {
         if [ -e /etc/systemd/system/shieldnode-blocklist-crowdsec.timer ]; then
             systemctl disable --now shieldnode-blocklist-crowdsec.timer shieldnode-blocklist-crowdsec.service >/dev/null 2>&1 || true
         fi
+        # 2026-11-09 (v1.2.9): чужой crowdsec-bouncer, отключённый при apply, включаем обратно
+        if [ -s "$SHIELD_STATE_DIR/foreign-bouncer.removed" ]; then
+            while read -r f; do
+                [ -n "$f" ] && { systemctl enable --now "$f" >/dev/null 2>&1 || true; }
+            done < "$SHIELD_STATE_DIR/foreign-bouncer.removed"
+            rm -f "$SHIELD_STATE_DIR/foreign-bouncer.removed"
+        fi
         # --now: без него служба оставалась «active (exited)» not-found до reboot;
         # ExecStop у shieldnode.service нет — stop меняет только состояние юнита
         systemctl disable --now shieldnode.service >/dev/null 2>&1 || true

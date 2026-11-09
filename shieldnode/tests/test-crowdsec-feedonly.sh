@@ -63,18 +63,29 @@ t "не-yaml в acquis.d сохранён" "[ -e '$OUT/etc/acquis.d/operator-not
 SHIELD_CROWDSEC_ETC="$OUT/no-such-dir" shield_crowdsec_feedonly_ensure >/dev/null 2>&1
 t "нет /etc/crowdsec — no-op без ошибки" "[ $? -eq 0 ]"
 
-# v1.2.9: чужой crowdsec-firewall-bouncer — предупреждаем с готовой командой, сами не отключаем
+# v1.2.9: чужой crowdsec-firewall-bouncer — apply отключает его сам (след прежней защиты)
 t "bouncer включён -> имена юнитов" "[ \"\$(FAKE_ENABLED=0 shield_crowdsec_foreign_bouncer)\" = 'crowdsec-firewall-bouncer.service cs-firewall-bouncer.service' ]"
 t "bouncer выключен и не запущен -> пусто" "[ -z \"\$(FAKE_ENABLED=1 FAKE_ACTIVE=3 shield_crowdsec_foreign_bouncer)\" ]"
 t "bouncer выключен, но запущен -> тоже находим" "[ -n \"\$(FAKE_ENABLED=1 FAKE_ACTIVE=0 shield_crowdsec_foreign_bouncer)\" ]"
-printf '#!/bin/sh\nexit 0\n' > "$OUT/bin/cscli"; chmod +x "$OUT/bin/cscli"; hash -r
+printf '#!/bin/sh\ncase "$*" in *"bouncers list"*) printf "name,ip,revoked,last_pull,type,version,auth\\ncs-firewall-bouncer-1,127.0.0.1,validated,x,crowdsec-firewall-bouncer,v0.0.36,api-key\\nmine,127.0.0.1,validated,x,other,v1,api-key\\n" ;; *) echo "$*" >> "%s/cscli.calls" ;; esac\nexit 0\n' "$OUT" > "$OUT/bin/cscli"; chmod +x "$OUT/bin/cscli"
+printf '#!/bin/sh\necho "$*" >> "%s/nft.calls"\ncase "$*" in "list table ip crowdsec") echo "chain crowdsec-chain-prerouting {" ;; "list table"*) exit 1 ;; esac\nexit 0\n' "$OUT" > "$OUT/bin/nft"; chmod +x "$OUT/bin/nft"; hash -r
 shield_conf_get() { echo "${2:-}"; }
-: > "$OUT/systemctl.calls"
+: > "$OUT/systemctl.calls"; : > "$OUT/nft.calls"; : > "$OUT/cscli.calls"
 ens="$(DRY_RUN=1 FAKE_ENABLED=0 shield_crowdsec_agent_ensure 2>&1 || true)"
-t "apply: предупреждение о чужом bouncer с командой отключения" "grep -q 'включён чужой crowdsec-firewall-bouncer.service.*Отключить: systemctl disable --now crowdsec-firewall-bouncer.service' <<<\"\$ens\""
-t "apply: сам bouncer не отключает" "! grep -qE '(disable|stop|mask).*bouncer' '$OUT/systemctl.calls'"
+t "dry-run: пишет, что отключит, и ничего не трогает" "grep -q 'dry-run: чужой crowdsec-firewall-bouncer.service' <<<\"\$ens\" && ! grep -qE 'disable.*bouncer' '$OUT/systemctl.calls' && ! grep -q delete '$OUT/nft.calls'"
+FAKE_ENABLED=0 shield_crowdsec_foreign_bouncer_remove "crowdsec-firewall-bouncer.service" >/dev/null 2>&1
+t "apply: bouncer остановлен и отключён" "grep -q 'disable --now crowdsec-firewall-bouncer.service' '$OUT/systemctl.calls'"
+t "apply: таблица bouncer'а снята, чужие не тронуты" "grep -qx 'delete table ip crowdsec' '$OUT/nft.calls' && [ \"\$(grep -c '^delete' '$OUT/nft.calls')\" = 1 ]"
+t "apply: регистрация bouncer'а в LAPI удалена, чужая оставлена" "grep -qx 'bouncers delete cs-firewall-bouncer-1' '$OUT/cscli.calls' && ! grep -q 'delete mine' '$OUT/cscli.calls'"
+t "apply: юнит записан для отката" "grep -qx 'crowdsec-firewall-bouncer.service' '$OUT/state/foreign-bouncer.removed'"
+: > "$OUT/systemctl.calls"
+shield_conf_get() { [ "$1" = CROWDSEC_REMOVE_FOREIGN_BOUNCER ] && echo 0 || echo "${2:-}"; }
+ens="$(FAKE_ENABLED=0 shield_crowdsec_foreign_bouncer_remove "crowdsec-firewall-bouncer.service" 2>&1 || true)"
+t "CROWDSEC_REMOVE_FOREIGN_BOUNCER=0 -> только предупреждение" "grep -q 'включён чужой' <<<\"\$ens\" && ! grep -qE 'disable.*bouncer' '$OUT/systemctl.calls'"
+shield_conf_get() { echo "${2:-}"; }
 ens="$(DRY_RUN=1 FAKE_ENABLED=1 FAKE_ACTIVE=3 shield_crowdsec_agent_ensure 2>&1 || true)"
-t "apply: bouncer нет -> предупреждения нет" "! grep -q 'чужой' <<<\"\$ens\""
+t "apply: bouncer нет -> ничего не пишет" "! grep -q 'чужой' <<<\"\$ens\""
+rm -f "$OUT/bin/nft"
 rm -f "$OUT/bin/cscli"; hash -r
 
 [ "$fails" -eq 0 ] && echo "PASS: все проверки feed-only" || { echo "FAIL: $fails провалов"; exit 1; }
