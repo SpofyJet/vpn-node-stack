@@ -1,6 +1,6 @@
 #!/bin/bash
 # node — lib/irq.sh: §13 RSS/RPS/XPS — диагностика обязательна, изменения opt-in.
-# Без произвольного пиннинга. RFS — opt-in (ENABLE_RFS, v1.2.10). RPS — по умолчанию при queues < cpus (v1.1.7).
+# Без произвольного пиннинга. RFS не реализуется. RPS — по умолчанию при queues < cpus (v1.1.7).
 set -euo pipefail
 
 # node_cpumask_hex <mask> — cpumask для rps_cpus/xps_cpus в формате ядра.
@@ -128,31 +128,6 @@ node_irq_apply() {
                 fi
             done
             ok "irq" "RPS applied mask=$(node_cpumask_hex "$mask") (queues=$queues < cpus=$cpus; rollback — из реестра)"
-            # 2026-11-09 (v1.2.10): RFS (opt-in, ENABLE_RFS=1) — пакет потока обрабатывается на том
-            # CPU, где его читает приложение (scaling.rst). Работает только поверх RPS, поэтому
-            # здесь же. На ноде lt RFS был включён руками и жил только в памяти — после reboot
-            # пропадал; теперь значения ставит apply и boot-юнит node-rt-tweaks. Дефолт 0: на
-            # остальных нодах RFS выключен, поведение не меняется.
-            if [ "$(node_conf_get ENABLE_RFS 0)" = "1" ]; then
-                local rfs_n rfs_q rfs_f="${NODE_PROC_ROOT:-/proc}/sys/net/core/rps_sock_flow_entries"
-                rfs_n="$(node_conf_get RFS_FLOW_ENTRIES 32768)"
-                [[ "$rfs_n" =~ ^[0-9]+$ ]] && [ "$rfs_n" -gt 0 ] || rfs_n=32768
-                rfs_q=$((rfs_n / queues)); [ "$rfs_q" -ge 1 ] || rfs_q=1
-                orig="$(cat "$rfs_f" 2>/dev/null || echo 0)"
-                if printf '%s' "$rfs_n" > "$rfs_f" 2>/dev/null; then
-                    node_rt_record "-" procsys "net/core/rps_sock_flow_entries" "$orig"
-                    for q in "$sr"/class/net/"$ifname"/queues/rx-*; do
-                        qn="$(basename "$q")"
-                        orig="$(cat "$q/rps_flow_cnt" 2>/dev/null || echo 0)"
-                        if printf '%s' "$rfs_q" > "$q/rps_flow_cnt" 2>/dev/null; then
-                            node_rt_record "$ifname" rfs "$qn" "$orig"
-                        fi
-                    done
-                    ok "irq" "RFS applied: rps_sock_flow_entries=$rfs_n, rps_flow_cnt=$rfs_q на очередь (rollback — из реестра)"
-                else
-                    warn "irq" "RFS: не удалось записать $rfs_f — пропуск"
-                fi
-            fi
         elif node_conf_user_set ENABLE_RPS; then
             warn "irq" "RPS: queues($queues) >= cpus($cpus) — RSS уже раскладывает по ядрам, RPS не применяется"
         else

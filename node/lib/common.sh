@@ -180,11 +180,6 @@ node_rt_rollback() {
             rps)        qf="/sys/class/net/$iface/queues/$param/rps_cpus"
                         [ -w "$qf" ] && printf '%s' "$orig" > "$qf" 2>/dev/null \
                             && log info "rt" "rps $iface/$param restored=$orig" || true ;;
-            rfs)        qf="/sys/class/net/$iface/queues/$param/rps_flow_cnt"
-                        [ -w "$qf" ] && printf '%s' "$orig" > "$qf" 2>/dev/null \
-                            && log info "rt" "rfs $iface/$param restored=$orig" || true ;;
-            procsys)    [ -w "/proc/sys/$param" ] && printf '%s' "$orig" > "/proc/sys/$param" 2>/dev/null \
-                            && log info "rt" "/proc/sys/$param restored=$orig" || true ;;
             xps)        qf="/sys/class/net/$iface/queues/$param/xps_cpus"
                         [ -w "$qf" ] && printf '%s' "$orig" > "$qf" 2>/dev/null \
                             && log info "rt" "xps $iface/$param restored=$orig" || true ;;
