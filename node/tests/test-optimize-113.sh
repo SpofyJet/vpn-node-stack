@@ -113,8 +113,8 @@ t "squeeze по малой выборке (32/4558 после boot): budget НЕ
 sn "000f4240 00000000 00002710"; plan     # 10000 / 1_000_000 = 1%
 t "squeeze 1%: netdev_budget 600 -> 1200" '[ "$(val net.core.netdev_budget)" = 1200 ]'
 t "squeeze 1%: usecs пропорционально 1200 -> 8000 (v1.1.7)" '[ "$(val net.core.netdev_budget_usecs)" = 8000 ]'
-sn "000f4240 00000005 00000000" "000f4240 00000000 00000000"; plan
-t "dropped > 0: netdev_max_backlog 8192 -> 16384" '[ "$(val net.core.netdev_max_backlog)" = 16384 ]'
+sn "000f4240 000003e8 00000000" "000f4240 00000000 00000000"; plan     # 1000 / 2_000_000 = 0.05% (> 0.01%, правило 1.2.7)
+t "dropped 0.05%: netdev_max_backlog 8192 -> 16384" '[ "$(val net.core.netdev_max_backlog)" = 16384 ]'
 sn "ffffffff 00000000 00000000"; node_softnet_read
 t "hex-разбор без strtonum (mawk): ffffffff = 4294967295" '[ "$_NODE_SN_PROC" = 4294967295 ]'
 cfg 'NETDEV_BUDGET=900\n'; sn "000f4240 00000000 00002710"; plan
@@ -158,6 +158,15 @@ t "отчёт без baseline — понятное сообщение" 'node_per
 # v1.2.1 (живая нода): единичный дроп NIC за 13 мин — не «LIMIT»
 fx 2000 0 0 10 2000 0 0 20000 1; node_perf_report "$OUT/base.txt" > "$OUT/r4"
 t "v1.2.1: 1 дроп NIC — без LIMIT" '! grep -q "LIMIT: NIC" "$OUT/r4"'
+# v1.2.10: повторные SYN (мёртвые назначения) не считаются потерями пути
+fxs() { # <syn_retrans> — добавляет TCPSynRetrans к netstat последнего fx
+    printf 'TcpExt: SyncookiesSent ListenOverflows ListenDrops TCPBacklogDrop TCPRcvQDrop TCPSynRetrans\nTcpExt: 0 0 0 0 0 %d\n' "$1" > "$OUT/proc/net/netstat"; }
+fx 1000 0 0 0 1000 0 0 10000 0; fxs 0; node_perf_snapshot > "$OUT/base-syn.txt"
+t "v1.2.10: снапшот пишет TcpExtTCPSynRetrans" 'grep -q "^TcpExtTCPSynRetrans=0$" "$OUT/base-syn.txt"'
+fx 2000 0 0 200 3000 0 0 20000 0; fxs 150; node_perf_report "$OUT/base-syn.txt" > "$OUT/r5"
+t "v1.2.10: 200 ретрансмитов, из них 150 SYN -> 2.50% (50/2000)" 'grep -q "tcp_retrans=2.50% (без SYN, syn_retrans=+150)" "$OUT/r5"'
+fx 2000 0 0 200 3000 0 0 20000 0; fxs 150; node_perf_report "$OUT/base.txt" > "$OUT/r6"
+t "v1.2.10: baseline без ключа (снят до 1.2.10) -> прежняя формула 10.00%" 'grep -q "tcp_retrans=10.00%" "$OUT/r6"'
 # v1.2.1 (лаба): squeeze 2.7% на ~270 пакетах за 18 с после apply — шум, не предел
 echo "aaaaaaaa-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
 printf '%08x 00000000 %08x\n' 1270 7 > "$OUT/proc/net/softnet_stat"; node_perf_report "$OUT/base.txt" > "$OUT/r6"

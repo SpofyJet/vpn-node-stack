@@ -112,7 +112,7 @@ node_perf_snapshot() {
     awk '$1 == "TcpExt:" || $1 == "Tcp:" || $1 == "Udp:" {
             if (!(($1) in hdr)) { hdr[$1] = 1; for (i = 2; i <= NF; i++) name[$1, i] = $i; next }
             for (i = 2; i <= NF; i++) v[$1 name[$1, i]] = $i }
-        END { n = split("TcpExt:ListenOverflows TcpExt:ListenDrops TcpExt:TCPBacklogDrop TcpExt:TCPRcvQDrop TcpExt:TCPMemoryPressures TcpExt:PruneCalled TcpExt:TCPAbortOnMemory Tcp:RetransSegs Tcp:OutSegs Udp:RcvbufErrors Udp:SndbufErrors Udp:InErrors Udp:MemErrors", want, " ")
+        END { n = split("TcpExt:ListenOverflows TcpExt:ListenDrops TcpExt:TCPBacklogDrop TcpExt:TCPRcvQDrop TcpExt:TCPMemoryPressures TcpExt:PruneCalled TcpExt:TCPAbortOnMemory TcpExt:TCPSynRetrans Tcp:RetransSegs Tcp:OutSegs Udp:RcvbufErrors Udp:SndbufErrors Udp:InErrors Udp:MemErrors", want, " ")
               for (j = 1; j <= n; j++) { key = want[j]; sub(":", "", key); printf "%s=%d\n", key, v[want[j]] + 0 } }' \
         "$pr/net/netstat" "$pr/net/snmp" 2>/dev/null || true
     # /proc/stat: cpu user nice system idle iowait irq softirq steal
@@ -144,13 +144,19 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
             dt = d("ts"); if (dt <= 0) dt = 1
             if (b["boot_id"] != "" && c["boot_id"] != "" && b["boot_id"] != c["boot_id"]) { print "perf: после apply был reboot — счётчики ядра обнулились; дельты появятся после следующего apply"; exit }
             if (d("softnet_processed") < 0 || d("cpu_total") < 0) { print "perf: счётчики меньше baseline — был reboot; повтори apply для нового baseline"; exit }
-            ret = (d("TcpOutSegs") > 0) ? 100 * d("TcpRetransSegs") / d("TcpOutSegs") : 0
+            # 2026-11-09 (v1.2.10): RetransSegs включает повторные SYN к адресам, которые не отвечают
+            # (замер: на hy 1,81 % с ними и 0,22 % без). Это не потери пути клиента, а мёртвые
+            # назначения. Вычитаем TCPSynRetrans; baseline без этого ключа (снят до 1.2.10) или
+            # ядро без счётчика — прежняя формула.
+            syn = (("TcpExtTCPSynRetrans" in b) && ("TcpExtTCPSynRetrans" in c)) ? d("TcpExtTCPSynRetrans") : 0
+            if (syn < 0 || syn > d("TcpRetransSegs")) syn = 0
+            ret = (d("TcpOutSegs") > 0) ? 100 * (d("TcpRetransSegs") - syn) / d("TcpOutSegs") : 0
             sq  = (d("softnet_processed") > 0) ? 100 * d("softnet_squeeze") / d("softnet_processed") : 0
             st  = (d("cpu_total") > 0) ? 100 * d("cpu_steal") / d("cpu_total") : 0
             si  = (d("cpu_total") > 0) ? 100 * d("cpu_softirq") / d("cpu_total") : 0
             ctf = (c["ct_max"] > 0) ? 100 * c["ct_count"] / c["ct_max"] : 0
-            printf "perf since apply (%ds): pps_in=%d/s softnet drop=+%d squeeze=%.3f%% | listen_ovf=+%d | tcp_retrans=%.2f%% | udp_rcvbuf_err=+%d udp_mem_err=+%d | tcp_mem_press=+%d | cpu steal=%.1f%% softirq=%.1f%% | nic rx_drop=+%d missed=+%d | conntrack=%d/%d (%.0f%%)\n", \
-                dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, d("UdpRcvbufErrors"), d("UdpMemErrors"), d("TcpExtTCPMemoryPressures"), st, si, d("nic_rx_dropped"), d("nic_rx_missed_errors"), c["ct_count"], c["ct_max"], ctf
+            printf "perf since apply (%ds): pps_in=%d/s softnet drop=+%d squeeze=%.3f%% | listen_ovf=+%d | tcp_retrans=%.2f%% (без SYN, syn_retrans=+%d) | udp_rcvbuf_err=+%d udp_mem_err=+%d | tcp_mem_press=+%d | cpu steal=%.1f%% softirq=%.1f%% | nic rx_drop=+%d missed=+%d | conntrack=%d/%d (%.0f%%)\n", \
+                dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, syn, d("UdpRcvbufErrors"), d("UdpMemErrors"), d("TcpExtTCPMemoryPressures"), st, si, d("nic_rx_dropped"), d("nic_rx_missed_errors"), c["ct_count"], c["ct_max"], ctf
             n = 0
             if (d("softnet_dropped") > 0)        { n++; print "  LIMIT: softnet backlog overflow — netdev_max_backlog (AUTO_SOFTNET_TUNE при следующем apply) / ENABLE_RPS" }
             # v1.2.1: как и автонастройка — только на выборке >= 100 000 пакетов (лаба: 7 событий из ~270 за 18 с)
@@ -162,7 +168,7 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
             if (d("UdpMemErrors") > 0)           { n++; print "  LIMIT: достигнут udp_mem (общая память UDP, не буфер сокета) — udp_mem (v1.2.7: доля RAM); при зависшем rw-core с тысячами сокетов" }
             if (d("TcpExtTCPMemoryPressures") > 0 || d("TcpExtTCPAbortOnMemory") > 0) { n++; print "  LIMIT: TCP упёрся в tcp_mem (нехватка памяти сокетов) — tcp_mem / общий расход; prune=+" d("TcpExtPruneCalled") }
             if (c["ct_max"] > 0 && 100 * c["ct_count"] >= 80 * c["ct_max"]) { n++; printf "  LIMIT: conntrack заполнен на %.0f%% (%d/%d) — при 100%% insert_failed рвёт НОВЫЕ соединения; nf_conntrack_max / notrack для UDP 443\n", 100*c["ct_count"]/c["ct_max"], c["ct_count"], c["ct_max"] }
-            if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
+            if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% (без повторных SYN) — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
             if (st > 5)                          { n++; printf "  NOTE: CPU steal %.1f%% — конкуренция на гипервизоре; тюнинг хоста не поможет\n", st }
             # v1.2.1: единичные дропы (живая нода: +1 за 13 мин) — не предел; > 0.1% пакетов или >= 100
             nd = d("nic_rx_missed_errors") + d("nic_rx_dropped"); np = d("nic_rx_packets")
