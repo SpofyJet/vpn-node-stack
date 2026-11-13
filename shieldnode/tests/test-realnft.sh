@@ -25,7 +25,10 @@ OUT=/tmp/shieldnode-test-realnft
 rm -rf "$OUT"; mkdir -p "$OUT/bin"
 export SHIELD_DIR SHIELD_VERSION=test SHIELD_STATE_DIR="$OUT/state" SHIELD_LOG=/var/log/shieldnode.log
 export SHIELD_LOCK=/run/shieldnode/shieldnode.lock SHIELD_CONFIG="$OUT/config.conf" SHIELD_EXCLUDE="$OUT/none"
-: > "$SHIELD_CONFIG"; : > /var/log/shieldnode.log; unset SSH_CONNECTION
+# 2026-11-13 (v1.2.10): центральный custom-список выключен. Тест идёт без сети, а с v1.1.8 по умолчанию запечён
+# сетевой адрес списка оператора: загрузка не удавалась, и с v1.2.9 updater по праву не трогал набор
+# («центральный упал и копии нет»). Три проверки локального custom.txt падали из-за окружения, не из-за кода.
+printf 'BLOCKLIST_CUSTOM_URLS=none\n' > "$SHIELD_CONFIG"; : > /var/log/shieldnode.log; unset SSH_CONNECTION
 
 fails=0
 t() { local name="$1"; shift

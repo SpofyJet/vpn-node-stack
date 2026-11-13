@@ -122,9 +122,11 @@ HEADER_EOF
         case "$cu" in none|off|0|no) cu="" ;; esac
         printf 'BL_URLS_custom="%s"\n' "$(_bl_safe BLOCKLIST_CUSTOM_URLS "$cu")"
         printf 'BL_URLS_crowdsec="%s"\n' "$(_bl_safe CROWDSEC_INTEGRATION_ID "$cs_endpoint")"
-        # spamhaus DROP/EDROP (v4) + dropv6 (v6): формат "S24-x.y.z.w/24 ; comment"
+        # spamhaus DROP (v4) + dropv6 (v6): формат "S24-x.y.z.w/24 ; comment"
         # (префикс S<len>- и хвост после ';' срезаются парсером)
-        printf 'BL_URLS_spamhaus="https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/dropv6.txt https://www.spamhaus.org/drop/edrop.txt"\n'
+        # 2026-11-13 (v1.2.10): edrop.txt убран — Spamhaus слил EDROP в DROP, в файле остались одни
+        # комментарии («This list has been merged into …/drop.txt»): лишний запрос каждые 6 часов с каждой ноды
+        printf 'BL_URLS_spamhaus="https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/dropv6.txt"\n'
         # CINS Army: plain IP list (v4 only)
         printf 'BL_URLS_cins="https://cinsscore.com/list/ci-badguys.txt"\n'
         # креды crowdsec НЕ запекаются в updater (скрипт 0750, но читаем
@@ -145,7 +147,11 @@ HEADER_EOF
         fi
         printf 'BL_MIN_spamhaus="%s"\n' "$(_bl_num MIN_ENTRIES_SPAMHAUS "$(shield_conf_get MIN_ENTRIES_SPAMHAUS 50)" 50)"
         printf 'BL_MIN_cins="%s"\n' "$(_bl_num MIN_ENTRIES_CINS "$(shield_conf_get MIN_ENTRIES_CINS 2000)" 2000)"
-        printf 'BL_MAX_scanner=100000\nBL_MAX_threat=200000\nBL_MAX_tor=10000\nBL_MAX_custom=50000\nBL_MAX_crowdsec=400000\nBL_MAX_spamhaus=20000\nBL_MAX_cins=200000\n'
+        # 2026-11-13 (v1.2.10): потолок scanner 100000 → 200000. На нодах набор вырос с 85 288 строк (03.10)
+        # до 88 921 (13.11), ~100 в сутки; с новыми источниками 1.2.10 — около 94 тысяч. Выше потолка updater
+        # пишет ABORT и набор перестаёт обновляться на всех нодах сразу. От испорченного фида по-прежнему
+        # защищают потолок адресов (BL_MAXADDR_scanner) и самая широкая сеть /18; ёмкость сета nft — 262144.
+        printf 'BL_MAX_scanner=200000\nBL_MAX_threat=200000\nBL_MAX_tor=10000\nBL_MAX_custom=50000\nBL_MAX_crowdsec=400000\nBL_MAX_spamhaus=20000\nBL_MAX_cins=200000\n'
         # размер сетов — ёмкость в ЗАПИСЯХ (после CIDR-агрегации). Генератор объявляет
         # сеты size 2*<X>_BLOCKLIST_SIZE+1 (interval-сет: узел начала + узел конца,
         # см. lib/nft.sh); updater сверяет ёмкость ДО заливки (8b): больше — set не тронут

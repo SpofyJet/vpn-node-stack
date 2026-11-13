@@ -175,7 +175,7 @@ t "install: custom.txt засеян" test -f "$SHIELD_LISTS_DIR/custom.txt"
 t "install: hardening юнита (NoNewPrivileges/ProtectSystem/Timeout)" bash -c "grep -q 'NoNewPrivileges=true' '$OUT/etc/systemd/system/shieldnode-blocklist.service' && grep -q 'ProtectSystem=strict' '$OUT/etc/systemd/system/shieldnode-blocklist.service' && grep -q 'TimeoutStartSec=600' '$OUT/etc/systemd/system/shieldnode-blocklist.service'"
 t "install: custom path-триггер (PathChanged, без PathExists)" bash -c "grep -q 'PathChanged=.*custom.txt' '$OUT/etc/systemd/system/shieldnode-blocklist-custom.path' && ! grep -q 'PathExists' '$OUT/etc/systemd/system/shieldnode-blocklist-custom.path'"
 t "install: custom.service зовёт updater с аргументом custom" grep -q "ExecStart=/usr/local/sbin/shieldnode-blocklist custom" "$OUT/etc/systemd/system/shieldnode-blocklist-custom.service"
-t "install: scanner URLs запечены (все из defaults, сейчас 11)" bash -c "grep -q '^BL_URLS_scanner=.*antiscanner.list' '$OUT/usr/local/sbin/shieldnode-blocklist' && test \$(grep '^BL_URLS_scanner=' '$OUT/usr/local/sbin/shieldnode-blocklist' | grep -o 'https://' | wc -l) = \$(grep '^BLOCKLIST_SCANNER_URLS=' '$SHIELD_DIR/shieldnode.defaults.conf' | grep -o 'https://' | wc -l)"
+t "install: scanner URLs запечены (все из defaults, сейчас 23)" bash -c "grep -q '^BL_URLS_scanner=.*antiscanner.list' '$OUT/usr/local/sbin/shieldnode-blocklist' && test \$(grep '^BL_URLS_scanner=' '$OUT/usr/local/sbin/shieldnode-blocklist' | grep -o 'https://' | wc -l) = \$(grep '^BLOCKLIST_SCANNER_URLS=' '$SHIELD_DIR/shieldnode.defaults.conf' | grep -o 'https://' | wc -l)"
 t "install: threat URLs: spamhaus DROP v4/v6 + firehol" bash -c "grep -q '^BL_URLS_threat=.*drop_v4.json' '$OUT/usr/local/sbin/shieldnode-blocklist' && grep -q 'firehol_level1.netset' '$OUT/usr/local/sbin/shieldnode-blocklist'"
 t "install: tor выключен по умолчанию (BL_ENABLED_tor=0)" grep -q '^BL_ENABLED_tor="0"' "$SHIELD_BLOCKLIST_SCRIPT"
 t "install: BLOCKLIST_CUSTOM_URLS запечён в updater" grep -q '^BL_URLS_custom="file://.*/fixtures/custom-central.txt"' "$SHIELD_BLOCKLIST_SCRIPT"
@@ -947,5 +947,19 @@ t "custom: центральный упал — его записи остали�
 rm -rf "$SHIELD_BLOCKLIST_STATE/src-cache"; printf '50.5.5.5\n' > "$SHIELD_LISTS_DIR/custom.txt"
 rc="$(run14 custom)"
 t "custom: центральный упал и копии нет — набор не урезан до локального файла" bash -c "[ $rc != 0 ] && grep -qx '40.1.1.0/24' '$OUT/nftdb/set_custom_blocklist_v4' && grep -qx '50.6.6.6/32' '$OUT/nftdb/set_custom_blocklist_v4'"
+
+# ================= 15) v1.2.10: источники сканеров, потолок набора, мёртвый EDROP =================
+t "1.2.10: в defaults 23 источника сканеров, среди них 10 новых файлов OpenFilters и AS196641/AS214664" bash -c "
+    l=\$(grep '^BLOCKLIST_SCANNER_URLS=' '$SHIELD_DIR/shieldnode.defaults.conf'); [ \$(echo \"\$l\" | grep -o 'https://' | wc -l) = 23 ] || exit 1
+    for n in infrawatch hunter virustotal shadowserver quake alphastrike flowiq criminalip zoomeye shodan; do
+        echo \"\$l\" | grep -q \"OpenFilters/internet-scanners/main/cidr/\${n}_v4.txt\" || exit 1; done
+    echo \"\$l\" | grep -q 'resource=AS196641' && echo \"\$l\" | grep -q 'resource=AS214664'"
+t "1.2.10: источники в defaults не повторяются" bash -c "
+    l=\$(grep '^BLOCKLIST_SCANNER_URLS=' '$SHIELD_DIR/shieldnode.defaults.conf' | cut -d'\"' -f2 | tr ' ' '\n'); [ \$(echo \"\$l\" | sort | uniq -d | wc -l) = 0 ]"
+t "1.2.10: новые источники запечены в updater" bash -c "grep '^BL_URLS_scanner=' '$OUT/usr/local/sbin/shieldnode-blocklist' | grep -q 'cidr/infrawatch_v4.txt' && grep '^BL_URLS_scanner=' '$OUT/usr/local/sbin/shieldnode-blocklist' | grep -q 'resource=AS196641'"
+t "1.2.10: потолок записей scanner 200000 (набор на нодах — 89 тысяч и растёт)" grep -qx 'BL_MAX_scanner=200000' "$OUT/usr/local/sbin/shieldnode-blocklist"
+t "1.2.10: потолок scanner меньше ёмкости сета nft" bash -c "[ 200000 -lt \$(sed -nE 's/^SCANNER_BLOCKLIST_SIZE=([0-9]+).*/\\1/p' '$SHIELD_DIR/shieldnode.defaults.conf') ]"
+t "1.2.10: пустой spamhaus edrop.txt больше не запрашивается" bash -c "! grep -q 'edrop.txt' '$OUT/usr/local/sbin/shieldnode-blocklist'"
+t "1.2.10: spamhaus DROP v4 и v6 остались" bash -c "grep -q '^BL_URLS_spamhaus=\"https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/dropv6.txt\"' '$OUT/usr/local/sbin/shieldnode-blocklist'"
 
 if [ "$fails" -eq 0 ]; then echo "PASS: blocklist (all checks)"; else echo "FAILED: $fails проверок"; exit 1; fi
