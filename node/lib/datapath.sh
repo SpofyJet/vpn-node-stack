@@ -104,6 +104,8 @@ node_perf_snapshot() {
     # 2026-09-26 (v1.2.1): счётчики ядра обнуляются при загрузке — без boot_id дельты «с apply»
     # после reboot выходили отрицательными (живая нода: squeeze=-0.392%)
     echo "boot_id=$(tr -d '-' < "$pr/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)"
+    # 2026-11-13 (v1.2.11): аптайм — чтобы после reboot считать дельты от загрузки (см. node_perf_report)
+    echo "uptime=$(awk '{ printf "%d", $1 }' "$pr/uptime" 2>/dev/null || echo 0)"
     if declare -F node_softnet_read >/dev/null 2>&1; then
         unset _NODE_SN_READ; node_softnet_read   # свежее чтение, не кэш плана
         echo "softnet_processed=$_NODE_SN_PROC"; echo "softnet_dropped=$_NODE_SN_DROP"; echo "softnet_squeeze=$_NODE_SN_SQZ"
@@ -129,6 +131,10 @@ node_perf_snapshot() {
     # может отсутствовать (модуль не загружен) — тогда ключи не пишем.
     echo "ct_count=$(cat "$pr/sys/net/netfilter/nf_conntrack_count" 2>/dev/null || echo 0)"
     echo "ct_max=$(cat "$pr/sys/net/netfilter/nf_conntrack_max" 2>/dev/null || echo 0)"
+    # 2026-11-13 (v1.2.11): при загрузке с ipv6.disable=1 (её ставит сам стек) у ядра нет обработчика
+    # IPv6 — каждый кадр IPv6 из сети хостера ядро отбрасывает и считает в rx_dropped интерфейса.
+    # /proc/net/if_inet6 есть только при загруженном стеке IPv6 (при disable_ipv6=1 через sysctl — есть).
+    if [ -e "$pr/net/if_inet6" ]; then echo "ipv6_stack=1"; else echo "ipv6_stack=0"; fi
 }
 
 node_perf_report() {   # <baseline-file>: дельты «сейчас − apply» и подсказки по пределам
@@ -141,9 +147,17 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
     awk -F= 'NR == FNR { b[$1] = $2; next } { c[$1] = $2 }
         function d(k) { return c[k] - b[k] }
         END {
+            # 2026-11-13 (v1.2.11): после reboot отчёт был пуст до следующего apply (живые ноды: 2 из 9).
+            # Счётчики ядра идут с нуля от загрузки, а настройки стека применяются при загрузке —
+            # считаем от неё: baseline = нули, интервал = аптайм. Аптайм неизвестен — прежнее сообщение.
+            since = "since apply"
+            if ((b["boot_id"] != "" && c["boot_id"] != "" && b["boot_id"] != c["boot_id"]) || d("softnet_processed") < 0 || d("cpu_total") < 0) {
+                if (c["uptime"] + 0 <= 0) { print "perf: после apply был reboot — счётчики ядра обнулились; дельты появятся после следующего apply"; exit }
+                print "perf: после apply был reboot — счётчики считаются с загрузки"
+                for (k in b) if (k != "boot_id") b[k] = 0
+                b["TcpExtTCPSynRetrans"] = 0; b["ts"] = c["ts"] - c["uptime"]; since = "since boot"
+            }
             dt = d("ts"); if (dt <= 0) dt = 1
-            if (b["boot_id"] != "" && c["boot_id"] != "" && b["boot_id"] != c["boot_id"]) { print "perf: после apply был reboot — счётчики ядра обнулились; дельты появятся после следующего apply"; exit }
-            if (d("softnet_processed") < 0 || d("cpu_total") < 0) { print "perf: счётчики меньше baseline — был reboot; повтори apply для нового baseline"; exit }
             # 2026-11-09 (v1.2.10): RetransSegs включает повторные SYN к адресам, которые не отвечают
             # (замер: на hy 1,81 % с ними и 0,22 % без). Это не потери пути клиента, а мёртвые
             # назначения. Вычитаем TCPSynRetrans; baseline без этого ключа (снят до 1.2.10) или
@@ -155,23 +169,35 @@ node_perf_report() {   # <baseline-file>: дельты «сейчас − apply�
             st  = (d("cpu_total") > 0) ? 100 * d("cpu_steal") / d("cpu_total") : 0
             si  = (d("cpu_total") > 0) ? 100 * d("cpu_softirq") / d("cpu_total") : 0
             ctf = (c["ct_max"] > 0) ? 100 * c["ct_count"] / c["ct_max"] : 0
-            printf "perf since apply (%ds): pps_in=%d/s softnet drop=+%d squeeze=%.3f%% | listen_ovf=+%d | tcp_retrans=%.2f%% (без SYN, syn_retrans=+%d) | udp_rcvbuf_err=+%d udp_mem_err=+%d | tcp_mem_press=+%d | cpu steal=%.1f%% softirq=%.1f%% | nic rx_drop=+%d missed=+%d | conntrack=%d/%d (%.0f%%)\n", \
-                dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, syn, d("UdpRcvbufErrors"), d("UdpMemErrors"), d("TcpExtTCPMemoryPressures"), st, si, d("nic_rx_dropped"), d("nic_rx_missed_errors"), c["ct_count"], c["ct_max"], ctf
+            v6off = (("ipv6_stack" in c) && c["ipv6_stack"] == 0)
+            printf "perf %s (%ds): pps_in=%d/s softnet drop=+%d squeeze=%.3f%% | listen_ovf=+%d | tcp_retrans=%.2f%% (без SYN, syn_retrans=+%d) | udp_rcvbuf_err=+%d udp_mem_err=+%d | tcp_mem_press=+%d | cpu steal=%.1f%% softirq=%.1f%% | nic rx_drop=+%d%s missed=+%d | conntrack=%d/%d (%.0f%%)\n", \
+                since, dt, d("nic_rx_packets") / dt, d("softnet_dropped"), sq, d("TcpExtListenOverflows"), ret, syn, d("UdpRcvbufErrors"), d("UdpMemErrors"), d("TcpExtTCPMemoryPressures"), st, si, d("nic_rx_dropped"), (v6off && d("nic_rx_dropped") > 0) ? " (кадры IPv6 без обработчика, не потери NIC)" : "", d("nic_rx_missed_errors"), c["ct_count"], c["ct_max"], ctf
             n = 0
             if (d("softnet_dropped") > 0)        { n++; print "  LIMIT: softnet backlog overflow — netdev_max_backlog (AUTO_SOFTNET_TUNE при следующем apply) / ENABLE_RPS" }
             # v1.2.1: как и автонастройка — только на выборке >= 100 000 пакетов (лаба: 7 событий из ~270 за 18 с)
             if (sq > 0.1 && d("softnet_processed") >= 100000) { n++; print "  LIMIT: NAPI budget исчерпывается (time_squeeze) — netdev_budget (AUTO_SOFTNET_TUNE) / больше очередей (RSS)" }
-            if (d("TcpExtListenOverflows") > 0 || d("TcpExtListenDrops") > 0) { n++; print "  LIMIT: accept-очередь переполняется — somaxconn/tcp_max_syn_backlog или backlog inbound xray" }
+            # 2026-11-13 (v1.2.11): только ListenOverflows. Переполнение accept-очереди всегда растит ОБА
+            # счётчика; ListenDrops один растёт от мусора на слушающем порту (сканеры, ACK без SYN).
+            # Живые ноды: +11482 и +18513 ListenDrops при ListenOverflows=0 — status писал «переполняется».
+            if (d("TcpExtListenOverflows") > 0) { n++; print "  LIMIT: accept-очередь переполняется — somaxconn/tcp_max_syn_backlog или backlog inbound xray" }
             if (d("UdpRcvbufErrors") > 0)        { n++; print "  LIMIT: UDP receive buffer — см. строки «сокет …» ниже: буфер < 16 МиБ -> rmem_max/NET_ADMIN, полный буфер -> CPU (QUIC/Hysteria2)" }
             # v1.2.7: udp_mem (глобальный предел памяти UDP) — ОТДЕЛЬНО от rcvbuf (буфер сокета).
             # MemErrors растёт, только когда исчерпан udp_mem -> дропы на ВСЕХ UDP-сокетах разом
             if (d("UdpMemErrors") > 0)           { n++; print "  LIMIT: достигнут udp_mem (общая память UDP, не буфер сокета) — udp_mem (v1.2.7: доля RAM); при зависшем rw-core с тысячами сокетов" }
-            if (d("TcpExtTCPMemoryPressures") > 0 || d("TcpExtTCPAbortOnMemory") > 0) { n++; print "  LIMIT: TCP упёрся в tcp_mem (нехватка памяти сокетов) — tcp_mem / общий расход; prune=+" d("TcpExtPruneCalled") }
+            # 2026-11-13 (v1.2.11): tcp_mem — только по TCPMemoryPressures (ядро входит в pressure раньше,
+            # чем упирается в предел). TCPAbortOnMemory растёт и по лимиту сокетов-сирот (tcp_max_orphans,
+            # tcp_check_oom: too_many_orphans || out_of_memory): живые ноды — 2–13 событий за всё время
+            # при TCPMemoryPressures=0, status писал «упёрся в tcp_mem». Сами обрывы — сигнал от 100.
+            if (d("TcpExtTCPMemoryPressures") > 0) { n++; print "  LIMIT: TCP упёрся в tcp_mem (нехватка памяти сокетов) — tcp_mem / общий расход; abort=+" d("TcpExtTCPAbortOnMemory") " prune=+" d("TcpExtPruneCalled") }
+            else if (d("TcpExtTCPAbortOnMemory") >= 100) { n++; printf "  LIMIT: ядро оборвало %d TCP-соединений без давления по tcp_mem — лимит сокетов-сирот (tcp_max_orphans)\n", d("TcpExtTCPAbortOnMemory") }
             if (c["ct_max"] > 0 && 100 * c["ct_count"] >= 80 * c["ct_max"]) { n++; printf "  LIMIT: conntrack заполнен на %.0f%% (%d/%d) — при 100%% insert_failed рвёт НОВЫЕ соединения; nf_conntrack_max / notrack для UDP 443\n", 100*c["ct_count"]/c["ct_max"], c["ct_count"], c["ct_max"] }
             if (ret > 2)                         { n++; printf "  NOTE: ретрансмиты %.2f%% (без повторных SYN) — потери/перегрузка ПУТИ (BBR, MTU), не узкое место хоста\n", ret }
             if (st > 5)                          { n++; printf "  NOTE: CPU steal %.1f%% — конкуренция на гипервизоре; тюнинг хоста не поможет\n", st }
             # v1.2.1: единичные дропы (живая нода: +1 за 13 мин) — не предел; > 0.1% пакетов или >= 100
-            nd = d("nic_rx_missed_errors") + d("nic_rx_dropped"); np = d("nic_rx_packets")
+            # 2026-11-13 (v1.2.11): без стека IPv6 rx_dropped — это кадры IPv6 из сети хостера, у которых
+            # нет обработчика (трассировка skb:kfree_skb на двух нодах: 6 из 6 и 28 из 28 прибавок —
+            # proto 0x86DD, UNHANDLED_PROTO); кольца тут ни при чём. Считаем только rx_missed_errors.
+            nd = d("nic_rx_missed_errors") + (v6off ? 0 : d("nic_rx_dropped")); np = d("nic_rx_packets")
             if (nd >= 100 || (np > 0 && 1000 * nd > np)) { n++; printf "  LIMIT: NIC дропает на приёме (%d пакетов) — NIC_RING_RX / ENABLE_NIC_OFFLOAD_OPT (кольца до max)\n", nd }
             if (n == 0) print "  нет сигналов узкого места на стороне хоста с момента apply"
         }' "$base" "$cur"

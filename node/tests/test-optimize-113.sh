@@ -179,6 +179,41 @@ t "v1.2.1: squeeze 1% на 500 000 пакетов — LIMIT есть" 'grep -q "
 echo "bbbbbbbb-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"
 fx 5000 0 0 10 5000 0 0 50000 0; node_perf_report "$OUT/base.txt" > "$OUT/r5"
 t "v1.2.1: после reboot (другой boot_id) — «был reboot», без отрицательных дельт" 'grep -q "был reboot" "$OUT/r5" && ! grep -q "squeeze=-" "$OUT/r5"'
+# v1.2.11 (живые ноды 13.11): три LIMIT срабатывали без узкого места
+fxl() { # <overflows> <drops> <mem_pressures> <abort_on_memory> — netstat поверх последнего fx
+    printf 'TcpExt: SyncookiesSent ListenOverflows ListenDrops TCPBacklogDrop TCPRcvQDrop TCPMemoryPressures PruneCalled TCPAbortOnMemory\nTcpExt: 0 %d %d 0 0 %d 0 %d\n' "$1" "$2" "$3" "$4" > "$OUT/proc/net/netstat"; }
+rxd() { echo "$1" > "$OUT/sys/class/net/eth0/statistics/rx_dropped"; }
+fx 1000 0 0 0 1000 0 0 10000 0; fxl 0 0 0 0; node_perf_snapshot > "$OUT/base-11.txt"
+t "v1.2.11: снапшот пишет ipv6_stack=0 (нет /proc/net/if_inet6)" 'grep -q "^ipv6_stack=0$" "$OUT/base-11.txt"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 11482 0 0; node_perf_report "$OUT/base-11.txt" > "$OUT/r11a"
+t "v1.2.11: ListenDrops без ListenOverflows — не «accept-очередь»" '! grep -q "LIMIT: accept-очередь" "$OUT/r11a" && grep -q "нет сигналов" "$OUT/r11a"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 3 3 0 0; node_perf_report "$OUT/base-11.txt" > "$OUT/r11b"
+t "v1.2.11: ListenOverflows — «accept-очередь» есть" 'grep -q "LIMIT: accept-очередь" "$OUT/r11b"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 0 13; node_perf_report "$OUT/base-11.txt" > "$OUT/r11c"
+t "v1.2.11: 13 TCPAbortOnMemory без pressure — не «tcp_mem»" '! grep -q "LIMIT" "$OUT/r11c" && grep -q "нет сигналов" "$OUT/r11c"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 2 13; node_perf_report "$OUT/base-11.txt" > "$OUT/r11d"
+t "v1.2.11: TCPMemoryPressures — «tcp_mem» есть, с числом обрывов" 'grep -q "LIMIT: TCP упёрся в tcp_mem.*abort=+13" "$OUT/r11d"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 0 150; node_perf_report "$OUT/base-11.txt" > "$OUT/r11e"
+t "v1.2.11: 150 обрывов без pressure — лимит сокетов-сирот, не tcp_mem" 'grep -q "LIMIT: ядро оборвало 150" "$OUT/r11e" && ! grep -q "упёрся в tcp_mem" "$OUT/r11e"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 0 0; rxd 5000; node_perf_report "$OUT/base-11.txt" > "$OUT/r11f"
+t "v1.2.11: rx_dropped без стека IPv6 — не «NIC дропает», причина в строке perf" '! grep -q "LIMIT: NIC" "$OUT/r11f" && grep -q "rx_drop=+5000 (кадры IPv6 без обработчика" "$OUT/r11f" && grep -q "нет сигналов" "$OUT/r11f"'
+fx 2000 0 0 10 2000 0 0 20000 150; fxl 0 0 0 0; rxd 5000; node_perf_report "$OUT/base-11.txt" > "$OUT/r11g"
+t "v1.2.11: rx_missed без стека IPv6 — «NIC дропает» по 150 missed" 'grep -q "LIMIT: NIC дропает на приёме (150 пакетов)" "$OUT/r11g"'
+: > "$OUT/proc/net/if_inet6"
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 0 0; rxd 5000; node_perf_report "$OUT/base-11.txt" > "$OUT/r11h"
+t "v1.2.11: rx_dropped при живом стеке IPv6 — «NIC дропает» как раньше" 'grep -q "LIMIT: NIC дропает на приёме (5000 пакетов)" "$OUT/r11h" && ! grep -q "без обработчика" "$OUT/r11h"'
+rm -f "$OUT/proc/net/if_inet6"
+grep -v "^ipv6_stack=" "$OUT/base-11.txt" > "$OUT/base-11-old.txt"   # baseline, снятый до 1.2.11
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 0 0; rxd 5000; node_perf_report "$OUT/base-11-old.txt" > "$OUT/r11i"
+t "v1.2.11: baseline без ключа ipv6_stack — решает текущее состояние" '! grep -q "LIMIT: NIC" "$OUT/r11i"'
+# v1.2.11 (живые ноды: 2 из 9): после reboot отчёт был пуст до следующего apply — считаем с загрузки
+echo "cccccccc-1111-2222-3333-444444444444" > "$OUT/proc/sys/kernel/random/boot_id"; echo "5000.12 9000.00" > "$OUT/proc/uptime"
+fx 5000 0 3 10 5000 0 0 50000 0; node_perf_report "$OUT/base.txt" > "$OUT/r11j"
+t "v1.2.11: после reboot — дельты с загрузки за аптайм, без нового apply" 'grep -q "был reboot — счётчики считаются с загрузки" "$OUT/r11j" && grep -q "^perf since boot (5000s): " "$OUT/r11j" && grep -q "listen_ovf=+3" "$OUT/r11j" && grep -q "LIMIT: accept-очередь" "$OUT/r11j"'
+t "v1.2.11: с загрузки — ретрансмиты 10/5000 = 0.20%, без отрицательных дельт" 'grep -q "tcp_retrans=0.20%" "$OUT/r11j" && ! grep -q -- "=-\|=+-" "$OUT/r11j"'
+fx 2000 0 0 10 2000 0 0 20000 0; fxl 0 0 0 0; node_perf_snapshot > "$OUT/base-11b.txt"; fx 4000 0 0 10 4000 0 0 40000 0; fxl 0 0 0 0; node_perf_report "$OUT/base-11b.txt" > "$OUT/r11k"
+t "v1.2.11: тот же boot — по-прежнему «since apply»" 'grep -q "^perf since apply (" "$OUT/r11k" && ! grep -q "был reboot" "$OUT/r11k"'
+rm -f "$OUT/proc/uptime"
 unset NODE_PROC_ROOT NODE_SYS_ROOT; export DRY_RUN=0
 
 # ---------- XPS по scaling.rst ----------
