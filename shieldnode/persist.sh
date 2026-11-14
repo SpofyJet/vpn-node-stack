@@ -283,6 +283,139 @@ shield_persist_security_sysctl() {
     fi
 }
 
+# --- 2026-11-14 (v1.2.11): ранний фильтр на входе (spofy-guard; логика — earlyfilter.sh) ---
+# Скрипт кладётся как есть, юниты — с теми же именами и тем же текстом, что при установке руками: на сервере,
+# где фильтр уже включён, shield_persist_stream видит совпадение и ничего не переписывает.
+SHIELD_EF_BIN="${SHIELD_EF_BIN:-/usr/local/sbin/spofy-guard}"
+SHIELD_EF_UNITS="${SHIELD_UNIT_DIR:-/etc/systemd/system}"
+
+# shield_manifest_forget <path...> — файл больше не наш: убрать из манифеста и реестра происхождения
+# (иначе rollback «откатил» бы файл, который позже поставили руками).
+shield_manifest_forget() {
+    local f reg="$SHIELD_STATE_DIR/file-origins.tsv" tmp copy
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    for f in "$@"; do
+        if [ -f "$SHIELD_MANIFEST" ] && grep -qxF -- "$f" "$SHIELD_MANIFEST"; then
+            tmp="$(mktemp "$SHIELD_STATE_DIR/.manifest.XXXXXX")" || return 0
+            grep -vxF -- "$f" "$SHIELD_MANIFEST" > "$tmp" || true
+            mv "$tmp" "$SHIELD_MANIFEST"
+        fi
+        [ -f "$reg" ] || continue
+        copy="$(awk -F'\t' -v p="$f" '$1==p{print $2; exit}' "$reg")"
+        [ -n "$copy" ] || continue
+        [ "$copy" = created ] || rm -f -- "$copy"
+        tmp="$(mktemp "$SHIELD_STATE_DIR/.origins.XXXXXX")" || return 0
+        awk -F'\t' -v p="$f" '$1!=p' "$reg" > "$tmp" || true
+        mv "$tmp" "$reg"
+    done
+}
+
+# shield_persist_earlyfilter — файл скрипта и юниты фильтра (без включения: порядок включения — earlyfilter.sh)
+shield_persist_earlyfilter() {
+    local src="${SHIELD_EF_SRC:-$SHIELD_DIR/spofy-guard}"   # переменная — для тестов
+    [ -s "$src" ] || { log warn "persist" "нет $src — ранний фильтр не ставится (неполная копия стека?)"; return 1; }
+    shield_persist_stream "$SHIELD_EF_BIN" 0755 < "$src"
+    [ "$(shield_conf_get PERSIST_ENABLED 1)" = "1" ] || { log info "persist" "PERSIST_ENABLED=0 — юниты раннего фильтра пропущены (после перезагрузки сам не вернётся)"; return 0; }
+    command -v systemctl >/dev/null 2>&1 || return 0
+    shield_persist_stream "$SHIELD_EF_UNITS/spofy-guard.service" 0644 <<'EOF'
+[Unit]
+Description=Spofy guard: early filter at the node's network entry
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/spofy-guard ensure
+TimeoutStartSec=180
+[Install]
+WantedBy=multi-user.target
+EOF
+    shield_persist_stream "$SHIELD_EF_UNITS/spofy-guard.timer" 0644 <<'EOF'
+[Unit]
+Description=Spofy guard: keep the table, add new listening ports, save memory to disk
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=1min
+[Install]
+WantedBy=timers.target
+EOF
+    if [ "${DRY_RUN:-0}" != "1" ]; then systemctl daemon-reload 2>/dev/null || true; fi
+}
+
+# shield_persist_earlyfilter_enable — включить юниты фильтра. Звать ТОЛЬКО когда таблица уже стоит или
+# её возвращает сам скрипт: таймер сразу зовёт `spofy-guard ensure`.
+shield_persist_earlyfilter_enable() {
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    [ -e "$SHIELD_EF_UNITS/spofy-guard.timer" ] || return 0
+    systemctl enable spofy-guard.service >/dev/null 2>&1 || log warn "persist" "systemctl enable spofy-guard.service не удался"
+    # enable --now без restart: у таймера OnBootSec — впервые запущенный, он срабатывает сразу, а уже
+    # работающий (фильтр включён раньше) не трогаем
+    systemctl enable --now spofy-guard.timer >/dev/null 2>&1 || log warn "persist" "systemctl enable --now spofy-guard.timer не удался"
+}
+
+# shield_persist_earlyfilter_remove — выключить и убрать юниты фильтра и файл скрипта
+shield_persist_earlyfilter_remove() {
+    local u
+    if [ "${DRY_RUN:-0}" != "1" ] && command -v systemctl >/dev/null 2>&1; then
+        for u in spofy-guard.timer spofy-guard.service; do
+            if [ -e "$SHIELD_EF_UNITS/$u" ]; then systemctl disable --now "$u" >/dev/null 2>&1 || true; fi
+        done
+    fi
+    shield_persist_remove "$SHIELD_EF_UNITS/spofy-guard.service" "$SHIELD_EF_UNITS/spofy-guard.timer" "$SHIELD_EF_BIN"
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        rm -f -- "$SHIELD_EF_BIN".pre-shieldnode-* "$SHIELD_EF_UNITS"/spofy-guard.service.pre-shieldnode-* \
+                 "$SHIELD_EF_UNITS"/spofy-guard.timer.pre-shieldnode-* 2>/dev/null || true
+        shield_manifest_forget "$SHIELD_EF_UNITS/spofy-guard.service" "$SHIELD_EF_UNITS/spofy-guard.timer" "$SHIELD_EF_BIN"
+        if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload 2>/dev/null || true; fi
+    fi
+}
+
+# shield_persist_earlyfilter_timer — свой таймер стека: раз в минуту проверяет наблюдение и включает отброс
+# (earlyfilter.sh: tick). Живёт, только пока отброс не включён.
+shield_persist_earlyfilter_timer() {
+    [ "$(shield_conf_get PERSIST_ENABLED 1)" = "1" ] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    shield_persist_stream "$SHIELD_EF_UNITS/shieldnode-earlyfilter.service" 0644 <<EOF
+[Unit]
+Description=shieldnode: ранний фильтр — после наблюдения включить отброс (early-filter tick)
+After=spofy-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $SHIELD_DIR/main.sh early-filter tick
+Nice=10
+EOF
+    shield_persist_stream "$SHIELD_EF_UNITS/shieldnode-earlyfilter.timer" 0644 <<'EOF'
+[Unit]
+Description=shieldnode: ранний фильтр — проверка наблюдения, пока отброс не включён
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=40s
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        systemctl daemon-reload 2>/dev/null || true
+        # enable + restart: см. lib/blocklist.sh «активируем»
+        { systemctl enable shieldnode-earlyfilter.timer >/dev/null 2>&1 && systemctl restart shieldnode-earlyfilter.timer >/dev/null 2>&1; } || \
+            log warn "persist" "systemctl enable shieldnode-earlyfilter.timer не удался — отброс включит следующий apply"
+    fi
+}
+shield_persist_earlyfilter_timer_remove() {
+    [ -e "$SHIELD_EF_UNITS/shieldnode-earlyfilter.timer" ] || [ -e "$SHIELD_EF_UNITS/shieldnode-earlyfilter.service" ] || return 0
+    if [ "${DRY_RUN:-0}" != "1" ] && command -v systemctl >/dev/null 2>&1 && [ -e "$SHIELD_EF_UNITS/shieldnode-earlyfilter.timer" ]; then
+        systemctl disable --now shieldnode-earlyfilter.timer >/dev/null 2>&1 || true
+    fi
+    shield_persist_remove "$SHIELD_EF_UNITS/shieldnode-earlyfilter.service" "$SHIELD_EF_UNITS/shieldnode-earlyfilter.timer"
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        shield_manifest_forget "$SHIELD_EF_UNITS/shieldnode-earlyfilter.service" "$SHIELD_EF_UNITS/shieldnode-earlyfilter.timer"
+        if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload 2>/dev/null || true; fi
+    fi
+}
+
 # shield_config_ensure — создать шаблон /etc/shieldnode/config.conf (0640), если нет.
 shield_config_ensure() {
     [ -f "$SHIELD_CONFIG" ] && return 0
@@ -307,5 +440,7 @@ shield_config_ensure() {
 # PROTECTED_TCP_EXTRA=   # доп. порты к авто-детекту
 # PROTECTED_UDP_EXTRA=
 # TRUSTED_IPS=           # доп. whitelist: "IP панели Remnawave, мониторинг" — через пробел
+# ENABLE_EARLY_FILTER=1  # ранний фильтр на входе (spofy-guard); 0 — стек его не ставит и свой снимает
+# EARLY_FILTER_MODE=auto # observe — держать ранний фильтр в наблюдении (серверы с docker / пробросом портов)
 EOF
 }

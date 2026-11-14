@@ -167,5 +167,7 @@ shield_verify() {
             *) nft get element inet shieldnode whitelist_v4 "{ $admin }" >/dev/null 2>&1 \
                    && _v ok "IP SSH-сессии $admin в белом списке" || _v fail "IP SSH-сессии $admin НЕ в белом списке" ;; esac
     fi
+    # 2026-11-14 (v1.2.11): ранний фильтр — только сведения: наблюдение и «нет» установку не валят
+    if declare -F shield_earlyfilter_brief >/dev/null 2>&1; then _v ok "ранний фильтр: $(shield_earlyfilter_brief)"; fi
     return "$bad"
 }

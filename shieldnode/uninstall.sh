@@ -23,7 +23,8 @@ shield_uninstall() {
              shieldnode-blocklist-custom.service shieldnode-blocklist-custom.path \
              shieldnode-blocklist-crowdsec.service shieldnode-blocklist-crowdsec.timer \
              shieldnode-ports.service shieldnode-blocklist-restore.service \
-             shieldnode-blocklist-retry.service shieldnode-blocklist-retry.timer; do
+             shieldnode-blocklist-retry.service shieldnode-blocklist-retry.timer \
+             shieldnode-earlyfilter.service shieldnode-earlyfilter.timer; do
         u="/etc/systemd/system/$u"
         if [ "${DRY_RUN:-0}" != "1" ]; then rm -f "$u"; continue; fi
         [ -e "$u" ] || [ -L "$u" ] || continue

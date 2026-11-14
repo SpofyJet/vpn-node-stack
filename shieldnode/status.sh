@@ -255,6 +255,8 @@ shield_health() {
     else _hc INFO "дропов с последнего apply: 0 — нода простаивает или атак не было (не ошибка)"; fi
     j="$(awk '/^### / {t = $2} END {print t}' "$SHIELD_STATE_DIR/abuse.journal" 2>/dev/null || true)"
     _hc INFO "abuse-сеты сейчас: ssh=$(nft_set_elem_count ssh_abusers) tcp=$(nft_set_elem_count tcp_abusers) udp=$(nft_set_elem_count udp_abusers) temp=$(nft_set_elem_count temporary_blocklist); журнал: ${j:-записей нет}"
+    # 2026-11-14 (v1.2.11): ранний фильтр на входе (spofy-guard) — режим, устройство, счётчики
+    if declare -F shield_earlyfilter_health >/dev/null 2>&1; then shield_earlyfilter_health; fi
     _h_sum
 }
 
@@ -284,7 +286,7 @@ shield_status() {
              UDP_RATE UDP_BURST UDP_GLOBAL_CEIL \
              SSH_ABUSERS_TIMEOUT TCP_ABUSERS_TIMEOUT UDP_ABUSERS_TIMEOUT TEMP_BLOCKLIST_TIMEOUT \
              PROTECTED_TCP_EXTRA PROTECTED_UDP_EXTRA TRUSTED_IPS LOG_LEVEL BACKUP_KEEP PERSIST_ENABLED \
-             ENABLE_ANTISPOOF; do
+             ENABLE_ANTISPOOF ENABLE_EARLY_FILTER EARLY_FILTER_MODE; do
         printf '  %-24s = %s\n' "$k" "$(shield_conf_get "$k" "")"
     done
     echo
@@ -329,6 +331,13 @@ shield_status() {
         echo "  (table отсутствует)"
     fi
     echo
+
+    # 2026-11-14 (v1.2.11): отдельным разделом — виден и без таблицы фаервола, и в аварийном режиме
+    if declare -F shield_earlyfilter_status >/dev/null 2>&1; then
+        echo "--- early filter (spofy-guard: раньше таблицы соединений и фаервола) ---"
+        shield_earlyfilter_status
+        echo
+    fi
 
     echo "--- crowdsec ---"
     # main.sh в ветке status НЕ source'ит limits.sh (SH_F_* unset) — читаем конфиг напрямую

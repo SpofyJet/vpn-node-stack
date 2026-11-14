@@ -2,7 +2,7 @@
 # shieldnode — main.sh: точка входа, режимы, lock, диспетчеризация (TZ §4, §28).
 set -euo pipefail
 
-SHIELD_VERSION="1.2.10"
+SHIELD_VERSION="1.2.11"
 # readlink -f: вызов может идти через symlink /usr/local/sbin/guard → main.sh
 SHIELD_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export SHIELD_DIR
@@ -31,6 +31,8 @@ usage() {
                       вручную не запускают)
   rollback [id]       откат к backup-набору (без id — последний/удаление своих)
   emergency on|off    аварийный минимальный режим
+  early-filter        ранний фильтр на входе (spofy-guard): режим, устройство, счётчики
+                      (tick — проверка наблюдения для shieldnode-earlyfilter.timer; вручную не запускают)
   uninstall           полный откат + удаление своих файлов
 
 Опции:
@@ -82,7 +84,7 @@ if [ "$(id -u)" -eq 0 ] && [ ! -e "$SHIELD_LOG" ]; then install -m 0640 /dev/nul
 # shellcheck source=config.sh
 source "$SHIELD_DIR/config.sh"
 shield_load_config
-if [ "$cmd" = guard ] || [ "$cmd" = verify ] || [ "$cmd" = ports-sync ] || [ "$cmd" = ports-watch ]; then
+if [ "$cmd" = guard ] || [ "$cmd" = verify ] || [ "$cmd" = ports-sync ] || [ "$cmd" = ports-watch ] || [ "$cmd" = early-filter ]; then
     # 2026-09-25 (v1.1.7): у пульта строка старта — только в журнал, не поверх дашборда
     [ -w "$SHIELD_LOG" ] && printf '%s [info] main: shieldnode v%s cmd=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SHIELD_VERSION" "$cmd" >> "$SHIELD_LOG" || true
 else
@@ -122,6 +124,8 @@ case "$cmd" in
         source "$SHIELD_DIR/persist.sh"
         # shellcheck source=lib/blocklist.sh
         source "$SHIELD_DIR/lib/blocklist.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"   # 2026-11-14 (v1.2.11): ранний фильтр — последним шагом apply
         shield_apply
         shield_blocklist_kick   # 2026-09-24 (v1.1.4): после apply, без основного lock'а
         ;;
@@ -139,6 +143,8 @@ case "$cmd" in
         source "$SHIELD_DIR/lib/crowdsec.sh"
         # shellcheck source=status.sh
         source "$SHIELD_DIR/status.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
         shield_status
         ;;
     guard)
@@ -146,6 +152,8 @@ case "$cmd" in
         source "$SHIELD_DIR/detect.sh"
         # shellcheck source=guard.sh
         source "$SHIELD_DIR/guard.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
         shield_guard
         ;;
     # 2026-09-25 (v1.2.0): синхронизация защищаемых портов (DIAGNOSIS P0-2) и проверка «жив»
@@ -158,14 +166,29 @@ case "$cmd" in
         source "$SHIELD_DIR/firewall.sh"
         # shellcheck source=lib/ports.sh
         source "$SHIELD_DIR/lib/ports.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
         case "$cmd" in
             ports-sync)  shield_ports_sync ;;
             ports-watch) shield_ports_watch ;;
             verify)      shield_verify ;;
         esac
         ;;
+    # 2026-11-14 (v1.2.11): ранний фильтр на входе (spofy-guard): состояние; tick — шаг таймера.
+    # Основной lock не нужен (таблицу фаервола не трогает) — у фильтра свой
+    early-filter)
+        # shellcheck source=persist.sh
+        source "$SHIELD_DIR/persist.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
+        shield_earlyfilter_cmd "$subarg"
+        ;;
     rollback)
         shield_wait_lock; acquire_lock
+        # shellcheck source=persist.sh
+        source "$SHIELD_DIR/persist.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
         # shellcheck source=rollback.sh
         source "$SHIELD_DIR/rollback.sh"
         shield_rollback "$subarg"
@@ -194,12 +217,18 @@ case "$cmd" in
         source "$SHIELD_DIR/persist.sh"
         # shellcheck source=lib/blocklist.sh
         source "$SHIELD_DIR/lib/blocklist.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
         shield_emergency "$subarg"
         # 2026-09-24 (v1.1.4): emergency off = полный apply — первый тик updater'а без lock'а
         if declare -F shield_blocklist_kick >/dev/null; then shield_blocklist_kick; fi
         ;;
     uninstall)
         shield_wait_lock; acquire_lock  # гонка с apply/rollback исключена
+        # shellcheck source=persist.sh
+        source "$SHIELD_DIR/persist.sh"
+        # shellcheck source=earlyfilter.sh
+        source "$SHIELD_DIR/earlyfilter.sh"
         # shellcheck source=rollback.sh
         source "$SHIELD_DIR/rollback.sh"
         # shellcheck source=uninstall.sh

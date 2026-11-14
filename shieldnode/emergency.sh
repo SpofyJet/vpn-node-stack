@@ -134,6 +134,9 @@ shield_emergency() {
                 fi
                 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$SHIELD_EMERGENCY_MARKER"
                 echo "reason: $reason" >> "$SHIELD_EMERGENCY_MARKER"
+                # 2026-11-14 (v1.2.11): аварийный режим = минимум — ранний фильтр снимается (после маркера:
+                # с ним его никто не поставит заново); прежний режим вернёт emergency off
+                if declare -F shield_earlyfilter_emergency_on >/dev/null 2>&1; then shield_earlyfilter_emergency_on || true; fi
             fi
             rm -f "$tmp"
             log warn "emergency" "маркер: $SHIELD_EMERGENCY_MARKER ; backup: $bdump"

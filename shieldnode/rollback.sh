@@ -53,11 +53,24 @@ shield_rollback() {
             done < "$SHIELD_STATE_DIR/foreign-bouncer.removed"
             rm -f "$SHIELD_STATE_DIR/foreign-bouncer.removed"
         fi
+        # 2026-11-14 (v1.2.11): ранний фильтр (earlyfilter.sh) — таблицы, две настройки ядра, юниты, файл и
+        # состояние; только тот, что ведёт стек (поставленный мимо стека — не наш). Свой таймер — в любом случае
+        if declare -F shield_earlyfilter_managed >/dev/null 2>&1 && shield_earlyfilter_managed; then
+            shield_earlyfilter_remove "rollback" || true
+        elif declare -F shield_persist_earlyfilter_timer_remove >/dev/null 2>&1; then
+            shield_persist_earlyfilter_timer_remove || true
+        fi
         # --now: без него служба оставалась «active (exited)» not-found до reboot;
         # ExecStop у shieldnode.service нет — stop меняет только состояние юнита
         systemctl disable --now shieldnode.service >/dev/null 2>&1 || true
-    elif [ -s "$SHIELD_STATE_DIR/foreign-bouncer.removed" ]; then
-        log info "dry-run" "would enable back foreign crowdsec bouncer: $(paste -sd' ' "$SHIELD_STATE_DIR/foreign-bouncer.removed")"
+    else
+        if [ -s "$SHIELD_STATE_DIR/foreign-bouncer.removed" ]; then
+            log info "dry-run" "would enable back foreign crowdsec bouncer: $(paste -sd' ' "$SHIELD_STATE_DIR/foreign-bouncer.removed")"
+        fi
+        # ранний фильтр, который ведёт стек: под DRY_RUN функция только пишет, что сняла бы
+        if declare -F shield_earlyfilter_managed >/dev/null 2>&1 && shield_earlyfilter_managed; then
+            shield_earlyfilter_remove "rollback" || true
+        fi
     fi
 
     # 1. восстановление/удаление по манифесту

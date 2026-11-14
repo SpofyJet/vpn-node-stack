@@ -131,6 +131,10 @@ _g_draw() {
         pt="$(nft_set_elems_raw protected_tcp | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true)"
         pu="$(nft_set_elems_raw protected_udp | tr ',\t\n' '   ' | tr -s ' ' | sed 's/^ //; s/ $//' || true)"
         printf '  Под защитой %sTCP %s%s   %sUDP %s%s\n' "$G_B" "${pt:-—}" "$G_0" "$G_B" "${pu:-—}" "$G_0"
+        # 2026-11-14 (v1.2.11): ранний фильтр на входе (spofy-guard) — режим, устройство, счётчики
+        if declare -F shield_earlyfilter_brief >/dev/null 2>&1; then
+            printf '  Ранний фильтр %s%s%s\n' "$G_D" "$(shield_earlyfilter_brief 2>/dev/null || true)" "$G_0"
+        fi
     fi
     echo
 

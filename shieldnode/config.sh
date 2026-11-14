@@ -47,6 +47,21 @@ shield_load_config() {
     fi
 }
 
+# 2026-11-14 (v1.2.11): ENABLE_EARLY_FILTER — ранний фильтр на входе (earlyfilter.sh). Только 0 или 1.
+# Любое другое значение — опечатка: по ней нельзя ни снять работающий фильтр, ни поставить его, поэтому
+# ответ «invalid» — стек фильтр не трогает и пишет предупреждение (apply, status).
+shield_conf_early_filter() {   # -> 1 | 0 | invalid
+    local v; v="$(shield_conf_get ENABLE_EARLY_FILTER 1)"
+    case "$v" in 0|1) echo "$v" ;; *) echo invalid ;; esac
+}
+# EARLY_FILTER_MODE — что стек делает с режимом раннего фильтра: auto — после наблюдения сам включает отброс,
+# если под него не попадают свои пакеты; observe — держит в наблюдении (серверы с пробросом портов в
+# контейнеры и т.п.). Другое значение — опечатка: «invalid», режим стек не меняет.
+shield_conf_early_filter_mode() {   # -> auto | observe | invalid
+    local v; v="$(shield_conf_get EARLY_FILTER_MODE auto)"
+    case "$v" in auto|observe) echo "$v" ;; *) echo invalid ;; esac
+}
+
 shield_cpu_count() {
     # grep -c возвращает rc=1 при 0 совпадений — под set -e это fatal без || true
     nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || true

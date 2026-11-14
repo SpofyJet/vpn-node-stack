@@ -156,6 +156,8 @@ shield_apply() {
         cat "$tmp"
         log info "dry-run" "persist: $SHIELD_NFT_PERSIST, shieldnode.service, $SHIELD_SYSCTL_SECURITY, cleanup-timer"
         rm -f "$tmp"
+        # 2026-11-14 (v1.2.11): ранний фильтр — в плане одной строкой (под DRY_RUN только читает и пишет, что сделал бы)
+        if declare -F shield_earlyfilter_ensure >/dev/null 2>&1; then shield_earlyfilter_ensure; fi
         return 0
     fi
 
@@ -237,6 +239,10 @@ shield_apply() {
 
     # --- контракт владения (ТЗ §15) ---
     shield_contract_write
+
+    # 2026-11-14 (v1.2.11): ранний фильтр на входе (spofy-guard, earlyfilter.sh) — последним и не в ущерб
+    # apply: фаервол уже применён и сохранён, сбой фильтра — только предупреждение (функция всегда rc 0)
+    if declare -F shield_earlyfilter_ensure >/dev/null 2>&1; then shield_earlyfilter_ensure; fi
 
     ok "apply" "shieldnode применён: ssh=[$SH_F_SSH_PORTS] protected_tcp=[$SH_F_PROTECTED_TCP] protected_udp=[$SH_F_PROTECTED_UDP] admin4=[$SH_F_ADMIN_V4]"
     log info "apply" "backup ruleset: $bdump ; снапшот: $SHIELD_LAST_SNAPSHOT"
