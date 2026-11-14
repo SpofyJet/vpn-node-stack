@@ -131,6 +131,14 @@ case "$MODE" in
         node_status
         ;;
     rollback)
+        # 2026-11-14 (v1.2.12): `rollback --dry-run` выполнял НАСТОЯЩИЙ откат — флаг читал только apply.
+        # Теперь, как и обещает справка («ничего не писать/не применять»), только говорит, что было бы.
+        if [ "$DRY_RUN" = "1" ]; then
+            _mf="$NODE_STATE_DIR/applied-files.txt"; _n=0
+            [ -f "$_mf" ] && _n="$(grep -c . "$_mf" || true)"
+            log info "dry-run" "rollback: ничего не меняем. Настоящий откат (без --dry-run) убрал бы файлы node по манифесту ($_n шт.: $_mf), вернул бы исходные sysctl и состояние служб${ROLLBACK_ID:+, набор $ROLLBACK_ID}"
+            exit 0
+        fi
         # shellcheck source=rollback.sh
         source "$NODE_DIR/rollback.sh"
         node_rollback "$ROLLBACK_ID"
