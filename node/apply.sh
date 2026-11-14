@@ -66,6 +66,7 @@ node_apply() {
     source "$NODE_DIR/lib/route.sh"      # 2026-09-27 (v1.2.2): initcwnd/initrwnd
     source "$NODE_DIR/lib/boot.sh";      node_boot_net_wait_plan   # 2026-11-14 (v1.2.12): предел ожидания сети при загрузке
     source "$NODE_DIR/lib/sshd.sh";      node_sshd_plan            # 2026-11-14 (v1.2.12): пределы входа sshd, вход по ключу
+    source "$NODE_DIR/lib/journal.sh";   node_journal_plan         # 2026-11-14 (v1.2.13): журнал без строки на каждый отброшенный пакет
 
     log info "apply" "sysctl keys planned: $(wc -l < "$NODE_PLAN_FILE")"
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -101,6 +102,7 @@ node_apply() {
     node_step_run limits_persist           node_limits_persist
     node_step_run boot_net_wait            node_boot_net_wait_apply       # 2026-11-14 (v1.2.12)
     node_step_run sshd_apply               node_sshd_apply                # 2026-11-14 (v1.2.12)
+    node_step_run journal_apply            node_journal_apply             # 2026-11-14 (v1.2.13)
 
     node_step_run nic_diag                 node_nic_diag
     node_step_run nic_apply_rings          node_nic_apply_rings

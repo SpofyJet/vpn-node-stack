@@ -3,7 +3,7 @@
 # Modes: apply (default) | status | rollback [id] | detect | uninstall
 set -euo pipefail
 
-NODE_VERSION="1.2.12"
+NODE_VERSION="1.2.13"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NODE_DIR="$SCRIPT_DIR"
 export NODE_STATE_DIR="/var/lib/node"

@@ -108,6 +108,8 @@ node_status() {
     # 2026-11-14 (v1.2.12): пределы входа sshd / вход по ключу; предел ожидания сети при загрузке
     source "$NODE_DIR/lib/sshd.sh"; node_sshd_status
     source "$NODE_DIR/lib/boot.sh"; node_boot_net_wait_status
+    # 2026-11-14 (v1.2.13): строки об отброшенных пакетах в файлах журналов; пишет ли нода каждый пакет
+    source "$NODE_DIR/lib/journal.sh"; node_journal_status
     source "$NODE_DIR/lib/xray.sh"
     echo "VPN-ядро слушает: $(node_xray_sockets_summary) (по ss; конфиг не читается, ТЗ §30)"
     echo "----------------------------------------------------------------------"

@@ -37,6 +37,10 @@ node_rollback() {
     # shellcheck source=lib/sshd.sh
     source "$NODE_DIR/lib/sshd.sh"
     local sshd_sig; sshd_sig="$(_node_sshd_sig)"
+    # 0b. 2026-11-14 (v1.2.13): то же для файла rsyslog стека (строки об отброшенных пакетах)
+    # shellcheck source=lib/journal.sh
+    source "$NODE_DIR/lib/journal.sh"
+    local journal_sig; journal_sig="$(_node_journal_sig)"
 
     # 1. восстановление/удаление по манифесту
     local dropdirs=() reg="$NODE_STATE_DIR/file-origins.tsv" origin
@@ -94,6 +98,8 @@ node_rollback() {
 
     # 1a. sshd: перечитать конфиг, если шаг 1 убрал или вернул файлы стека (sshd -t, reload)
     node_sshd_rollback_reload "$sshd_sig"
+    # 1b. rsyslog: перезапустить, если шаг 1 убрал или вернул файл стека
+    node_journal_rollback_restart "$journal_sig"
 
     # 2. runtime-откат ключей, которым больше не принадлежит файл
     local snap keys_f="$NODE_STATE_DIR/owner-keys.txt" sreg="$NODE_STATE_DIR/sysctl-orig.tsv" restored=""
