@@ -64,6 +64,22 @@ node_bbr_plan() {
     fi
 }
 
+# node_panic_plan — 2026-11-14 (v1.2.12): автоперезагрузка после сбоя ядра.
+# По умолчанию kernel.panic=0: после panic сервер стоит, пока его не сбросят руками в панели
+# хостера; oops (kernel.panic_on_oops=0) оставляет ядро работать с испорченным состоянием — нода
+# «жива» по ping, а клиенты не ходят. С 10/1 любой сбой ядра = перезагрузка через 10 с (kdump
+# стеком выключен, дамп снимать некому). Ключи в базовом файле: rollback и «выпавшие из плана»
+# ищут ключи node только в 99-z[0-4]-node-*.conf. _writable: в LXC/OpenVZ /proc/sys/kernel
+# только для чтения — там пропуск, а не падение sysctl -p.
+node_panic_plan() {
+    if [ "$(node_conf_get HARDEN_PANIC_REBOOT 1)" != "1" ]; then
+        log info "kernel" "HARDEN_PANIC_REBOOT=0 — kernel.panic/panic_on_oops не трогаем"
+        return 0
+    fi
+    node_sysctl_add_writable "$NODE_SYSCTL_BASE" kernel.panic 10
+    node_sysctl_add_writable "$NODE_SYSCTL_BASE" kernel.panic_on_oops 1
+}
+
 # node_cpu_xlevel — x86-64 уровень CPU: v3/v2/v1 (для выбора пакета XanMod).
 node_cpu_xlevel() {
     local flags; flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"

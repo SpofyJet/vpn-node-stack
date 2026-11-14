@@ -33,7 +33,7 @@ node_contract_write() {
         echo "nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)"
         echo "irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
         echo "ipv6_disabled=1 ipv6_kernel_off=$(node_ipv6_kernel_off && echo 1 || echo 0)"
-        echo "hardening=bg:$(node_conf_get HARDEN_BG_SERVICES 1),unattended:$(node_conf_get HARDEN_UNATTENDED 1),packagekit:$(node_conf_get HARDEN_PACKAGEKIT 1),irqbalance:$(node_conf_get HARDEN_IRQBALANCE 1),rpcbind:$(node_conf_get HARDEN_RPCBIND 1),kdump:$(node_conf_get HARDEN_KDUMP 1),mta:$(node_conf_get HARDEN_MTA 0),snapd:$(node_conf_get HARDEN_SNAPD 0),thp:$(node_conf_get HARDEN_THP 1),sched_none:$(node_conf_get HARDEN_SCHED_NONE 1),noatime:$(node_conf_get HARDEN_NOATIME 1),low_latency_nic=$(node_conf_get ENABLE_LOW_LATENCY_NIC 0)"
+        echo "hardening=bg:$(node_conf_get HARDEN_BG_SERVICES 1),unattended:$(node_conf_get HARDEN_UNATTENDED 1),packagekit:$(node_conf_get HARDEN_PACKAGEKIT 1),irqbalance:$(node_conf_get HARDEN_IRQBALANCE 1),rpcbind:$(node_conf_get HARDEN_RPCBIND 1),kdump:$(node_conf_get HARDEN_KDUMP 1),mta:$(node_conf_get HARDEN_MTA 0),snapd:$(node_conf_get HARDEN_SNAPD 0),thp:$(node_conf_get HARDEN_THP 1),sched_none:$(node_conf_get HARDEN_SCHED_NONE 1),noatime:$(node_conf_get HARDEN_NOATIME 1),low_latency_nic=$(node_conf_get ENABLE_LOW_LATENCY_NIC 0),panic_reboot:$(node_conf_get HARDEN_PANIC_REBOOT 1)"
         echo "owner_keys=$NODE_STATE_DIR/owner-keys.txt"
         echo "diagnostics=${NODE_LAST_SNAPSHOT:-none}"
     } > "$tmp"
@@ -52,7 +52,7 @@ node_apply() {
     source "$NODE_DIR/lib/conntrack.sh"; node_conntrack_plan
     source "$NODE_DIR/lib/tcp.sh";       node_tcp_plan; node_tcp_perf_plan
     source "$NODE_DIR/lib/datapath.sh";  node_datapath_plan
-    source "$NODE_DIR/lib/kernel.sh";    node_bbr_plan
+    source "$NODE_DIR/lib/kernel.sh";    node_bbr_plan; node_panic_plan   # 2026-11-14 (v1.2.12): kernel.panic
     source "$NODE_DIR/lib/udp.sh";       node_udp_plan
     source "$NODE_DIR/lib/network.sh";   node_network_plan
     source "$NODE_DIR/lib/limits.sh";    node_limits_plan

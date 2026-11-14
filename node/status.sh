@@ -9,7 +9,7 @@ node_status() {
     source "$NODE_DIR/lib/conntrack.sh"; node_conntrack_plan
     source "$NODE_DIR/lib/tcp.sh";       node_tcp_plan; node_tcp_perf_plan
     source "$NODE_DIR/lib/datapath.sh";  node_datapath_plan
-    source "$NODE_DIR/lib/kernel.sh"
+    source "$NODE_DIR/lib/kernel.sh";    node_panic_plan   # 2026-11-14 (v1.2.12): kernel.panic — в таблице ниже
     source "$NODE_DIR/lib/udp.sh";       node_udp_plan
     source "$NODE_DIR/lib/network.sh";   node_network_plan
     source "$NODE_DIR/lib/limits.sh";    node_limits_plan
