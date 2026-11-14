@@ -153,6 +153,11 @@ case "$MODE" in
         echo "$NODE_LAST_SNAPSHOT"
         ;;
     uninstall)
+        # 2026-11-14 (v1.2.12): то же для `uninstall --dry-run` — раньше удалял стек по-настоящему
+        if [ "$DRY_RUN" = "1" ]; then
+            log info "dry-run" "uninstall: ничего не меняем. Настоящее удаление (без --dry-run) выполнило бы полный откат (как rollback) и убрало бы реестры node из $NODE_STATE_DIR; /etc/node/node.conf остался бы на месте"
+            exit 0
+        fi
         # shellcheck source=uninstall.sh
         source "$NODE_DIR/uninstall.sh"
         node_uninstall

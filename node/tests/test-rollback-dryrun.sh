@@ -1,5 +1,5 @@
 #!/bin/bash
-# node — тест: `rollback --dry-run` не выполняет откат (v1.2.12). До этой версии флаг читал только
+# node — тест: `rollback --dry-run` и `uninstall --dry-run` ничего не меняют (v1.2.12). До этой версии флаг читал только
 # apply, и «пробный» откат на живой ноде снимал всё по-настоящему.
 # Безопасность самого теста: работает с копией модуля, где rollback.sh заменён заглушкой (настоящий
 # откат невозможен даже при провале), и не под root (state уходит в /tmp).
@@ -38,6 +38,10 @@ echo "== rollback --dry-run с набором"
 : > "$OUT/mark"
 out="$(run rollback 20261114-010203 --dry-run)" && rc=0 || rc=$?
 [ "$rc" = 0 ] && [ ! -s "$OUT/mark" ] && grep -q "набор 20261114-010203" <<<"$out" && ok "набор назван, откат не вызван" || bad "rc=$rc mark=$(cat "$OUT/mark") out=$out"
+echo "== uninstall --dry-run"
+: > "$OUT/mark"
+out="$(run uninstall --dry-run)" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ ! -s "$OUT/mark" ] && grep -q "uninstall: ничего не меняем" <<<"$out" && ok "удаление не выполнено, сказано, что было бы" || bad "rc=$rc mark=$(cat "$OUT/mark") out=$out"
 echo "== rollback без --dry-run не под root — отказ, а не откат"
 : > "$OUT/mark"
 out="$(run rollback)" && rc=0 || rc=$?
