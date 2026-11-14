@@ -33,7 +33,7 @@ node_contract_write() {
         echo "nic_offload_opt=$(node_conf_get ENABLE_NIC_OFFLOAD_OPT 0)"
         echo "irq_affinity=$(node_conf_get ENABLE_IRQ_AFFINITY 0)"
         echo "ipv6_disabled=1 ipv6_kernel_off=$(node_ipv6_kernel_off && echo 1 || echo 0)"
-        echo "hardening=bg:$(node_conf_get HARDEN_BG_SERVICES 1),unattended:$(node_conf_get HARDEN_UNATTENDED 1),packagekit:$(node_conf_get HARDEN_PACKAGEKIT 1),irqbalance:$(node_conf_get HARDEN_IRQBALANCE 1),rpcbind:$(node_conf_get HARDEN_RPCBIND 1),kdump:$(node_conf_get HARDEN_KDUMP 1),mta:$(node_conf_get HARDEN_MTA 0),snapd:$(node_conf_get HARDEN_SNAPD 0),thp:$(node_conf_get HARDEN_THP 1),sched_none:$(node_conf_get HARDEN_SCHED_NONE 1),noatime:$(node_conf_get HARDEN_NOATIME 1),low_latency_nic=$(node_conf_get ENABLE_LOW_LATENCY_NIC 0),panic_reboot:$(node_conf_get HARDEN_PANIC_REBOOT 1)"
+        echo "hardening=bg:$(node_conf_get HARDEN_BG_SERVICES 1),unattended:$(node_conf_get HARDEN_UNATTENDED 1),packagekit:$(node_conf_get HARDEN_PACKAGEKIT 1),irqbalance:$(node_conf_get HARDEN_IRQBALANCE 1),rpcbind:$(node_conf_get HARDEN_RPCBIND 1),kdump:$(node_conf_get HARDEN_KDUMP 1),mta:$(node_conf_get HARDEN_MTA 0),snapd:$(node_conf_get HARDEN_SNAPD 0),thp:$(node_conf_get HARDEN_THP 1),sched_none:$(node_conf_get HARDEN_SCHED_NONE 1),noatime:$(node_conf_get HARDEN_NOATIME 1),low_latency_nic=$(node_conf_get ENABLE_LOW_LATENCY_NIC 0),panic_reboot:$(node_conf_get HARDEN_PANIC_REBOOT 1),boot_net_wait:$(node_conf_get BOOT_NET_WAIT_SEC 10)"
         echo "owner_keys=$NODE_STATE_DIR/owner-keys.txt"
         echo "diagnostics=${NODE_LAST_SNAPSHOT:-none}"
     } > "$tmp"
@@ -64,6 +64,7 @@ node_apply() {
     source "$NODE_DIR/lib/cpu.sh"        # node_cpu_check
     source "$NODE_DIR/lib/xray.sh"
     source "$NODE_DIR/lib/route.sh"      # 2026-09-27 (v1.2.2): initcwnd/initrwnd
+    source "$NODE_DIR/lib/boot.sh";      node_boot_net_wait_plan   # 2026-11-14 (v1.2.12): предел ожидания сети при загрузке
 
     log info "apply" "sysctl keys planned: $(wc -l < "$NODE_PLAN_FILE")"
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -97,6 +98,7 @@ node_apply() {
     node_step_run services_apply           node_services_apply   # irqbalance выключаем ДО ручной IRQ-affinity
     node_step_run storage_apply            node_storage_apply
     node_step_run limits_persist           node_limits_persist
+    node_step_run boot_net_wait            node_boot_net_wait_apply       # 2026-11-14 (v1.2.12)
 
     node_step_run nic_diag                 node_nic_diag
     node_step_run nic_apply_rings          node_nic_apply_rings
