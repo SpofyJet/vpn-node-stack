@@ -31,6 +31,13 @@ node_rollback() {
         fi
     done
 
+    # 0a. 2026-11-14 (v1.2.12): файлы sshd стека (пределы входа, вход только по ключу) уходят по
+    # манифесту в шаге 1 — отпечаток до него; изменились — работающий sshd перечитывает конфиг
+    # (шаг 1a), иначе снятые настройки действовали бы до его перезапуска
+    # shellcheck source=lib/sshd.sh
+    source "$NODE_DIR/lib/sshd.sh"
+    local sshd_sig; sshd_sig="$(_node_sshd_sig)"
+
     # 1. восстановление/удаление по манифесту
     local dropdirs=() reg="$NODE_STATE_DIR/file-origins.tsv" origin
     if [ -f "$NODE_MANIFEST" ]; then
@@ -84,6 +91,9 @@ node_rollback() {
         rm -f "$reg" "$NODE_STATE_DIR"/origins/* 2>/dev/null || true
         rmdir "$NODE_STATE_DIR/origins" 2>/dev/null || true
     fi
+
+    # 1a. sshd: перечитать конфиг, если шаг 1 убрал или вернул файлы стека (sshd -t, reload)
+    node_sshd_rollback_reload "$sshd_sig"
 
     # 2. runtime-откат ключей, которым больше не принадлежит файл
     local snap keys_f="$NODE_STATE_DIR/owner-keys.txt" sreg="$NODE_STATE_DIR/sysctl-orig.tsv" restored=""
