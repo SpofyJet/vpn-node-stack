@@ -28,6 +28,8 @@ node_svc_snapshot() { # <unit>
 }
 
 node_svc_exists() { # <unit> — 0 если юнит установлен
+    # ВАЖНО: имя — только полное, с суффиксом (.service/.timer/.socket/.path). На systemd 255
+    # `list-unit-files ModemManager` (без суффикса) не находит ничего — юнит считался отсутствующим.
     systemctl list-unit-files --no-legend "$1" 2>/dev/null | grep -q .
 }
 
@@ -113,15 +115,88 @@ node_svc_mask() { # <unit...> — disable --now + mask со снапшотом
 # пустой для совместимости вызовов.
 node_harden_ipv6() { :; }
 
+# --- 2026-11-14 (v1.2.12): фон, который до сих пор выключали разовым скриптом на каждой ноде ---
+# Журналы разового скрипта с десяти нод 14.11: выключено 7–16 единиц на ноду, работающих служб
+# 17–25 -> 15–21, свободной памяти прибавилось на 5–87 МБ (на одной ноде не прибавилось). Выигрыш
+# не в скорости, а в том, что на ноде не работает лишнее. Синхронизация времени, сеть, docker,
+# ssh, журнал не затрагиваются.
+# Три группы — только когда они точно не нужны (условия ниже); условие перестало выполняться
+# (появился RAID, multipath, файл-хук) — следующий apply возвращает юнит в исходное состояние.
+
+# multipath: устройство device-mapper с UUID «mpath-…» (то же, что TYPE=mpath у lsblk) либо
+# WWID, записанный в /etc/multipath/wwids (multipath настраивали — устройство может быть не собрано)
+node_svc_has_multipath() {
+    local f
+    for f in "${NODE_SYS_BLOCK:-/sys/block}"/dm-*/dm/uuid; do
+        [ -r "$f" ] || continue
+        case "$(cat "$f" 2>/dev/null || true)" in mpath-*) return 0 ;; esac
+    done
+    grep -qE '^/.+/[[:space:]]*$' "${NODE_MULTIPATH_WWIDS:-/etc/multipath/wwids}" 2>/dev/null
+}
+
+# программный RAID: строка «mdN : …» в /proc/mdstat
+node_svc_has_md() { grep -qE '^md[^[:space:]]*[[:space:]]*:' "${NODE_PROC_MDSTAT:-/proc/mdstat}" 2>/dev/null; }
+
+# networkd-dispatcher нужен, только если есть файлы-хуки: свои (/etc) или от пакетов (/usr/lib —
+# например chrony кладёт туда переключение online/offline). Нет хуков — служба ничего не делает.
+node_svc_has_dispatcher_hooks() {
+    local d
+    for d in ${NODE_DISPATCHER_DIRS:-/etc/networkd-dispatcher /usr/lib/networkd-dispatcher}; do
+        [ -d "$d" ] || continue
+        [ -n "$(find "$d" \( -type f -o -type l \) -print -quit 2>/dev/null)" ] && return 0
+    done
+    return 1
+}
+
+# node_svc_restore_all <unit...> — node_svc_restore для каждого (нет в снапшоте — без действий)
+node_svc_restore_all() { local u; for u in "$@"; do node_svc_restore "$u"; done; }
+
+node_svc_bg_extra_apply() {
+    # multipathd: сокет раньше службы — иначе обращение к сокету (udev-правило multipath)
+    # поднимает только что остановленную службу снова
+    if node_svc_has_multipath; then
+        log info "services" "multipath-устройства есть — multipathd не трогаем"
+        node_svc_restore_all multipathd.socket multipathd.service
+    else
+        node_svc_disable multipathd.socket multipathd.service
+    fi
+    # fwupd (прошивки), upower (батарея) — static, поднимаются по D-Bus: только маска
+    node_svc_disable fwupd-refresh.timer
+    node_svc_mask fwupd.service upower.service
+    if node_svc_has_dispatcher_hooks; then
+        log info "services" "у networkd-dispatcher есть файлы-хуки — не трогаем"
+        node_svc_restore_all networkd-dispatcher.service
+    else
+        node_svc_disable networkd-dispatcher.service
+    fi
+    # таймеры: пересборка индекса man, отчёты о сбоях в Canonical, загрузки update-notifier,
+    # сообщения Ubuntu Pro, ремонт snapd (нужен только на Ubuntu Core)
+    node_svc_disable \
+        man-db.timer apport-autoreport.timer apport-autoreport.path \
+        update-notifier-download.timer update-notifier-motd.timer \
+        ua-timer.timer snapd.snap-repair.timer
+    # проверка и мониторинг программного RAID — только когда массивов нет
+    if node_svc_has_md; then
+        log info "services" "есть программный RAID (/proc/mdstat) — таймеры mdcheck/mdmonitor не трогаем"
+        node_svc_restore_all mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer
+    else
+        node_svc_disable mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer
+    fi
+}
+
 node_services_apply() {
     # фоновые сервисы headless-VPS (доказанный список поколения старых скриптов)
     if [ "$(node_conf_get HARDEN_BG_SERVICES 1)" = "1" ]; then
         # список проверен на старой ветке; ModemManager/udisks2 — static/dbus,
         # их глушит mask-if-alive в node_svc_disable
+        # 2026-11-14 (v1.2.12): ModemManager.service / udisks2.service — с суффиксом. Без него
+        # node_svc_exists их не находил (см. выше) и обе службы работали на каждой ноде
+        # (живые ноды до 14.11: «ModemManager.service enabled active», «udisks2.service enabled active»).
         node_svc_disable \
             motd-news.timer accounts-daemon.service switcheroo-control.service \
             colord.service thermald.service avahi-daemon.service \
-            ModemManager udisks2
+            ModemManager.service udisks2.service
+        node_svc_bg_extra_apply
     fi
 
     # автообновления: APT::Periodic=0 + таймеры (явное решение оператора:
@@ -134,8 +209,15 @@ node_services_apply() {
             echo "// node: автообновления отключены (HARDEN_UNATTENDED=1). Вернуть: удалить файл + enable apt-daily*.timer"
             echo "APT::Periodic::Update-Package-Lists \"0\";"
             echo "APT::Periodic::Unattended-Upgrade \"0\";"
-        } | node_persist /etc/apt/apt.conf.d/99-node-no-unattended
+        } | node_persist "${NODE_APT_CONF_DIR:-/etc/apt/apt.conf.d}/99-node-no-unattended"   # override — тесты
         node_svc_disable apt-daily.timer apt-daily-upgrade.timer
+        # 2026-11-14 (v1.2.12): unattended-upgrades.service — процесс, который только ждёт
+        # выключения, чтобы дать автообновлению закончить. Автообновления выключены — ждать нечего.
+        # Фоновая служба: под HARDEN_BG_SERVICES; при HARDEN_UNATTENDED=0 возвращается
+        # (node_unattended_safe_apply).
+        if [ "$(node_conf_get HARDEN_BG_SERVICES 1)" = "1" ]; then
+            node_svc_disable unattended-upgrades.service
+        fi
     fi
 
     # packagekit: отключаем+маскируем (purge неверен — ломает переустановку)
@@ -209,6 +291,7 @@ node_unattended_safe_apply() {
     done
     node_svc_restore apt-daily.timer
     node_svc_restore apt-daily-upgrade.timer
+    node_svc_restore unattended-upgrades.service   # 2026-11-14 (v1.2.12): отключается только при HARDEN_UNATTENDED=1
     {
         echo '// node: автообновления безопасности — да, рестарт VPN — нет (managed by node; HARDEN_UNATTENDED=1 — выключить)'
         echo 'Unattended-Upgrade::Package-Blacklist { "^docker-" ; "^containerd" ; };'
@@ -261,7 +344,12 @@ node_services_rollback() {
 _node_svc_restore_line() {
     local u="$1" en="$2" ac="$3" cur
         # снимаем маску ТОЛЬКО если замаскировали мы (до нас юнит не был masked)
-        cur="$(systemctl is-enabled "$u" 2>/dev/null || echo '?')"
+        # 2026-11-14 (v1.2.12): для замаскированного юнита is-enabled печатает «masked» И возвращает 1 —
+        # с `|| echo '?'` выходило «masked<перевод строки>?», сравнение ниже не срабатывало никогда:
+        # маска, поставленная node (packagekit, rpcbind, snapd, выжившие после stop), откатом не
+        # снималась, а enable/start замаскированного юнита молча падали. Та же ошибка, что в
+        # node_svc_snapshot до v1.2.5.
+        cur="$(systemctl is-enabled "$u" 2>/dev/null | head -1)" || true
         if [ "$cur" = "masked" ] && [ "$en" != "masked" ]; then
             systemctl unmask "$u" >/dev/null 2>&1 || true
             log info "services" "unmasked $u (был замаскирован node)"
