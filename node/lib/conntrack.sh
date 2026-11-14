@@ -33,7 +33,14 @@ node_conntrack_plan() {
     # таблице; max/4 (совет времён 2.6) давал 4 сравнения на КАЖДЫЙ пакет каждого потока.
     # Цена — 8 байт на bucket: 786432 -> 6 МиБ против ~240 МиБ самих записей.
     hashsize="$max"
-    loose="$(node_conf_get CONNTRACK_TCP_LOOSE 1)"
+    # 2026-11-14 (v1.2.12): ранний фильтр (shieldnode: spofy-guard) в отбросе держит nf_conntrack_tcp_loose=0 —
+    # пакет без начала соединения (ACK/RST-флуд) не заводит запись. Строку CONNTRACK_TCP_LOOSE=0 он дописывает в
+    # node.conf сам, но только если файл есть; без файла каждый apply возвращал loose=1 на минуту — до ближайшего
+    # тика фильтра. Его отметка «настройки ядра включены» есть, а значение не задано — берём 0.
+    loose="$(node_conf_get CONNTRACK_TCP_LOOSE "")"
+    if [ -z "$loose" ]; then
+        if [ -f "${NODE_EARLYFILTER_SYSCTL_MARK:-/var/lib/spofy-guard/sysctl.on}" ]; then loose=0; else loose=1; fi
+    fi
 
     # 2026-10-12: writable, не plain add — все ключи зависят от модуля nf_conntrack;
     # в LXC/контейнере без modprobe/ключей sysctl -p на файле уронил бы весь apply
