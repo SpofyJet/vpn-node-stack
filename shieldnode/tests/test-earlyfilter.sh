@@ -152,8 +152,8 @@ conf "SSH_PORT=22"
 # ================= скрипт в репозитории =================
 G="$SHIELD_DIR/spofy-guard"
 # совпадение по содержимому с тем, что стоит на серверах, = apply ничего не переписывает. Обновил скрипт — обнови и здесь
-t "скрипт: тот же файл, что стоит на серверах (2.3, sha256)" \
-    "[ \"\$(sha256sum < $G | cut -d' ' -f1)\" = 8b8a7bfbb2debdc0e8ea67a0e85f4758aa54f2d36e56baf2b8ab0881a4e16795 ] && grep -q '^VER=2.3; T=spofy_guard; CT=spofy_guard_ct\$' $G"
+t "скрипт: тот же файл, что стоит на серверах (2.4, sha256)" \
+    "[ \"\$(sha256sum < $G | cut -d' ' -f1)\" = d0fe30210f1b876c02e8114a29b1ef0332979dcefc330a7778b226fe0698dea9 ] && grep -q '^VER=2.4; T=spofy_guard; CT=spofy_guard_ct\$' $G"
 t "скрипт: умеет reload («поставить заново в том же режиме»), observe, enforce, ensure, remove, sysctl" \
     "for c in observe enforce ensure reload remove sysctl; do grep -qE \"^  \$c\\)\" $G || exit 1; done"
 t "скрипт: пути те же, что ждёт стек (/etc/spofy-guard.conf, /var/lib/spofy-guard, /etc/sysctl.d)" \

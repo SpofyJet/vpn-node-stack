@@ -19,6 +19,8 @@
 #   emergency on/off, ENABLE_EARLY_FILTER=0, ручная проба, rollback;
 #   фильтр, включённый руками мимо стека: при ENABLE_EARLY_FILTER=0 его не трогают ни apply, ни rollback,
 #               при =1 apply принимает его как есть (таблица, правило режима, счётчики и файлы — те же).
+#   предел на один адрес (2.4): знакомый адрес вышел за свой предел — пока общий запас есть, соединения
+#               проходят все; запас исчерпан (флуд с адреса) — отброс; число таких адресов видно в status.
 # systemctl — заглушка, которая ведёт себя как systemd для двух юнитов фильтра: включённый впервые таймер
 # сразу зовёт `spofy-guard ensure` (так и на сервере: OnBootSec давно прошёл).
 set -euo pipefail
@@ -137,6 +139,27 @@ elif m == "tcp-stale":   # <свой адрес> <адрес> <порт>: ACK в
             if struct.unpack("!HH", p[ihl:ihl + 4]) == (dport, sport):
                 print("rst" if p[ihl + 13] & 4 else "other"); break
     except socket.timeout: print("silence")
+elif m == "tcp-sink":    # <ip> <порт>: принимает соединения разом (очередь 1024), отвечает "k" и держит открытыми
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((a[0], int(a[1]))); s.listen(1024)
+    keep = []
+    while True:
+        c, _ = s.accept()
+        try: c.sendall(b"k")
+        except OSError: pass
+        keep.append(c)
+        if len(keep) > 2000:
+            for x in keep[:1000]: x.close()
+            del keep[:1000]
+elif m == "tcp-burst":   # <адрес> <порт> <сколько> <ждать, с>: открыть соединения разом -> ok:<сколько установилось за время>
+    n, wait, ss = int(a[2]), float(a[3]), []
+    for _ in range(n):
+        c = socket.socket(); c.setblocking(False); c.connect_ex((a[0], int(a[1]))); ss.append(c)
+    time.sleep(wait); ok = 0
+    for c in ss:
+        try: c.getpeername(); ok += 1
+        except OSError: pass
+        c.close()
+    print("ok:%d" % ok)
 EOF
 
 # --- сеть: нода (этот netns, wan0 10.99.0.1) <-> клиент (netns c, 10.99.0.2); маршрут по умолчанию — через клиента
@@ -509,6 +532,36 @@ t "после принятия: SYN на слушающий порт прохо�
 rc=0; main rollback > "$OUT/rollback3.out" 2>&1 || rc=$?
 t "rollback после принятия: фильтр снят целиком (его теперь ведёт стек)" \
     "[ $rc = 0 ] && ! nft list table netdev spofy_guard && ! nft list table inet spofy_guard_ct && [ ! -e $G ] && [ ! -e /etc/systemd/system/spofy-guard.timer ] && [ \"\$(sysctl -n net.netfilter.nf_conntrack_tcp_loose)\" = 1 ] && [ ! -e $GUARD_STATE ]"
+
+# ================= J. предел на один адрес: общий запас (spofy-guard 2.4) =================
+# Маленькие числа, чтобы хватило десятков соединений: свой предел 2 в секунду (всплеск 10), запас 5 в секунду
+# (всплеск 50). Залп 40 соединений со знакомого адреса: 10 — в свой предел, 30 — из запаса, отброса нет.
+# Следом 200 разом: запас кончился — лишнее отбрасывается (так выглядит флуд с одного адреса).
+printf 'LEARN=1\nSRC_SYN=2\nSPARE_SYN=5\n' > "$GUARD_CONF"
+bg python3 "$OUT/h.py" tcp-sink 0.0.0.0 8600; sleep 0.5
+install -m 0755 "$SHIELD_DIR/spofy-guard" "$G"
+"$G" observe > /dev/null 2>&1; "$G" enforce > /dev/null 2>&1
+t "запас: правила — сверх предела на адрес идёт в цепочку с запасом, отброс только после него" \
+    "has 'jump syn_hot' nft list chain netdev spofy_guard syn_k && has 'limit rate 5/second burst 50 packets counter name \"c_syn_spare\" accept' nft list chain netdev spofy_guard syn_hot && has 'jump q_hot' nft list chain netdev spofy_guard q_k"
+t "запас: адрес клиента становится знакомым (сервис отдал ему данные)" \
+    "[ \"\$(C python3 $OUT/h.py tcp-ask 10.99.0.1 8443 known)\" = ok:hi:known ] && has 10.99.0.2 nft list set netdev spofy_guard known"
+b1="$(C python3 "$OUT/h.py" tcp-burst 10.99.0.1 8600 40 0.6)"
+t "запас: залп 40 соединений со знакомого адреса — установились все 40 ($b1)" "[ \"$b1\" = ok:40 ]"
+t "запас: лишние 25–30 прошли из запаса, отброшенных нет" \
+    "[ \"\$(gcnt syn_spare)\" -ge 25 ] && [ \"\$(gcnt syn_spare)\" -le 31 ] && [ \"\$(gcnt syn_src)\" = 0 ]"
+t "запас: адрес записан как выходивший за предел, status называет число адресов, не адрес" \
+    "has 10.99.0.2 nft list set netdev spofy_guard src_hot && has 'адресов, выходивших за свой предел за последний час: 1 (' $G status && ! has 10.99.0.2 $G status"
+b2="$(C python3 "$OUT/h.py" tcp-burst 10.99.0.1 8600 200 0.6)"
+t "запас исчерпан: из 200 соединений разом установилось не больше 60 ($b2), остальные отброшены на входе" \
+    "[ \"${b2#ok:}\" -le 60 ] && [ \"\$(gcnt syn_src)\" -ge 120 ]"
+t "запас исчерпан: строка status — сколько прошло из запаса и сколько отброшено" \
+    "has 'сверх предела на адрес: прошло из запаса' $G status"
+ip -n c addr add 10.99.0.3/24 dev c0
+o="$(C python3 -c "import socket; s = socket.socket(); s.bind(('10.99.0.3', 0)); s.settimeout(1.5); s.connect(('10.99.0.1', 8443)); s.sendall(b'other'); print(s.recv(64).decode())" 2>&1 || true)"
+t "запас исчерпан одним адресом: другой адрес в ту же секунду подключается ($o)" "[ \"$o\" = hi:other ]"
+"$G" remove > /dev/null 2>&1
+t "после проверки запаса фильтр снят" "! nft list table netdev spofy_guard && ! nft list table inet spofy_guard_ct"
+echo 'LEARN=1' > "$GUARD_CONF"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: earlyfilter-realnft (all checks)"; else echo "FAILED: $fails checks"; exit 1; fi

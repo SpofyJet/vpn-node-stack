@@ -100,7 +100,7 @@ _ef_numbers() {
     c="$(_ef_counters)"
     read -r EF_PASS EF_MISS EF_FP EF_PICKUP <<<"$(awk '
         BEGIN {
-            n = split("syn_known syn_new syn_retry udp_listen udp_reply q_known q_ip q_new q_other q_retry frag", a, " ")
+            n = split("syn_known syn_new syn_retry syn_spare udp_listen udp_reply q_known q_ip q_new q_other q_retry q_spare frag", a, " ")
             for (i = 1; i <= n; i++) pass["c_" a[i]] = 1
             n = split("syn_closed syn_first syn_over syn_src tcp_flags mgmt_over udp_miss q_ver q_small q_first q_over q_src icmp_over frag_over proto", b, " ")
             for (i = 1; i <= n; i++) miss["c_" b[i]] = 1
